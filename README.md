@@ -48,3 +48,8 @@ account (for example a Bedrock inference profile).
 
 Adapted from [simplecore-inc/claude-mods](https://github.com/simplecore-inc/claude-mods)
 (MIT); see `THIRD_PARTY_NOTICES.md`.
+
+## License
+
+MIT, see `LICENSE`. The adapted simplecore-inc/claude-mods code keeps its own MIT
+notice in `LICENSES/`.

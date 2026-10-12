@@ -2,5 +2,9 @@
   "name": "rice-session-accounts",
   "version": "0.1.0",
   "description": "Saved Anthropic accounts (claude.ai login or token, Console API key, gateway, Bedrock, Vertex, Foundry); /account switches only this session",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "Mo Abualruz"
+  }
 }
