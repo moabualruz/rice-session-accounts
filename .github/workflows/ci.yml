@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude: ['2.1.296', '2.1.299', '2.1.301']
+        claude: ['2.1.296', '2.1.299', '2.1.301', '2.1.302']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude: ['2.1.299', '2.1.301']
+        claude: ['2.1.299', '2.1.301', '2.1.302']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

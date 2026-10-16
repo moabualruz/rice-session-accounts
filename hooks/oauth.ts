@@ -91,8 +91,10 @@ export function refreshInit(credential: Credential): HttpInit {
 
 /** The credential after a refresh; the server rotates the refresh token, so it must be saved. */
 export function applyRefresh(credential: Credential, responseText: string, now: number): Credential {
-  const body = JSON.parse(responseText) as { access_token?: string; refresh_token?: string; expires_in?: number }
-  if (typeof body.access_token !== 'string' || typeof body.expires_in !== 'number') {
+  let body: { access_token?: string; refresh_token?: string; expires_in?: number } | null
+  // A JSON syntax error quotes the text it read, and this response carries grants.
+  try { body = JSON.parse(responseText) as typeof body } catch { throw new AnthropicError('the token refresh returned an unreadable response') }
+  if (typeof body?.access_token !== 'string' || typeof body.expires_in !== 'number') {
     throw new AnthropicError('the token refresh returned no access token')
   }
   const oauth = credential.claudeAiOauth

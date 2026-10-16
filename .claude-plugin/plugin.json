@@ -1,6 +1,6 @@
 {
   "name": "rice-session-accounts",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Choose an Anthropic OAuth account by email and tier inside ordinary Claude, with session-local authentication, selected-account reporting and resumable setup on macOS, Linux, WSL and Windows",
   "types": "./types/index.d.ts",
   "license": "MIT",

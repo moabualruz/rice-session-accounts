@@ -11,8 +11,8 @@ test('the keychain service is named as Claude Code names it for its config direc
   expect(await liveServiceName({ configDir: '/home/me/.claude' }, home)).toBe('Claude Code-credentials-cb67f5c9')
   expect(await liveServiceName({ configDir: '/home/me/work-claude' }, home)).toBe('Claude Code-credentials-9b768060')
   expect(await liveServiceName({ configDir: '/home/me/work-claude', secureStorageDir: '' }, home)).toBe(LIVE_SERVICE)
-  // Checked on this machine against an item Claude Code itself wrote for CLAUDE_CONFIG_DIR=/Users/mkh/.claude.
-  expect(await liveServiceName({ configDir: '/Users/mkh/.claude' }, home)).toBe('Claude Code-credentials-3617b2f2')
+  // A macOS-style folder hashes its exact text as given.
+  expect(await liveServiceName({ configDir: '/Users/me/.claude' }, home)).toBe('Claude Code-credentials-0bd83d07')
 })
 
 test('addLine carries the secret as hex and refuses names that would end the line', async () => {
@@ -35,7 +35,7 @@ test('an item printed as hex is decoded back to its JSON; a plain token stays as
 })
 
 test('the keychain account is the user name, or claude-code-user', async () => {
-  expect(keychainAccountName('mkh')).toBe('mkh')
+  expect(keychainAccountName('me')).toBe('me')
   expect(keychainAccountName('a b')).toBe('claude-code-user')
   expect(keychainAccountName(undefined)).toBe('claude-code-user')
 })
@@ -49,6 +49,15 @@ test('a login is renewed five minutes before it expires, and the rotated refresh
   expect(renewed.claudeAiOauth.refreshToken).toBe('r2')
   expect(renewed.claudeAiOauth.expiresAt).toBe(5_000 + 3_600_000)
   expect(renewed.claudeAiOauth.scopes).toEqual(['user:inference'])
+})
+
+test('an unreadable refresh response fails without quoting the grant text it held', async () => {
+  const login = parseCredential('{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1","expiresAt":1000000}}')
+  let message = ''
+  try { applyRefresh(login, '{"refresh_token":"fixture-rotated-grant-wxyz","access_token":"fixture-access-wxyz","x":@}', 5_000) }
+  catch (error) { message = error instanceof Error ? error.message : String(error) }
+  expect(message).toContain('unreadable response')
+  expect(message.includes('wxyz')).toBe(false)
 })
 
 test('usage windows read both response shapes', async () => {

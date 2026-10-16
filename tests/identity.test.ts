@@ -65,6 +65,20 @@ test('machine login reads native HOME metadata and its own credential tier', asy
   expect(world.commands[1]?.[4]).toBe('/home/me/.claude/.credentials.json')
 })
 
+test('native Windows machine login reads USERPROFILE metadata when HOME is unset', async () => {
+  const profile = 'C:\\Users\\me'
+  const world = fixture({}, { [`${profile}/.claude.json`]: metadata('windows@example.test') })
+  world.io.env = async name => name === 'OS' ? 'Windows_NT' : name === 'USERPROFILE' ? profile : undefined
+  world.io.run = async argv => {
+    world.commands.push(argv)
+    if (argv[0] === 'node' && argv[3] === 'read' && argv[4] === `${profile}\\.claude/.credentials.json`) return result(JSON.stringify(credential('pro')))
+    throw new Error('unexpected process')
+  }
+  const windows: Machine = { claudeDir: `${profile}\\.claude`, user: 'me', storage: {} }
+  expect(await accountIdentity(world.io, { kind: 'login' }, windows)).toEqual({ email: 'windows@example.test', tier: 'Pro' })
+  expect(world.reads).toEqual([`${profile}/.claude.json`])
+})
+
 test('explicit machine config uses that config metadata without reading another login', async () => {
   const configured: Machine = { claudeDir: '/profiles/work', user: 'me', storage: { configDir: '/profiles/work' } }
   const world = fixture({ '/profiles/work/.credentials.json': credential('enterprise') }, {

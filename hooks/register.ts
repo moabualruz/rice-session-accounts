@@ -4,7 +4,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { ActiveAccount, EnvSnapshot } from '../types'
 import { loginEmail, materialFor } from './accounts'
 import type { Machine } from './accounts'
-import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig } from './config'
+import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig, UNPARSED_CONFIG } from './config'
 import type { AccountConfig, Config, Kind } from './config'
 import { headerToken, MANAGED, planEnv } from './env'
 import type { Managed, Originals } from './env'
@@ -251,6 +251,14 @@ async function loadConfig($: EngineInterface): Promise<{ config: Config; problem
   return loaded
 }
 
+/** Defaults stand in for a file that does not parse; writing them would discard every saved entry. */
+async function writableConfig($: EngineInterface): Promise<Config> {
+  const { config, problems } = await loadConfig($)
+  const unparsed = problems.find(problem => problem.startsWith(UNPARSED_CONFIG))
+  if (unparsed) throw new Error(`${unparsed}. Repair accounts.json first; it was left unchanged.`)
+  return config
+}
+
 async function saveConfig($: EngineInterface, config: Config): Promise<void> {
   const paths = pathsFor((await machineOf($)).claudeDir)
   await $.fs.write(paths.config, serializeConfig(config))
@@ -491,6 +499,10 @@ async function usageText($: EngineInterface): Promise<string> {
   return `${name} usage:\n${formatLimits(parseUsage(JSON.parse(response.text)))}`
 }
 
+function selectedReportProblem(detail: string | undefined): string {
+  return transitionProblem ?? `The selected session account report is unavailable${detail ? ` (${detail.replace(/\.$/, '')})` : ''}. The machine login was not reported in its place. Retry, or run /rice-account check.`
+}
+
 async function statusText($: EngineInterface): Promise<string> {
   if (transitionProblem) return transitionProblem
   const [version, model, cwd] = await Promise.all([$.session.version(), $.session.model(), $.session.cwd()])
@@ -581,7 +593,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     }
     if (first === 'add') {
       const [name, word, ...tail] = rest
-      const { config } = await loadConfig($)
+      const config = await writableConfig($)
       const kind = word && !word.includes('=') ? word : config.accounts[name ?? '']?.kind ?? 'claudeai'
       const more = word?.includes('=') ? [word, ...tail] : tail
       if (!name || kind === 'login' || !(KINDS as readonly string[]).includes(kind)) {
@@ -597,7 +609,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       const name = rest[0]
       if (!name) return 'Usage: /rice-account remove <name>'
       if (mirror.active?.name === name) return `${name} is this session's account; /rice-account login first.`
-      const { config } = await loadConfig($)
+      const config = await writableConfig($)
       const account = config.accounts[name]
       if (config.legacy && Object.hasOwn(config.legacy, name) || account && !(KINDS as readonly string[]).includes(account.kind)) return 'This provider entry is retained. Rice Accounts manages OAuth accounts only.'
       await saveConfig($, removeAccount(config, name))
@@ -612,7 +624,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     }
     if (first === 'set-default') {
       const name = rest[0]
-      const { config } = await loadConfig($)
+      const config = await writableConfig($)
       if (!name || !config.accounts[name] || !(KINDS as readonly string[]).includes(config.accounts[name]!.kind) || rest.length !== 1) return 'This legacy command expects a saved OAuth account name. Use /rice-account <name> to switch this session.'
       await saveConfig($, { ...config, default: name })
 
@@ -709,15 +721,17 @@ export const register: Register = on => {
     return result
   })
 
+  // A failed hook is skipped, and the native command would then report the
+  // machine account. Answer with the selected account's problem instead.
   on('command.run', { command: 'usage' }, async ($, e, next) => {
     if (!accountReport && !transitionProblem) return next(e)
     return { text: await usageText($) }
-  })
+  }).catch((_host, e, next) => next.called ? next(e) : { text: selectedReportProblem(next.error.message) })
 
   on('command.run', { command: 'status' }, async ($, e, next) => {
     if (!accountReport && !transitionProblem) return next(e)
     return { text: await statusText($) }
-  })
+  }).catch((_host, e, next) => next.called ? next(e) : { text: selectedReportProblem(next.error.message) })
 
   on('model.*', (_$, e, next) => transitionProblem ? { deny: transitionProblem } : next(e))
 

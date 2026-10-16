@@ -117,7 +117,7 @@ function fixture(on: On) {
   on('ui.status', (_host, e) => { status.push(e.text); return { value: undefined } })
   on('ui.log', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
-  return { environment, writes, processes, status, activeWrites, cachedRequests, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
+  return { environment, documents, writes, processes, status, activeWrites, cachedRequests, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
     let started = () => {}, release = () => {}
     const seen = new Promise<void>(resolve => { started = resolve })
     const wait = new Promise<void>(resolve => { release = resolve })
@@ -214,6 +214,21 @@ test('a late usage response for A cannot replace the selected B reporting', asyn
   expect(usage.text ?? '').not.toContain('100%')
   expect(world.status.at(-1) ?? '').toContain('account-b')
   expect(world.writes).toEqual([])
+})
+
+test('a failed selected-account report never falls back to the machine account in /usage or /status', async ($, on) => {
+  const world = fixture(on)
+  on('command.run', { command: 'usage' }, () => ({ text: 'native machine usage' }))
+  on('command.run', { command: 'status' }, () => ({ text: 'native machine status' }))
+  await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
+  expect((await $.command.run(command('account-b'))).text ?? '').toContain('now uses account-b')
+  world.documents.delete(`${paths.loginDir('account-b')}/.credentials.json`)
+  for (const name of ['usage', 'status']) {
+    const text = (await $.command.run({ ...command(''), command: name })).text ?? ''
+    expect(text).toContain('account-b is not signed in yet')
+    expect(text).toContain('machine login was not reported')
+    expect(text).not.toContain('native machine')
+  }
 })
 
 test('the withdrawn setup-native command cannot recreate a launcher', async ($, on) => {

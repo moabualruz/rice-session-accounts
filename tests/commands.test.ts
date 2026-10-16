@@ -179,6 +179,19 @@ test('switching an unsigned Linux account points to setup without a macOS execut
   expect(world.writes).toEqual([])
 })
 
+for (const args of ['add personal-live', 'set-default login', 'remove personal-live']) {
+  test(`${args} keeps an accounts.json that does not parse instead of replacing it with defaults`, async ($, on) => {
+    const world = fixture(on)
+    const broken = '{ "accounts": { "personal-live": { "kind": "claudeai", '
+    world.files.set(configPath, broken)
+    const result = await $.command.run(command(args))
+    expect(result.text ?? '').toContain('accounts.json does not parse')
+    expect(world.files.get(configPath)).toBe(broken)
+    expect(world.writes).toEqual([])
+    expect(world.processes).toEqual([])
+  })
+}
+
 function withProvider(): Config {
   const initial = savedLogin()
   return {

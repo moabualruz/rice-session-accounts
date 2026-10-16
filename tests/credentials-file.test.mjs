@@ -89,3 +89,29 @@ test('a valid native machine store without OAuth is distinct from malformed or m
   fs.writeFileSync(file, JSON.stringify({ claudeAiOauth: { accessToken: 'incomplete-fixture' } }))
   assert.equal(run('read').status, 46)
 }))
+
+// Native Windows renewal locks run this static program because Windows has no /bin/sh.
+const lockText = fs.readFileSync(new URL('../hooks/lock.ts', import.meta.url), 'utf8')
+const lockPayload = /const NODE_LOCK = String\.raw`([\s\S]*?)`\n/.exec(lockText)?.[1]
+assert.ok(lockPayload, 'native lock program must be present')
+new vm.Script(lockPayload)
+
+test('the native lock program makes one lock directory, refuses a held lock and removes it idempotently', () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'rice-account-lock-test-'))
+  const lock = path.join(folder, 'locks', 'personal-live.lock')
+  const run = (operation, target = lock) => spawnSync(process.execPath, ['-e', lockPayload, operation, target], { encoding: 'utf8', timeout: 15_000 })
+  try {
+    assert.equal(run('make').status, 0)
+    assert.equal(fs.statSync(lock).isDirectory(), true)
+    const held = run('make')
+    assert.notEqual(held.status, 0)
+    assert.equal(held.stderr, 'EEXIST')
+    assert.equal(run('remove').status, 0)
+    assert.equal(fs.existsSync(lock), false)
+    assert.equal(run('remove').status, 0, 'an already removed lock is not an error')
+    assert.notEqual(run('make', 'relative.lock').status, 0)
+    assert.notEqual(run('unknown').status, 0)
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true })
+  }
+})

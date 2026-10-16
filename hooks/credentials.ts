@@ -15,11 +15,15 @@ export function hostPlatform(io: Io): Promise<HostPlatform> {
   if (known) return known
   const pending = (async (): Promise<HostPlatform> => {
     if (await io.env('OS') === 'Windows_NT') return 'win32'
-    const result = await io.run(['/usr/bin/uname', '-s'], { timeoutMs: 10_000 })
-      .catch(() => { throw new Error('Cannot detect the host OS: /usr/bin/uname -s must be available.') })
-    if (result.exitCode !== 0) throw new Error('Cannot detect the host OS: /usr/bin/uname -s failed.')
-    if (result.stdout.trim() === 'Darwin') return 'darwin'
-    if (result.stdout.trim() === 'Linux') return 'linux'
+    // Alpine and unmerged-/usr systems ship /bin/uname only; NixOS has neither path.
+    let system: string | undefined
+    for (const command of ['/usr/bin/uname', '/bin/uname', 'uname']) {
+      const result = await io.run([command, '-s'], { timeoutMs: 10_000 }).catch(() => undefined)
+      if (result?.exitCode === 0) { system = result.stdout.trim(); break }
+    }
+    if (system === undefined) throw new Error('Cannot detect the host OS: uname -s must be available.')
+    if (system === 'Darwin') return 'darwin'
+    if (system === 'Linux') return 'linux'
     throw new Error('Account storage supports macOS, Linux (including WSL) and native Windows.')
   })()
   platforms.set(io, pending)

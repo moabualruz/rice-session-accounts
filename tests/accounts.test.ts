@@ -67,6 +67,45 @@ test('a Linux isolated login reads the native credential file without launching 
   expect(commands.some(argv => argv[0] === '/usr/bin/security')).toBe(false)
 })
 
+test('Linux platform detection falls back to /bin/uname when /usr/bin/uname is absent', async () => {
+  const commands: (readonly string[])[] = []
+  const io = fixture(async argv => {
+    commands.push(argv)
+    if (argv[0] === '/usr/bin/uname') throw new Error('ENOENT')
+    if (argv[0] === '/bin/uname') return result('Linux\n')
+    throw new Error('unexpected executable')
+  })
+  expect(await hostPlatform(io)).toBe('linux')
+  expect(commands.map(argv => argv[0])).toEqual(['/usr/bin/uname', '/bin/uname'])
+})
+
+test('freshLogin renews an isolated native Windows grant without a POSIX shell for its lock', async () => {
+  const loginDir = 'C:\\Users\\me\\.claude/rice-session-accounts/logins/personal-live'
+  const nativePath = `${loginDir}/.credentials.json`
+  const lockPath = 'C:\\Users\\me\\.claude/rice-session-accounts/locks/personal-live.lock'
+  const expired = { ...login, claudeAiOauth: { ...login.claudeAiOauth, expiresAt: 1 } }
+  const commands: (readonly string[])[] = []
+  const io = fixture(async (argv, init) => {
+    commands.push(argv)
+    if (argv[0] === '/bin/sh' || argv[0] === '/usr/bin/uname') throw new Error('ENOENT: no POSIX executable on native Windows')
+    if (argv[0] === 'node' && argv[1] === '-e' && argv.length === 5 && argv[4] === lockPath) return result()
+    if (argv[0] === 'node' && argv[3] === 'read') return argv[4] === nativePath ? result(JSON.stringify(expired)) : result('', 44)
+    if (argv[0] === 'node' && argv[3] === 'write' && argv[4] === nativePath) {
+      const input = JSON.parse(init?.stdin ?? '{}') as { oauth: Credential['claudeAiOauth'] }
+      return result(JSON.stringify({ ...expired, claudeAiOauth: { ...expired.claudeAiOauth, ...input.oauth } }))
+    }
+    throw new Error('unexpected executable')
+  })
+  io.env = async name => name === 'OS' ? 'Windows_NT' : name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined
+  io.fetch = async () => ({ ok: true, status: 200, headers: {}, text: JSON.stringify({ access_token: 'rotated-access', refresh_token: 'rotated-grant', expires_in: 3600 }) })
+  const saved = await freshLogin(io, 'personal-live', { kind: 'claudeai', loginDir }, pathsFor('C:\\Users\\me\\.claude'), {
+    claudeDir: 'C:\\Users\\me\\.claude', user: 'me', storage: {},
+  })
+  expect(saved.claudeAiOauth.accessToken).toBe('rotated-access')
+  expect(commands.filter(argv => argv[4] === lockPath).map(argv => argv[3])).toEqual(['make', 'remove'])
+  expect(commands.some(argv => argv[0] === '/bin/sh' || argv[0] === '/usr/bin/uname')).toBe(false)
+})
+
 test('Linux storage directories follow native secure-storage override and empty override semantics', async () => {
   const location = { storage: { configDir: '/profiles/work' }, defaultConfigDir: '/home/me/.claude' }
   expect(nativeCredentialPath(location, '/home/me')).toBe('/profiles/work/.credentials.json')

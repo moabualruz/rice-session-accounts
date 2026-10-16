@@ -78,6 +78,9 @@ export function accountProblems(name: string, account: AccountConfig): string[] 
   return problems
 }
 
+/** The problem a file that does not parse reports, so writers can keep it for repair. */
+export const UNPARSED_CONFIG = 'accounts.json does not parse'
+
 /** The file's accounts, the bad ones left out and said; a file that does not parse is all problem. */
 export function parseConfig(text: string): { config: Config; problems: string[] } {
   const config = defaultConfig()
@@ -86,7 +89,7 @@ export function parseConfig(text: string): { config: Config; problems: string[] 
   try {
     raw = JSON.parse(text)
   } catch (error) {
-    return { config, problems: [`accounts.json does not parse: ${error instanceof Error ? error.message : String(error)}`] }
+    return { config, problems: [`${UNPARSED_CONFIG}: ${error instanceof Error ? error.message : String(error)}`] }
   }
   const top = (raw ?? {}) as { default?: unknown; accounts?: unknown }
   if (top.accounts && typeof top.accounts === 'object') {

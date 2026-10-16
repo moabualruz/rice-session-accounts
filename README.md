@@ -3,16 +3,19 @@
 Manage saved Anthropic OAuth accounts in Claude Code.
 `/rice-account` opens an account picker showing each saved name, email and plan.
 
-**0.4.0:** this version switches accounts through the public
+**0.4.1:** this version switches accounts through the public
 plugin API inside ordinary, unmodified `claude`. It sets authentication only in
 the invoking process, replaces `/usage` and interactive `/status` with selected-account reports, and
 shows the selected name, email, plan and usage in the plugin's status entry.
-The earlier **0.3.0** release contains the withdrawn native-bridge guard.
+0.4.1 fixes token renewal on native Windows, keeps `/usage` and `/status`
+on the selected account when its report fails, and refuses to overwrite an
+`accounts.json` that does not parse. The earlier **0.3.0** release contains the
+withdrawn native-bridge guard.
 No replacement launcher, preload, gateway
 or proxy is part of this flow.
 
 The ordinary-Claude native SDK proof is qualified against Claude Code
-**2.1.301**. Older 2.1.296 and 2.1.299 cohorts check plugin and storage
+**2.1.301**. The 2.1.296, 2.1.299 and 2.1.302 cohorts check plugin and storage
 compatibility, rather than the complete current account-switching proof.
 Native panels outside the replaced `/usage` and `/status` commands can still display cached
 machine-account metadata. The plugin does not claim to rewrite those internal

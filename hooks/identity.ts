@@ -78,7 +78,9 @@ export async function accountIdentity(io: Io, account: AccountConfig, machine: M
   } else if (machine.storage.configDir) {
     paths.push(metadataPath(machine.storage.configDir))
   } else {
-    const home = await io.env('HOME').catch(() => undefined)
+    // Native Windows keeps ~/.claude.json under USERPROFILE, which HOME rarely names.
+    const windows = await io.env('OS').catch(() => undefined) === 'Windows_NT'
+    const home = (windows ? await io.env('USERPROFILE').catch(() => undefined) : undefined) ?? await io.env('HOME').catch(() => undefined)
     if (home) paths.push(metadataPath(home))
     const fallback = metadataPath(machine.claudeDir)
     if (!paths.includes(fallback)) paths.push(fallback)
