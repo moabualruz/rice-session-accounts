@@ -135,8 +135,60 @@ test('bad args and unsupported runtimes fail before any account or credential op
   const deps = { major: 22, platform: 'linux', env: {}, read: () => { reads++; throw Error('unexpected') } }
   for (const args of [[], ['personal', 'extra'], ['--config-dir'], ['../bad'], ['--unknown']]) await assert.rejects(runSetup(args, deps), /Usage:|needs a directory/)
   await assert.rejects(runSetup(['personal'], { ...deps, major: 20 }), /22 or later/)
-  await assert.rejects(runSetup(['personal'], { ...deps, platform: 'win32' }), /macOS and Linux/)
+  await assert.rejects(runSetup(['personal'], { ...deps, platform: 'freebsd' }), /macOS, Linux/)
   assert.equal(reads, 0)
+})
+
+test('Windows browser setup uses USERPROFILE, drive-qualified credential storage and native login arguments', async () => {
+  const calls = [], prepared = [], reads = []
+  const loginDir = 'C:\\Users\\fixture user\\accounts\\personal'
+  let ready = false
+  await runSetup(['personal'], {
+    platform: 'win32', major: 22, env: { USERPROFILE: 'C:\\Users\\fixture user', HOME: '/wrong-home', SystemRoot: 'C:\\Windows' },
+    read: path => { reads.push(path); return JSON.stringify({ accounts: { personal: { kind: 'claudeai', loginDir } } }) },
+    prepare: path => prepared.push(path), log: () => {},
+    exec: (command, args, init) => {
+      calls.push({ command, args, init })
+      if (args[1] === 'login') ready = true
+      return { status: ready ? 0 : 1, stdout: JSON.stringify({ loggedIn: ready, authMethod: ready ? 'claude.ai' : 'none', apiProvider: 'firstParty' }) }
+    },
+  })
+  assert.deepEqual(reads, ['C:\\Users\\fixture user\\.claude\\rice-session-accounts\\accounts.json'])
+  assert.deepEqual(prepared, [loginDir])
+  assert.deepEqual(calls.map(call => call.args), [['auth', 'status', '--json'], ['auth', 'login', '--claudeai'], ['auth', 'status', '--json']])
+  for (const call of calls) assert.equal(call.init.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, loginDir)
+})
+
+test('Windows token setup uses Credential Manager through stdin, with no token in arguments or logs', async () => {
+  const world = fixture({ kind: 'claudeai-token', secret: { service: 'rice-session-accounts', account: 'personal' } }, { platform: 'win32', env: { USERPROFILE: 'C:\\Users\\fixture', SystemRoot: 'C:\\Windows' } })
+  let stored = false
+  world.deps.exec = (command, args, init = {}) => {
+    world.calls.push({ command, args, init })
+    if (command === 'claude') return { status: 0 }
+    const request = JSON.parse(init.input)
+    if (request.operation === 'write') { stored = true; assert.equal(request.secret, 'fixture-private-value'); return { status: 0 } }
+    return { status: stored ? 0 : 44, stdout: stored ? 'fixture-private-value' : '' }
+  }
+  await world.run()
+  assert.equal(world.calls.length, 4)
+  assert.equal(world.calls[0].command, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+  assert.deepEqual(world.calls[1].args, ['setup-token'])
+  assert.equal(JSON.stringify(world.calls.map(call => [call.command, call.args])).includes('fixture-private-value'), false)
+  assert.equal(world.messages.join('\n').includes('fixture-private-value'), false)
+})
+
+test('Windows rejects drive-relative login directories before preparing storage or launching authentication', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: '\\relative-to-current-drive' }, { platform: 'win32' })
+  await assert.rejects(world.run(), /absolute loginDir/)
+  assert.deepEqual(world.prepared, [])
+  assert.deepEqual(world.calls, [])
+})
+
+test('a requested unsupported Windows vendor store is rejected before login preparation', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: 'C:\\fixture\\login' }, { platform: 'win32', env: { USERPROFILE: 'C:\\fixture', FORCE_WINDOWS_CREDMAN: '1' } })
+  await assert.rejects(world.run(), /FORCE_WINDOWS_CREDMAN/)
+  assert.deepEqual(world.prepared, [])
+  assert.deepEqual(world.calls, [])
 })
 
 test('the actual CLI exits nonzero with a useful missing-account error', () => {

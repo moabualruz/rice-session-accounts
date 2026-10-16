@@ -45,6 +45,18 @@ async function variable($: EngineInterface, name: EnvName): Promise<string | und
       return $.env.get('HOME')
     case 'USER':
       return $.env.get('USER')
+    case 'OS':
+      return $.env.get('OS')
+    case 'USERPROFILE':
+      return $.env.get('USERPROFILE')
+    case 'USERNAME':
+      return $.env.get('USERNAME')
+    case 'SystemRoot':
+      return $.env.get('SystemRoot')
+    case 'WINDIR':
+      return $.env.get('WINDIR')
+    case 'FORCE_WINDOWS_CREDMAN':
+      return $.env.get('FORCE_WINDOWS_CREDMAN')
     case 'CLAUDE_CONFIG_DIR':
       return $.env.get('CLAUDE_CONFIG_DIR')
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
@@ -60,6 +72,8 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
       return $.env.get('ANTHROPIC_AUTH_TOKEN')
     case 'CLAUDE_CODE_OAUTH_TOKEN':
       return $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+    case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
+      return $.env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')
     case 'ANTHROPIC_BASE_URL':
       return $.env.get('ANTHROPIC_BASE_URL')
     case 'CLAUDE_CODE_USE_BEDROCK':
@@ -119,6 +133,8 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
       return $.env.set('ANTHROPIC_AUTH_TOKEN', value)
     case 'CLAUDE_CODE_OAUTH_TOKEN':
       return $.env.set('CLAUDE_CODE_OAUTH_TOKEN', value)
+    case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
+      return $.env.set('CLAUDE_SECURESTORAGE_CONFIG_DIR', value)
     case 'ANTHROPIC_BASE_URL':
       return $.env.set('ANTHROPIC_BASE_URL', value)
     case 'CLAUDE_CODE_USE_BEDROCK':
@@ -187,12 +203,14 @@ function machineIo($: EngineInterface): Io {
 
 async function machineOf($: EngineInterface): Promise<Machine> {
   const configDir = await variable($, 'CLAUDE_CONFIG_DIR')
-  const home = (await variable($, 'HOME')) ?? ''
+  const windows = await variable($, 'OS') === 'Windows_NT'
+  const home = (windows ? await variable($, 'USERPROFILE') : undefined) ?? (await variable($, 'HOME')) ?? ''
+  const originals = (await read($, originalsAtom)) ?? mirror.originals
 
   return {
     claudeDir: configDir || `${home}/.claude`,
-    user: await variable($, 'USER'),
-    storage: { configDir: configDir || undefined, secureStorageDir: await variable($, 'CLAUDE_SECURESTORAGE_CONFIG_DIR') },
+    user: (windows ? await variable($, 'USERNAME') : undefined) ?? await variable($, 'USER'),
+    storage: { configDir: configDir || undefined, secureStorageDir: originals ? originals.CLAUDE_SECURESTORAGE_CONFIG_DIR ?? undefined : await variable($, 'CLAUDE_SECURESTORAGE_CONFIG_DIR') },
   }
 }
 
@@ -213,6 +231,25 @@ async function saveConfig($: EngineInterface, config: Config): Promise<void> {
 
 /** The managed variables as this process started, taken once and kept across reloads and /clear. */
 async function originalsOf($: EngineInterface): Promise<Originals> {
+  const startup = await $.env.get('RICE_SESSION_ACCOUNTS_INITIAL_ORIGINALS')
+  if (startup !== undefined) {
+    let supplied: Record<string, unknown>
+    try {
+      const value: unknown = JSON.parse(startup)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid startup metadata')
+      supplied = value as Record<string, unknown>
+    } catch { throw new Error('The account launcher supplied invalid startup authentication metadata. Start a fresh managed launcher session.') }
+    const taken = {} as Originals
+    for (const name of MANAGED) {
+      const value = supplied[name]
+      if (value !== null && typeof value !== 'string') throw new Error('The account launcher supplied incomplete startup authentication metadata. Start a fresh managed launcher session.')
+      taken[name] = value
+    }
+    await $.env.set('RICE_SESSION_ACCOUNTS_INITIAL_ORIGINALS', undefined)
+    mirror = { ...mirror, originals: taken }
+    await update($, originalsAtom, () => taken)
+    return taken
+  }
   const kept = (await read($, originalsAtom)) ?? mirror.originals
   if (kept) {
     if (!(await read($, originalsAtom))) await update($, originalsAtom, () => kept)
@@ -259,6 +296,9 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
     throw new Error(`No account named ${name}. Saved: ${Object.keys(config.accounts).join(', ')}${extra}`)
   }
   if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
+  const nativeActive = await $.env.get('RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE') === '1'
+  if (name !== LOGIN_NAME && !nativeActive) throw new Error('Account switching requires the native account cache bridge. Run /rice-account setup-native <absolute path to a qualified Claude executable>, then start a new session with rice-account-claude or the configured rice-claude launcher.')
+  const previousName = mirror.active?.name ?? LOGIN_NAME
   const machine = await machineOf($)
   const originals = await originalsOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
@@ -273,21 +313,27 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   await update($, activeAtom, () => active)
   expiresAt = material.expiresAt
   scheduleRenewal($, name, now)
+  // Commit only a completed account transition, not same-account token renewal.
+  // The main-process bridge resets OAuth/quota caches and retires old responses.
+  if (previousName !== name) await $.env.set('RICE_SESSION_ACCOUNTS_AUTH_REVISION', name)
   $.ui.status(statusText(name, account))
   if (isQuiet) return ''
   const email = account.kind === 'claudeai' ? await loginEmail(machineIo($), account.loginDir) : undefined
 
   return name === LOGIN_NAME
-    ? "This session is back on this machine's /login. Other sessions were not touched."
+    ? `This session is back on this machine's /login. Other sessions were not touched.${nativeActive ? '' : ' Native account reporting needs a fresh rice-account-claude session; run /rice-account setup-native.'}`
     : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
 }
 
 /** After a reload (state kept) or a /clear (module kept), the account this process holds is put back in both. */
 async function restore($: EngineInterface): Promise<void> {
   await originalsOf($)
-  const kept = (await read($, activeAtom)) ?? mirror.active
+  const initial = await $.env.get('RICE_SESSION_ACCOUNTS_INITIAL_ACCOUNT')
+  if (initial !== undefined) await $.env.set('RICE_SESSION_ACCOUNTS_INITIAL_ACCOUNT', undefined)
+  const kept = initial ? { name: initial, switchedAt: await $.clock.now() } : (await read($, activeAtom)) ?? mirror.active
   if (!kept) return
-  if (!(await read($, activeAtom))) await update($, activeAtom, () => kept)
+  if (initial || !(await read($, activeAtom))) await update($, activeAtom, () => kept)
+  mirror = { ...mirror, active: kept }
   await switchTo($, kept.name, true).catch((error: unknown) => {
     $.ui.toast(`${PLUGIN}: could not keep ${kept.name}: ${message(error)}`)
   })
@@ -400,13 +446,23 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     if (first === 'usage') return await usageText($)
     if (first === 'check') return await checkText($, rest[0] ?? mirror.active?.name ?? LOGIN_NAME)
     if (first === 'default') return await switchTo($, (await loadConfig($)).config.default)
+    if (first === 'setup-native') {
+      let executable = args.trim().slice('setup-native'.length).trim()
+      if (executable.startsWith('"') || executable.startsWith("'")) {
+        const quote = executable[0]
+        if (executable.at(-1) !== quote) return 'Usage: /rice-account setup-native [absolute path to a qualified Claude executable]'
+        executable = executable.slice(1, -1)
+      }
+      const result = await $.process.run(['node', `${$.plugin.root}/native/launch.mjs`, '--install', ...(executable ? [executable] : [])], { timeoutMs: 40_000 })
+      return result.exitCode === 0 ? result.stdout.trim() : result.stderr.trim() || 'Native account launcher setup failed. Use an absolute path to a qualified native Claude executable.'
+    }
     if (first === 'setup') {
       const name = rest[0]
       const { config } = await loadConfig($)
       if (!name || !config.accounts[name] || rest.length !== 1) return 'Usage: /rice-account setup <saved name>'
       if (!(KINDS as readonly string[]).includes(config.accounts[name]!.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
       if (name === LOGIN_NAME) return 'The built-in login uses this machine\'s Claude Code authentication. Run claude auth login in a terminal.'
-      return setupText($.plugin.root, (await machineOf($)).claudeDir, name)
+      return setupText($.plugin.root, (await machineOf($)).claudeDir, name, false, (await variable($, 'OS')) === 'Windows_NT' ? 'win32' : 'posix')
     }
     if (first === 'add') {
       const [name, word, ...tail] = rest
@@ -420,7 +476,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       const added = addAccount(config, name, kind as Kind, parseOptions(more), pathsFor(machine.claudeDir))
       if (added.config !== config) await saveConfig($, added.config)
 
-      return setupText($.plugin.root, machine.claudeDir, name, !config.accounts[name])
+      return setupText($.plugin.root, machine.claudeDir, name, !config.accounts[name], (await variable($, 'OS')) === 'Windows_NT' ? 'win32' : 'posix')
     }
     if (first === 'remove') {
       const name = rest[0]
@@ -470,7 +526,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'rice-account',
       description: 'Choose a Claude OAuth account by email and tier, or add, set up and check accounts',
-      argumentHint: '[<name> | list | setup <name> | check [name] | add <name> [kind] | remove <name>]',
+      argumentHint: '[<name> | list | setup <name> | setup-native [absolute executable] | check [name] | add <name> [kind] | remove <name>]',
     })
     await restore($)
     await syncDescendantAuth($)

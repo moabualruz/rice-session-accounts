@@ -10,6 +10,7 @@ export const MANAGED = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR',
   'ANTHROPIC_BASE_URL',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
@@ -49,6 +50,7 @@ const AUTH: readonly Managed[] = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
@@ -79,6 +81,9 @@ export function planEnv(account: AccountConfig, secret: string | undefined, orig
   for (const name of AUTH) plan[name] = undefined
   switch (account.kind) {
     case 'claudeai':
+      if (!account.loginDir) throw new Error('The browser account has no native login directory.')
+      plan.CLAUDE_SECURESTORAGE_CONFIG_DIR = account.loginDir
+      break
     case 'claudeai-token':
       plan.CLAUDE_CODE_OAUTH_TOKEN = secret
       break

@@ -1,7 +1,7 @@
 {
   "name": "rice-session-accounts",
-  "version": "0.2.0",
-  "description": "Choose an Anthropic OAuth account by email and tier for this session; resumable setup on macOS, Linux and WSL, with the machine's configuration preserved",
+  "version": "0.3.0",
+  "description": "Choose an Anthropic OAuth account by email and tier for this session; native account usage and resumable setup on macOS, Linux, WSL and Windows, with the machine's configuration preserved",
   "types": "./types/index.d.ts",
   "license": "MIT",
   "author": {

@@ -2,10 +2,11 @@
 import { spawnSync } from 'node:child_process'
 import { chmodSync, lstatSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, posix, win32 } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { WINDOWS_CREDENTIAL_STORE, WINDOWS_PRIVATE_DIRECTORY } from './windows-store-payloads.mjs'
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/
 const AUTH_ENV = [
@@ -33,12 +34,27 @@ export function loginEnvironment(environment, loginDir) {
 
 /** Login owns credential storage. This helper never copies a credential to a file. */
 function privateDirectory(path) {
+  if (process.platform === 'win32') {
+    successful(execute(windowsPowerShell(process.env), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_PRIVATE_DIRECTORY], { input: JSON.stringify({ path }) }), 'Private Windows login directory setup')
+    return
+  }
   mkdirSync(path, { recursive: true, mode: 0o700 })
   const stat = lstatSync(path)
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid()) {
     throw Error('The isolated login directory must be a directory owned by the current user, without a symlink.')
   }
   chmodSync(path, 0o700)
+}
+
+function windowsPowerShell(env) {
+  const root = env.SystemRoot || env.WINDIR
+  return root ? win32.join(root, 'System32/WindowsPowerShell/v1.0/powershell.exe') : 'powershell.exe'
+}
+
+function absoluteDirectory(value, platform) {
+  return typeof value === 'string' && !/[\0\r\n]/.test(value) && (platform === 'win32'
+    ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(value)
+    : value.startsWith('/'))
 }
 
 async function hiddenInput(label) {
@@ -98,31 +114,38 @@ function credentialLine(service, account, secret) {
 async function secretSetup(account, name, deps, force) {
   const ref = secretArguments(account, name)
   const mac = deps.platform === 'darwin'
-  const command = mac ? '/usr/bin/security' : 'secret-tool'
+  const windows = deps.platform === 'win32'
+  const command = windows ? windowsPowerShell(deps.env) : mac ? '/usr/bin/security' : 'secret-tool'
   const lookup = mac
     ? ['find-generic-password', '-s', ref.service, '-a', ref.account, '-w']
-    : ['lookup', 'service', ref.service, 'account', ref.account]
-  const existing = deps.exec(command, lookup)
-  if (!mac && existing.status !== 0 && existing.hasErrorOutput) {
+    : windows ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_CREDENTIAL_STORE]
+      : ['lookup', 'service', ref.service, 'account', ref.account]
+  const lookupOptions = windows ? { input: JSON.stringify({ operation: 'read', service: ref.service, account: ref.account }) } : undefined
+  const existing = deps.exec(command, lookup, lookupOptions)
+  if (!mac && !windows && existing.status !== 0 && existing.hasErrorOutput) {
     throw Error('Linux Secret Service is unavailable or locked. Start an accessible user keyring, unlock it, and rerun setup.')
   }
   if (!force && existing.status === 0 && existing.stdout.trim()) {
     deps.log('A credential is already stored. Use --login to replace it.')
     return
   }
-  if (existing.status !== 0 && existing.status !== (mac ? 44 : 1)) {
+  if (existing.status !== 0 && existing.status !== (mac || windows ? 44 : 1)) {
     throw Error('The credential store is unavailable or locked. Unlock it and rerun setup.')
   }
   if (account.kind === 'claudeai-token') {
     deps.log('Claude Code will generate a setup token. Copy it for the hidden prompt that follows.')
-    successful(deps.exec('claude', ['setup-token'], { interactive: true, env: loginEnvironment(deps.env, account.loginDir ?? join(deps.configDir, 'rice-session-accounts', 'logins', name)) }), 'Token setup')
+    const paths = deps.platform === 'win32' ? win32 : posix
+    const tokenDir = account.loginDir ?? paths.join(deps.configDir, 'rice-session-accounts', 'logins', name)
+    deps.prepare(tokenDir)
+    successful(deps.exec('claude', ['setup-token'], { interactive: true, env: loginEnvironment(deps.env, tokenDir) }), 'Token setup')
   }
   const secret = await deps.prompt('Claude setup token')
-  const stored = mac
-    ? deps.exec(command, ['-i'], { input: credentialLine(ref.service, ref.account, secret) })
-    : deps.exec(command, ['store', '--label', `Rice account ${name}`, 'service', ref.service, 'account', ref.account], { input: `${secret}\n` })
+  const stored = windows
+    ? deps.exec(command, lookup, { input: JSON.stringify({ operation: 'write', service: ref.service, account: ref.account, secret }) })
+    : mac ? deps.exec(command, ['-i'], { input: credentialLine(ref.service, ref.account, secret) })
+      : deps.exec(command, ['store', '--label', `Rice account ${name}`, 'service', ref.service, 'account', ref.account], { input: `${secret}\n` })
   successful(stored, 'Credential storage')
-  const verified = deps.exec(command, lookup)
+  const verified = deps.exec(command, lookup, lookupOptions)
   if (verified.status !== 0 || verified.stdout.replace(/\r?\n$/, '') !== secret) {
     throw Error('The credential could not be read back from the credential store. Unlock it and rerun setup.')
   }
@@ -131,15 +154,17 @@ async function secretSetup(account, name, deps, force) {
 export async function runSetup(args, overrides = {}) {
   const deps = { ...native, ...overrides }
   if (deps.major < 22) throw Error('Account setup needs Node.js 22 or later.')
-  if (!['darwin', 'linux'].includes(deps.platform)) throw Error('Account setup supports macOS and Linux (including WSL).')
-  let configDir = deps.env.CLAUDE_CONFIG_DIR || join(deps.env.HOME || homedir(), '.claude')
+  if (!['darwin', 'linux', 'win32'].includes(deps.platform)) throw Error('Account setup supports macOS, Linux (including WSL) and native Windows.')
+  const paths = deps.platform === 'win32' ? win32 : posix
+  const home = deps.platform === 'win32' ? deps.env.USERPROFILE || deps.env.HOME || homedir() : deps.env.HOME || homedir()
+  let configDir = deps.env.CLAUDE_CONFIG_DIR || paths.join(home, '.claude')
   let force = false
   const names = []
   for (let at = 0; at < args.length; at++) {
     const word = args[at]
     if (word === '--config-dir') {
       if (!args[at + 1] || args[at + 1].startsWith('--')) throw Error('--config-dir needs a directory.')
-      configDir = resolve(args[++at])
+      configDir = paths.resolve(args[++at])
     } else if (word === '--login') force = true
     else if (word.startsWith('-')) throw Error('Usage: node account-setup.mjs [--config-dir <directory>] [--login] <saved name>')
     else names.push(word)
@@ -148,13 +173,14 @@ export async function runSetup(args, overrides = {}) {
   deps.configDir = configDir
   const name = names[0]
   let config
-  try { config = JSON.parse(deps.read(join(configDir, 'rice-session-accounts', 'accounts.json'))) }
+  try { config = JSON.parse(deps.read(paths.join(configDir, 'rice-session-accounts', 'accounts.json'))) }
   catch { throw Error('Cannot read accounts.json. First run /rice-account add <name> inside Claude Code.') }
   const account = Object.hasOwn(config?.accounts ?? {}, name) ? config.accounts[name] : undefined
   if (!account || typeof account !== 'object') throw Error(`${name} is not saved. First run /rice-account add ${name}.`)
   if (account.kind === 'login') throw Error('The built-in login uses claude auth login directly.')
   if (account.kind === 'claudeai') {
-    if (typeof account.loginDir !== 'string' || !account.loginDir.startsWith('/')) throw Error(`${name} has no absolute loginDir. Check accounts.json.`)
+    if (deps.platform === 'win32' && deps.env.FORCE_WINDOWS_CREDMAN && !/^(?:0|false|no|off)$/i.test(deps.env.FORCE_WINDOWS_CREDMAN)) throw Error('The optional FORCE_WINDOWS_CREDMAN browser store is not supported by Rice Accounts. Run this setup without that override, or add a claudeai-token account for Windows Credential Manager.')
+    if (!absoluteDirectory(account.loginDir, deps.platform)) throw Error(`${name} has no absolute loginDir. Check accounts.json.`)
     deps.prepare(account.loginDir)
     const env = loginEnvironment(deps.env, account.loginDir)
     const status = () => {

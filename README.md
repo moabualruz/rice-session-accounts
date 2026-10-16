@@ -11,13 +11,16 @@ browser sign-ins, and `claudeai-token` setup tokens. Model and provider
 configuration belongs to [rice-multi-models](https://github.com/moabualruz/rice-multi-models).
 
 The plugin is named **rice-session-accounts**. Its command is **`/rice-account`**.
-It supports macOS and Linux, including WSL. Install Node.js 22 or newer and make
-`node` available in the environment where Claude runs. The setup helper and the
-Linux credential backend use it.
+It supports macOS, Linux (including WSL), and native Windows. Install Node.js 22 or newer and make
+`node` available in the environment where Claude runs. The setup helper, native
+launcher and credential-file backend use it.
 
-Version 0.2.0 was verified with native Claude Code 2.1.296 on WSL and 2.1.300 on
-macOS. See [verification details](docs/verification/0.2.0.md) for the checks and
-their scope.
+Version 0.3.0 adds a native account cache bridge. Use a qualified native Claude
+runtime through the managed launcher below. The bridge clears the previous
+account's usage immediately and rejects delayed usage headers from that account.
+Native Claude 2.1.301 and other versions need qualification before use.
+See [0.3.0 verification details](docs/verification/0.3.0.md) for the qualified
+platforms and actual native SDK, usage, Windows and launcher checks.
 
 ## Install
 
@@ -28,8 +31,62 @@ claude plugin install rice-session-accounts --marketplace moabualruz/rice-mods
 ```
 
 This adds the Rice marketplace if necessary and installs the plugin. Start a new
-Claude Code session, approve the plugin's requested capabilities when prompted,
-and enter:
+Claude Code session and approve its requested capabilities when prompted.
+
+Use a native Claude 2.1.299 executable. If the machine's usual `claude` is already
+that version, `/rice-account setup-native` can find it. Otherwise, install a
+private official runtime in a terminal, without replacing the machine's CLI:
+
+```sh
+npm install --prefix "$HOME/.claude/rice-session-accounts/runtimes/claude-2.1.299" @anthropic-ai/claude-code@2.1.299 --no-audit --no-fund
+"$HOME/.claude/rice-session-accounts/runtimes/claude-2.1.299/node_modules/.bin/claude" --version
+```
+
+On native Windows, use PowerShell:
+
+```powershell
+npm install --prefix "$HOME\.claude\rice-session-accounts\runtimes\claude-2.1.299" @anthropic-ai/claude-code@2.1.299 --no-audit --no-fund
+& "$HOME\.claude\rice-session-accounts\runtimes\claude-2.1.299\node_modules\@anthropic-ai\claude-code\bin\claude.exe" --version
+```
+
+Then return to Claude Code and give setup the full absolute executable path.
+For example, on Linux:
+
+```text
+/rice-account setup-native /home/yourname/.claude/rice-session-accounts/runtimes/claude-2.1.299/node_modules/.bin/claude
+```
+
+On Windows, select the actual native `.exe`:
+
+```text
+/rice-account setup-native "C:\Users\yourname\.claude\rice-session-accounts\runtimes\claude-2.1.299\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
+```
+
+On macOS use your `/Users/yourname/...` path. Replace the example username with
+your own. Slash commands do not expand `$HOME` or `~`; quote the full path when
+it contains spaces. You can select an existing qualified private runtime from
+rice-multi-models instead of installing a second copy.
+
+Setup verifies the runtime before saving it and installs
+`~/.local/bin/rice-account-claude`. Keep `~/.local/bin` on your terminal's `PATH`.
+Start a new session with:
+
+```sh
+rice-account-claude
+```
+
+On Windows, the managed command is `rice-account-claude.cmd`. Keep
+`$HOME\.local\bin` on `PATH`, or start it explicitly in PowerShell:
+
+```powershell
+& "$HOME\.local\bin\rice-account-claude.cmd"
+```
+
+Use the native executable rather than an npm `.cmd` wrapper as the saved runtime.
+
+The launcher remembers the verified executable, checks the bridge on every
+launch, and follows normal plugin updates. It preserves the machine's official
+Claude executable, updater and configuration. In this new session, enter:
 
 ```text
 /rice-account
@@ -56,7 +113,9 @@ claude plugin marketplace update rice-mods
 claude plugin update rice-session-accounts@rice-mods
 ```
 
-Restart Claude Code after updating so the session loads the new plugin code.
+Start a new `rice-account-claude` session after updating so the session loads
+the new plugin code and native bridge. Merely reloading a plugin in a running
+ordinary `claude` process cannot install the main-process bridge.
 
 ## Add your personal Claude account
 
@@ -75,7 +134,7 @@ Restart Claude Code after updating so the session loads the new plugin code.
    finish, and checks the saved credential. Choose the intended account in the
    browser. Follow the printed browser instructions if WSL cannot open it.
    If the saved account is already signed in, the helper checks its local login
-   status and skips the browser login. The check in the next step contacts the
+   status and skips the browser login. The check in the next step contacts
    Anthropic.
 
 3. When setup succeeds, return to Claude Code:
@@ -149,6 +208,7 @@ Use another name when adding an account with a different kind or configuration.
 | `/rice-account check [name]` | Check the named sign-in or setup token, or the current account when omitted. Saved OAuth tokens use Anthropic's profile endpoint when their permissions allow it. |
 | `/rice-account usage` | Show the current account's reported five-hour and weekly usage windows. Some setup tokens cannot access this information. |
 | `/rice-account setup <name>` | Print the terminal command to complete or repeat an account's setup. |
+| `/rice-account setup-native [absolute executable]` | Verify and save a qualified native runtime and install the account launcher. Run in ordinary Claude or the managed launcher. |
 | `/rice-account remove <name>` | Remove a saved account's configuration. The command explains any remaining credential cleanup. |
 
 Independent sessions launched from your usual terminal keep their normal login.
@@ -157,19 +217,57 @@ selected account. `/rice-account login` restores the credential environment the
 current process started with, including an inherited account for a child process.
 A selection survives plugin reload and `/clear` in the current process. Changing
 an account does not alter already-running independent sessions or children.
+Existing in-process subagents use the newly selected account on their next
+request. A request already in flight completes with its original credential.
+Its delayed usage headers cannot replace the new account's usage.
 
-## Linux and WSL credentials
+After a switch, native usage displays are temporarily unknown until the new
+account returns usage headers. `/rice-account usage` separately asks Anthropic
+for the currently selected account's limits when that credential permits it.
+The previous account's usage is never carried forward by the bridge.
 
-- A `claudeai` account uses Claude Code's own isolated login folder. On Linux and
-  WSL, Claude stores that login in the folder's native `.credentials.json` file.
-  On macOS, Claude uses the keychain item associated with that folder.
+To resume a conversation using a saved browser account from the very first
+request, select it at launch:
+
+```sh
+rice-account-claude --account personal-live --resume SESSION_ID
+```
+
+With the current rice-multi-models launcher, the equivalent is:
+
+```sh
+rice-claude --account personal-live --resume SESSION_ID
+```
+
+`--account` selects the native authentication folder before Claude loads the
+conversation or performs startup compaction. It keeps the machine's main
+settings and the resumed model configuration. This flag accepts saved
+`claudeai` browser accounts. Select setup-token accounts inside the managed
+session. `--account login` is refused because a launcher started by another
+selected session cannot infer the original terminal's machine baseline. Start
+from a normal terminal without `--account` for the machine login.
+Replace `SESSION_ID` with the conversation ID you want to resume.
+
+## Credentials on each operating system
+
+- A `claudeai` account uses Claude Code's own isolated login folder. On Linux,
+  WSL and native Windows, Claude stores that login in the folder's native
+  `.credentials.json` file. On macOS, Claude uses the keychain item associated
+  with that folder. Rice preserves the native file's permissions on refresh;
+  Windows files use a private owner-only ACL and reject reparse points.
 - Setup tokens entered into this plugin's helper use the macOS Keychain
-  or Linux Secret Service through `secret-tool`. The plugin does not create a
-  separate plaintext token store.
+  or Linux Secret Service through `secret-tool`. On native Windows, they use
+  Windows Credential Manager. The plugin does not create a separate plaintext
+  token store.
 - Linux `claudeai` browser login does not require `secret-tool`. Setup-token
   accounts do require `secret-tool`, a running Secret Service implementation and
   access to an unlocked collection in the same user session. Installing the
   executable alone does not provide a working keyring.
+- Native Windows setup prints a command quoted for PowerShell. Browser login
+  uses the ordinary native credential file. An explicitly requested optional
+  `FORCE_WINDOWS_CREDMAN` browser store is refused with instructions rather than
+  silently reading another store; this restriction does not affect setup-token
+  accounts, which use the plugin's own Credential Manager entries.
 
 If a Linux setup-token account reports that `secret-tool` is missing, install the
 package that provides it for your distribution. Debian and Ubuntu use
@@ -194,6 +292,8 @@ helper reports missing prerequisites before prompting for a token.
 | Browser login used the wrong account, or a login can no longer renew | Run `/rice-account setup <name>` again. Append `--login` to the generated terminal command to force a fresh sign-in. |
 | A copied setup command no longer exists after a plugin update | Run `/rice-account setup <name>` again to get the current installed path. |
 | `node` is missing or too old | Install Node.js 22 or newer on the machine running the helper, then rerun its command. WSL needs its own Linux Node installation. |
+| A switch says the native account cache bridge is required | Run `/rice-account setup-native` with a qualified runtime, then launch a new session with `rice-account-claude`. Existing ordinary Claude processes cannot load the main-process bridge by plugin reload alone. `login` remains available to restore launch credentials. |
+| The saved native runtime is missing or unsupported | Run `/rice-account setup-native /absolute/path/to/qualified/claude` again. Failed setup retains the previous saved selection. The launcher reports the problem instead of silently choosing a different machine CLI. |
 | An older provider account is missing from the picker | This mod now switches Anthropic OAuth accounts only. Legacy provider entries are retained in configuration but cannot be selected here. Configure providers in rice-multi-models. |
 
 ## Files and session behavior
@@ -205,8 +305,12 @@ The default config directory is `~/.claude`. When Claude Code starts with
   credential references.
 - `rice-session-accounts/logins/<name>/` is each `claudeai` account's isolated
   native Claude config directory.
+- `rice-session-accounts/native-launcher.json` remembers the verified native
+  executable for the managed launcher. It contains no credential.
 - The `rice-session-accounts` Keychain or Secret Service service stores named
   setup tokens by account name, unless the account specifies `service=`.
+  Windows Credential Manager uses plugin-owned entries derived from that
+  service and account reference.
 
 The isolated folders hold only the additional account logins. Switching accounts
 does not change the current session's config directory, settings, installed
@@ -229,6 +333,11 @@ proof for subagents, both process APIs, Bash, `claude -p`, sibling sessions and 
 fresh session. Credentials and model replies in that proof are synthetic; the
 processes and configuration inheritance are real. It does not use your accounts
 or install the plugin.
+The actual native SDK proof also checks main and existing-agent Authorization
+headers against synthetic A/B credentials, immediate usage reset, and a held
+old-account response. The launcher proof installs only into its owned temporary
+HOME and checks saved-runtime selection and failure recovery. Both are isolated
+from real accounts and provider services.
 
 Adapted from [simplecore-inc/claude-mods](https://github.com/simplecore-inc/claude-mods)
 (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

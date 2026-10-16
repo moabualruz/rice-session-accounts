@@ -12,12 +12,12 @@ function command(args: string): CommandRunInput {
 }
 
 /** All account, credential and process effects stay inside the native test host. */
-function fixture(on: On, initial?: Config) {
+function fixture(on: On, initial?: Config, nativeSetup = false) {
   const files = new Map<string, string>(initial ? [[configPath, serializeConfig(initial)]] : [])
   const reads: string[] = []
   const writes: { path: string; text: string }[] = []
   const processes: (readonly string[])[] = []
-  mock.env(on, { HOME: '/fixture/home', USER: 'fixture', CLAUDE_CONFIG_DIR: configDir })
+  mock.env(on, { HOME: '/fixture/home', USER: 'fixture', CLAUDE_CONFIG_DIR: configDir, RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE: '1' })
   mock.clock(on, { now: 1_800_000_000_000 })
   mock.store(on)
   on('state.get', () => ({ value: { value: undefined, version: 0 } }))
@@ -38,6 +38,7 @@ function fixture(on: On, initial?: Config) {
   on('fs.list', () => ({ value: [] }))
   on('process.run', (_host, input) => {
     processes.push(input.argv)
+    if (nativeSetup && input.argv[1]?.endsWith('/native/launch.mjs')) return { value: { exitCode: 0, stdout: 'Installed owned launcher\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {
       return { value: { exitCode: 0, stdout: 'Linux\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -104,6 +105,17 @@ test('setup repeats the saved account helper command without changing its accoun
   expect(world.saved()).toEqual(initial)
   expect(world.writes).toEqual([])
   expect(world.processes).toEqual([])
+})
+
+test('native setup passes one quoted absolute executable to the managed installer', async ($, on) => {
+  const world = fixture(on, undefined, true)
+  const result = await $.command.run(command('setup-native "/owned/runtime with spaces/claude"'))
+  const argv = world.processes[0] ?? []
+  expect(argv.slice(-2)).toEqual(['--install', '/owned/runtime with spaces/claude'])
+  expect(argv[0]).toBe('node')
+  expect(argv[1] ?? '').toContain('/native/launch.mjs')
+  expect(result.text).toBe('Installed owned launcher')
+  expect(world.writes).toEqual([])
 })
 
 for (const args of ['add personal-live', 'add personal-live claudeai']) {

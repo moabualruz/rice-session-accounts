@@ -4,7 +4,7 @@
 import type { FsStat, HttpInit, HttpResponse, ProcessRunInit, ProcessRunResult } from 'claude-code'
 
 /** The environment variables the modules read, each read by its literal name in register.ts. */
-export type EnvName = 'HOME' | 'USER' | 'CLAUDE_CONFIG_DIR' | 'CLAUDE_SECURESTORAGE_CONFIG_DIR'
+export type EnvName = 'HOME' | 'USER' | 'OS' | 'USERPROFILE' | 'USERNAME' | 'SystemRoot' | 'WINDIR' | 'FORCE_WINDOWS_CREDMAN' | 'CLAUDE_CONFIG_DIR' | 'CLAUDE_SECURESTORAGE_CONFIG_DIR'
 
 /** What the modules reach the machine through; register.ts builds it over `$`. */
 export type Io = {

@@ -5,11 +5,12 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { bootstrap, qualify } from '../native/launch.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const fixture = mkdtempSync(join(tmpdir(), 'rice-account-process-proof-'))
@@ -79,7 +80,7 @@ try {
   mkdirSync(configDir)
   mkdirSync(barriers)
   mkdirSync(join(fixture, 'tmp'))
-  for (const directory of ['.claude-plugin', 'hooks', 'types']) cpSync(join(root, directory), join(plugin, directory), { recursive: true })
+  for (const directory of ['.claude-plugin', 'hooks', 'types', 'scripts']) cpSync(join(root, directory), join(plugin, directory), { recursive: true })
   const inputSha256 = sourceHash(plugin)
   const proofSha256 = createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex')
   writeFileSync(join(fixture, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true }))
@@ -87,6 +88,7 @@ try {
   for (const [folder, marker] of [[loginA, 'account-a-settings'], [loginB, 'account-b-settings']]) {
     mkdirSync(folder, { recursive: true })
     writeFileSync(join(folder, 'settings.json'), JSON.stringify({ model: 'sonnet', env: { RICE_PROOF_CONFIG_MARKER: marker } }))
+    writeFileSync(join(folder, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: folder === loginA ? tokenA : tokenB, refreshToken: 'fixture-refresh', expiresAt: Date.now()+3600000, scopes: ['user:inference','user:profile'], subscriptionType: 'pro' } }))
   }
   const accountsDir = join(configDir, 'rice-session-accounts')
   mkdirSync(accountsDir)
@@ -96,7 +98,7 @@ try {
   } }))
   const service = folder => `Claude Code-credentials-${createHash('sha256').update(folder.normalize('NFC')).digest('hex').slice(0, 8)}`
   const fixtureCredentials = Object.fromEntries([[service(loginA), tokenA], [service(loginB), tokenB], [`${loginA}/.credentials.json`, tokenA], [`${loginB}/.credentials.json`, tokenB]])
-  const environmentReader = 'process.stdout.write(JSON.stringify({apiKey:process.env.ANTHROPIC_API_KEY??null,oauth:process.env.CLAUDE_CODE_OAUTH_TOKEN??null,configDir:process.env.CLAUDE_CONFIG_DIR??null,marker:process.env.RICE_PROOF_CONFIG_MARKER??null}))'
+  const environmentReader = 'process.stdout.write(JSON.stringify({apiKey:process.env.ANTHROPIC_API_KEY??null,oauth:process.env.CLAUDE_CODE_OAUTH_TOKEN??null,storage:process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR??null,configDir:process.env.CLAUDE_CONFIG_DIR??null,marker:process.env.RICE_PROOF_CONFIG_MARKER??null}))'
   const nativeArgs = ['-p', '--plugin-dir', plugin, '--setting-sources', 'user', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--tools', 'Agent,Bash', '--permission-mode', 'bypassPermissions', '--no-session-persistence', '--output-format', 'json', 'Owned account environment proof']
   const register = join(plugin, 'hooks', 'register.ts')
   const production = readFileSync(register, 'utf8')
@@ -118,12 +120,13 @@ try {
   const proofBashReader = ${JSON.stringify('node -e ' + shellQuote(environmentReader))}
   const proofBashPrint = ${JSON.stringify('/usr/bin/env -u CLAUDECODE RICE_SESSION_ACCOUNT_PROOF_ROLE=child claude ' + nativeArgs.map(shellQuote).join(' '))}
   const proofLabel = (value: string | null | undefined) => value === ${JSON.stringify(apiKey)} ? 'launch' : value === ${JSON.stringify(tokenA)} ? 'a' : value === ${JSON.stringify(tokenB)} ? 'b' : value == null ? null : 'unexpected'
+  const proofStorage = (value: string | null | undefined) => value === ${JSON.stringify(loginA)} ? 'a' : value === ${JSON.stringify(loginB)} ? 'b' : value === ${JSON.stringify(configDir)} ? 'machine' : 'unexpected'
   const proofDecode = (text: string) => {
-    const parsed = JSON.parse(text) as { apiKey: string | null; oauth: string | null; configDir: string | null; marker: string | null }
-    return { apiKey: proofLabel(parsed.apiKey), oauth: proofLabel(parsed.oauth), config: parsed.configDir === ${JSON.stringify(configDir)} ? 'machine' : 'unexpected', marker: parsed.marker }
+    const parsed = JSON.parse(text) as { apiKey: string | null; oauth: string | null; storage: string | null; configDir: string | null; marker: string | null }
+    return { apiKey: proofLabel(parsed.apiKey), oauth: proofLabel(parsed.oauth), storage: proofStorage(parsed.storage), config: parsed.configDir === ${JSON.stringify(configDir)} ? 'machine' : 'unexpected', marker: parsed.marker }
   }
   const proofSnapshot = async ($: EngineInterface, model: string) => {
-    const host = { apiKey: proofLabel(await $.env.get('ANTHROPIC_API_KEY')), oauth: proofLabel(await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')), config: (await $.env.get('CLAUDE_CONFIG_DIR')) === ${JSON.stringify(configDir)} ? 'machine' : 'unexpected', marker: await $.env.get('RICE_PROOF_CONFIG_MARKER') }
+    const host = { apiKey: proofLabel(await $.env.get('ANTHROPIC_API_KEY')), oauth: proofLabel(await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')), storage: proofStorage(await $.env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')), config: (await $.env.get('CLAUDE_CONFIG_DIR')) === ${JSON.stringify(configDir)} ? 'machine' : 'unexpected', marker: await $.env.get('RICE_PROOF_CONFIG_MARKER') }
     const child = await $.process.run(['node', '-e', proofReader], { timeoutMs: 10_000 })
     if (child.exitCode !== 0) throw new Error('owned environment child failed')
     let streamed = ''
@@ -219,6 +222,13 @@ try {
   writeFileSync(register, decorated.slice(0, decoratedClosing) + '\n' + probe.slice(hooksAt) + decorated.slice(decoratedClosing))
   const env = Object.fromEntries(['PATH', 'SystemRoot', 'SystemDrive', 'LANG', 'LC_ALL'].filter(name => process.env[name] !== undefined).map(name => [name, process.env[name]]))
   Object.assign(env, { HOME: fixture, USER: 'fixture', USERPROFILE: fixture, TMPDIR: join(fixture, 'tmp'), CLAUDE_CONFIG_DIR: configDir, CLAUDE_SECURESTORAGE_CONFIG_DIR: configDir, ANTHROPIC_API_KEY: apiKey, ANTHROPIC_BASE_URL: 'http://127.0.0.1:1', DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' })
+  if (process.env.RICE_ACCOUNTS_PROOF_CLAUDE) {
+    mkdirSync(join(fixture, 'bin'))
+    symlinkSync(process.env.RICE_ACCOUNTS_PROOF_CLAUDE, join(fixture, 'bin/claude'))
+    env.PATH = join(fixture, 'bin') + ':' + env.PATH
+  }
+  const preload = bootstrap(), qualified = qualify('claude', env, preload)
+  Object.assign(env, { BUN_OPTIONS: '--preload ' + preload, RICE_SESSION_ACCOUNTS_NATIVE_VERSION: qualified.claudeVersion, RICE_SESSION_ACCOUNTS_NATIVE_EXECUTABLE: qualified.executable })
   const version = spawnSync('claude', ['--version'], { env, encoding: 'utf8', timeout: 10_000 })
   assert.equal(version.status, 0, 'native version probe')
   const validated = spawnSync('claude', ['plugin', 'validate', '--strict', plugin], { cwd: fixture, env, encoding: 'utf8', timeout: 15_000 })
@@ -231,7 +241,7 @@ try {
   process.stderr.write(JSON.stringify({ phase: 'native-observations', switcher: switched, sibling: unchanged, baseline: fresh }) + '\n')
   const nativeModel = switched.before.model
   assert.match(nativeModel, /haiku/i, 'machine configuration selects the native model')
-  const snapshot = (oauth = null, key = 'launch') => ({ host: { apiKey: key, oauth, config: 'machine', marker: 'machine-config' }, child: { apiKey: key, oauth, config: 'machine', marker: 'machine-config' }, streamed: { apiKey: key, oauth, config: 'machine', marker: 'machine-config' }, bash: { apiKey: key, oauth, config: 'machine', marker: 'machine-config' }, model: nativeModel })
+  const snapshot = (storage = 'machine', key = 'launch') => ({ host: { apiKey: key, oauth: null, storage, config: 'machine', marker: 'machine-config' }, child: { apiKey: key, oauth: null, storage, config: 'machine', marker: 'machine-config' }, streamed: { apiKey: key, oauth: null, storage, config: 'machine', marker: 'machine-config' }, bash: { apiKey: key, oauth: null, storage, config: 'machine', marker: 'machine-config' }, model: nativeModel })
   assert.deepEqual(switched.before, snapshot())
   assert.deepEqual(switched.a, snapshot('a', null))
   assert.deepEqual(switched.agent.snapshot, snapshot('a', null))

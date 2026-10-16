@@ -2,8 +2,9 @@ import type { SecretRef } from './config'
 import type { Io } from './io'
 import { keychainAccountName, liveServiceName, parseCredential, readItem, writeItem } from './keychain'
 import type { Credential, StorageVariables } from './keychain'
+import { WINDOWS_CREDENTIAL_STORE } from '../scripts/windows-store-payloads.mjs'
 
-export type HostPlatform = 'darwin' | 'linux'
+export type HostPlatform = 'darwin' | 'linux' | 'win32'
 export type LoginLocation = { storage: StorageVariables; defaultConfigDir: string; user?: string }
 
 const platforms = new WeakMap<Io, Promise<HostPlatform>>()
@@ -13,26 +14,28 @@ export function hostPlatform(io: Io): Promise<HostPlatform> {
   const known = platforms.get(io)
   if (known) return known
   const pending = (async (): Promise<HostPlatform> => {
+    if (await io.env('OS') === 'Windows_NT') return 'win32'
     const result = await io.run(['/usr/bin/uname', '-s'], { timeoutMs: 10_000 })
       .catch(() => { throw new Error('Cannot detect the host OS: /usr/bin/uname -s must be available.') })
     if (result.exitCode !== 0) throw new Error('Cannot detect the host OS: /usr/bin/uname -s failed.')
     if (result.stdout.trim() === 'Darwin') return 'darwin'
     if (result.stdout.trim() === 'Linux') return 'linux'
-    throw new Error('Account storage supports macOS and Linux (including WSL).')
+    throw new Error('Account storage supports macOS, Linux (including WSL) and native Windows.')
   })()
   platforms.set(io, pending)
   return pending
 }
 
-/** Native Linux secure storage is independent of CLAUDE_CONFIG_DIR when overridden. */
-export function nativeCredentialPath(location: LoginLocation, home: string | undefined): string {
+/** Native file storage is independent of CLAUDE_CONFIG_DIR when overridden. */
+export function nativeCredentialPath(location: LoginLocation, home: string | undefined, platform: HostPlatform = 'linux'): string {
   const { secureStorageDir, configDir } = location.storage
   const folder = secureStorageDir === ''
     ? home ? `${home}/.claude` : undefined
     : secureStorageDir ?? configDir ?? location.defaultConfigDir
-  if (!folder || !folder.startsWith('/') || folder.includes('\0')) throw new Error('The native credential directory must be an absolute path; HOME is required for an empty secure-storage override.')
+  const absolute = folder && (platform === 'win32' ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(folder) : folder.startsWith('/'))
+  if (!absolute || /[\0\r\n]/.test(folder)) throw new Error('The native credential directory must be an absolute path; the machine home is required for an empty secure-storage override.')
 
-  return `${folder.normalize('NFC').replace(/\/+$/, '')}/.credentials.json`
+  return `${folder.normalize('NFC').replace(/[\\/]+$/, '')}/.credentials.json`
 }
 
 /**
@@ -44,6 +47,7 @@ export function nativeCredentialPath(location: LoginLocation, home: string | und
 const NATIVE_FILE = String.raw`
 const fs = require('node:fs');
 const crypto = require('node:crypto');
+const paths = require('node:path');
 const [operation, path] = process.argv.slice(1);
 const flags = fs.constants;
 const limit = 1024 * 1024;
@@ -52,9 +56,14 @@ function fail(code) { process.exitCode = code; throw new Error('credential-opera
 function read() {
   let fd;
   try {
-    fd = fs.openSync(path, flags.O_RDONLY | flags.O_NOFOLLOW | flags.O_NONBLOCK);
+    const link = fs.lstatSync(path, { bigint: true });
+    if (link.isSymbolicLink()) fail(45);
+    if (!link.isFile() || link.size > limit) fail(46);
+    fd = fs.openSync(path, flags.O_RDONLY | (flags.O_NOFOLLOW ?? 0) | (flags.O_NONBLOCK ?? 0));
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.size > limit) fail(46);
+    const identity = fs.fstatSync(fd, { bigint: true });
+    if (identity.ino !== link.ino || identity.dev !== link.dev) fail(45);
     const bytes = Buffer.alloc(limit + 1);
     let size = 0;
     while (size < bytes.length) {
@@ -73,7 +82,7 @@ function read() {
 }
 try {
   if (Number(process.versions.node.split('.')[0]) < 22) fail(50);
-  if (!path?.startsWith('/') || path.includes('\0')) fail(46);
+  if (!path || !paths.isAbsolute(path) || /[\0\r\n]/.test(path) || process.platform === 'win32' && !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(path)) fail(46);
   let document = read();
   if (operation === 'write') {
     const input = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -84,7 +93,7 @@ try {
     const encoded = JSON.stringify(document);
     if (Buffer.byteLength(encoded) > limit) fail(46);
     temporary = path + '.rice-' + process.pid + '-' + crypto.randomUUID();
-    const fd = fs.openSync(temporary, flags.O_WRONLY | flags.O_CREAT | flags.O_EXCL | flags.O_NOFOLLOW, 0o600);
+    const fd = fs.openSync(temporary, flags.O_WRONLY | flags.O_CREAT | flags.O_EXCL | (flags.O_NOFOLLOW ?? 0), 0o600);
     try { fs.writeFileSync(fd, encoded, 'utf8'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(temporary, path);
     temporary = undefined;
@@ -113,9 +122,9 @@ function credential(text: string): Credential | null {
 
 async function nativeFile(io: Io, operation: 'read' | 'write', path: string, stdin?: string): Promise<Credential | null> {
   const result = await io.run(['node', '-e', NATIVE_FILE, operation, path], { stdin, timeoutMs: 15_000 })
-    .catch(() => { throw new Error('Linux account storage requires Node.js 22 or later on PATH. Install it, then run account setup again.') })
+    .catch(() => { throw new Error('Native file account storage requires Node.js 22 or later on PATH. Install it, then run account setup again.') })
   if ((result.exitCode === 43 || result.exitCode === 44) && operation === 'read') return null
-  if (result.exitCode === 50) throw new Error('Linux account storage requires Node.js 22 or later on PATH.')
+  if (result.exitCode === 50) throw new Error('Native file account storage requires Node.js 22 or later on PATH.')
   if (result.exitCode === 45) throw new Error('Refused a symbolic link at the native credential file. Run account setup with its own login directory.')
   if (result.exitCode === 47) throw new Error('The login changed while it was renewed. Retry the account switch to read the newer login.')
   if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error(`Cannot ${operation} the native Claude credential file. Check its permissions and run account setup again.`)
@@ -123,24 +132,36 @@ async function nativeFile(io: Io, operation: 'read' | 'write', path: string, std
   return credential(result.stdout)
 }
 
+async function fileStoreAvailable(io: Io, platform: HostPlatform): Promise<void> {
+  if (platform !== 'win32') return
+  const forced = await io.env('FORCE_WINDOWS_CREDMAN')
+  if (forced && !/^(?:0|false|no|off)$/i.test(forced)) throw new Error('The optional FORCE_WINDOWS_CREDMAN native browser store is not supported by Rice Accounts. Start this session without that override, or use a claudeai-token account in Windows Credential Manager.')
+}
+
 export async function readLogin(io: Io, location: LoginLocation): Promise<Credential | null> {
-  if (await hostPlatform(io) === 'darwin') {
+  const platform = await hostPlatform(io)
+  if (platform === 'darwin') {
     const service = await liveServiceName(location.storage, location.defaultConfigDir)
     const text = await readItem(io, service, keychainAccountName(location.user))
     return text === null ? null : credential(text)
   }
 
-  return nativeFile(io, 'read', nativeCredentialPath(location, await io.env('HOME')))
+  await fileStoreAvailable(io, platform)
+  const home = platform === 'win32' ? await io.env('USERPROFILE') ?? await io.env('HOME') : await io.env('HOME')
+  return nativeFile(io, 'read', nativeCredentialPath(location, home, platform))
 }
 
 /** Persist a rotated grant without replacing unrelated native credential fields. */
 export async function writeLogin(io: Io, location: LoginLocation, fresh: Credential, previous: Credential): Promise<Credential> {
-  if (await hostPlatform(io) === 'darwin') {
+  const platform = await hostPlatform(io)
+  if (platform === 'darwin') {
     const service = await liveServiceName(location.storage, location.defaultConfigDir)
     await writeItem(io, service, keychainAccountName(location.user), JSON.stringify(fresh))
     return fresh
   }
-  const saved = await nativeFile(io, 'write', nativeCredentialPath(location, await io.env('HOME')), JSON.stringify({
+  await fileStoreAvailable(io, platform)
+  const home = platform === 'win32' ? await io.env('USERPROFILE') ?? await io.env('HOME') : await io.env('HOME')
+  const saved = await nativeFile(io, 'write', nativeCredentialPath(location, home, platform), JSON.stringify({
     expectedRefreshToken: previous.claudeAiOauth.refreshToken,
     oauth: {
       accessToken: fresh.claudeAiOauth.accessToken,
@@ -154,7 +175,17 @@ export async function writeLogin(io: Io, location: LoginLocation, fresh: Credent
 
 /** Named keys and tokens use the OS keyring, separate from native OAuth files. */
 export async function readSecret(io: Io, reference: SecretRef): Promise<string | null> {
-  if (await hostPlatform(io) === 'darwin') return readItem(io, reference.service, reference.account)
+  const platform = await hostPlatform(io)
+  if (platform === 'darwin') return readItem(io, reference.service, reference.account)
+  if (platform === 'win32') {
+    const root = await io.env('SystemRoot') ?? await io.env('WINDIR')
+    const command = root ? `${root.replace(/[\\/]+$/, '')}/System32/WindowsPowerShell/v1.0/powershell.exe` : 'powershell.exe'
+    const result = await io.run([command, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_CREDENTIAL_STORE], { stdin: JSON.stringify({ operation: 'read', service: reference.service, account: reference.account }), timeoutMs: 15_000 })
+      .catch(() => { throw new Error('Windows account secrets require Windows PowerShell and an interactive Windows sign-in with Credential Manager available.') })
+    if (result.exitCode === 44) return null
+    if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('Cannot read Windows Credential Manager. Sign into an interactive Windows session and run account setup again.')
+    return result.stdout
+  }
   const result = await io.run(['secret-tool', 'lookup', 'service', reference.service, 'account', reference.account], { timeoutMs: 15_000 })
     .catch(() => { throw new Error('Named account secrets on Linux require secret-tool (libsecret) and an unlocked Secret Service keyring. Install or enable them, then run account setup again.') })
   if (result.exitCode === 1 && result.stderr.trim() === '') return null

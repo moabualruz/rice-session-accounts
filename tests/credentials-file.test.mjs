@@ -40,7 +40,7 @@ test('the native credential program reads and rotates a real file atomically wit
   const expected = { ...login, claudeAiOauth: { ...login.claudeAiOauth, ...oauth } }
   assert.deepEqual(JSON.parse(saved.stdout), expected)
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), expected)
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600)
   assert.notEqual(fs.statSync(file).ino, before.ino, 'write must replace the file atomically')
   assert.deepEqual(fs.readdirSync(folder), ['.credentials.json'])
 }))
@@ -64,7 +64,7 @@ test('refresh retains unrelated fields added after the caller loaded its credent
   assert.deepEqual(JSON.parse(saved.stdout), { ...current, claudeAiOauth: { ...current.claudeAiOauth, ...oauth } })
 }))
 
-test('symlink reads and writes are refused without altering their target', () => fixture(({ file, run }) => {
+test('symlink reads and writes are refused without altering their target', { skip: process.platform === 'win32' ? 'creating a Windows file symlink requires Developer Mode or elevation; Windows reparse refusal is checked separately' : false }, () => fixture(({ file, run }) => {
   fs.writeFileSync(`${file}.target`, JSON.stringify(login), { mode: 0o600 })
   fs.symlinkSync(`${file}.target`, file)
   assert.equal(run('read').status, 45)
