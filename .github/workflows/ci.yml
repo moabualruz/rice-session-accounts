@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude: ['2.1.296', '2.1.299']
+        claude: ['2.1.296', '2.1.299', '2.1.301']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,7 +26,12 @@ jobs:
           test "$("$claude_bin" --version)" = '${{ matrix.claude }} (Claude Code)'
           printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
           printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
-      - run: npm run check
+      - name: Check compatibility contracts
+        if: matrix.claude != '2.1.301'
+        run: npm run check:compat
+      - name: Check current ordinary-Claude behavior
+        if: matrix.claude == '2.1.301'
+        run: npm run check
       - name: Check the owner's dash policy
         shell: bash
         run: |
@@ -40,6 +45,10 @@ jobs:
   windows-native:
     runs-on: windows-2025
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        claude: ['2.1.299', '2.1.301']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,13 +59,17 @@ jobs:
         run: |
           Get-PSDrive C | Select-Object Name, Free, Used
           $nativePrefix = Join-Path $env:RUNNER_TEMP 'claude-native'
-          npm install --prefix $nativePrefix --ignore-scripts=false --no-audit --no-fund '@anthropic-ai/claude-code@2.1.299'
+          npm install --prefix $nativePrefix --ignore-scripts=false --no-audit --no-fund '@anthropic-ai/claude-code@${{ matrix.claude }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $nativeExecutable = Join-Path $nativePrefix 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
           $version = & $nativeExecutable --version
-          if ($LASTEXITCODE -ne 0 -or $version -ne '2.1.299 (Claude Code)') { throw 'Native prerequisite unavailable' }
+          if ($LASTEXITCODE -ne 0 -or $version -ne '${{ matrix.claude }} (Claude Code)') { throw 'Native prerequisite unavailable' }
           "RICE_ACCOUNTS_PROOF_CLAUDE=$nativeExecutable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - run: node scripts/proof-windows-bootstrap.mjs
+          (Join-Path $nativePrefix 'node_modules/.bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Check compatibility contracts
+        if: matrix.claude != '2.1.301'
+        run: npm run check:compat
+      - name: Check current ordinary-Claude behavior
+        if: matrix.claude == '2.1.301'
+        run: npm run check
       - run: node scripts/proof-windows-storage.mjs
-      - run: npm run test:windows-launcher
-      - run: npm run test:auth

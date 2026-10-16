@@ -54,6 +54,93 @@ test('ready login skips interactive auth, while --login explicitly reauthenticat
   assert.deepEqual(world.calls[2], ['auth', 'status', '--json'])
 })
 
+for (const platform of ['linux', 'darwin', 'win32']) {
+  test(`${platform} login forwards the expected email and verifies the isolated identity before readiness`, async () => {
+    const loginDir = platform === 'win32' ? 'C:\\fixture\\isolated' : '/isolated'
+    const world = fixture({ kind: 'claudeai', loginDir }, { platform })
+    world.deps.exec = (command, args, init) => {
+      world.calls.push({ command, args, init })
+      return { status: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', email: 'Personal@Example.com' }) }
+    }
+    await world.run('--login', '--email', 'personal@example.com', '--manual')
+    assert.deepEqual(world.calls.map(call => call.args), [['auth', 'login', '--claudeai', '--email', 'personal@example.com'], ['auth', 'status', '--json']])
+    for (const call of world.calls) {
+      assert.equal(call.init.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, loginDir)
+      assert.equal(call.init.env.BROWSER, 'true')
+    }
+    assert.match(world.messages.join('\n'), /isolated Claude login is ready/)
+  })
+}
+
+test('a chosen browser is passed as one process-local executable without changing the parent environment', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: '/isolated' }, { env: { HOME: '/fixture', BROWSER: 'original-browser' } })
+  world.deps.exec = (_command, args, init) => {
+    world.calls.push({ args, init })
+    return { status: 0, stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}' }
+  }
+  await world.run('--login', '--browser', '/Applications/Chosen Browser.app/Contents/MacOS/Browser')
+  for (const call of world.calls) assert.equal(call.init.env.BROWSER, '/Applications/Chosen Browser.app/Contents/MacOS/Browser')
+  assert.equal(world.deps.env.BROWSER, 'original-browser')
+})
+
+test('browser control options reject malformed or conflicting input before reading account data', async () => {
+  let reads = 0
+  const deps = { major: 22, platform: 'linux', env: {}, read: () => { reads++; throw Error('must not read') } }
+  for (const args of [['--manual', '--manual'], ['--manual', '--browser', 'firefox'], ['--browser'], ['--browser', '--login'], ['--browser', 'a\nb'], ['--browser', 'a', '--browser', 'b']]) {
+    await assert.rejects(runSetup(['personal', ...args], deps), /--manual|--browser/)
+  }
+  assert.equal(reads, 0)
+})
+
+test('expected-email mismatch after successful native login fails without claiming readiness', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: '/isolated' })
+  world.deps.exec = () => ({ status: 0, stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"other@example.com"}' })
+  await assert.rejects(world.run('--login', '--email', 'personal@example.com'), /Expected personal@example\.com, but Claude is signed in as other@example\.com[\s\S]*--login/)
+  assert.equal(world.messages.some(message => /is ready|Then switch/.test(message)), false)
+})
+
+test('an existing different identity needs an explicit login instead of silently accepting or replacing it', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: '/isolated' })
+  world.deps.exec = (_command, args) => {
+    world.calls.push(args)
+    return { status: 0, stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"other@example.com"}' }
+  }
+  await assert.rejects(world.run('--email', 'personal@example.com'), /other@example\.com[\s\S]*--login/)
+  assert.deepEqual(world.calls, [['auth', 'status', '--json']])
+  assert.equal(world.messages.some(message => /is ready/.test(message)), false)
+})
+
+test('an existing matching identity is reused without interactive login', async () => {
+  const world = fixture({ kind: 'claudeai', loginDir: '/isolated' })
+  world.deps.exec = (_command, args) => {
+    world.calls.push(args)
+    return { status: 0, stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"personal@example.com"}' }
+  }
+  await world.run('--email', 'personal@example.com')
+  assert.deepEqual(world.calls, [['auth', 'status', '--json']])
+  assert.match(world.messages.join('\n'), /isolated Claude login is ready/)
+})
+
+test('an expected email cannot be verified using a missing or unsafe native identity', async () => {
+  for (const email of [undefined, 'unsafe@example.com\ncredential-like-output']) {
+    const world = fixture({ kind: 'claudeai', loginDir: '/isolated' })
+    world.deps.exec = () => ({ status: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', email }) })
+    await assert.rejects(world.run('--login', '--email', 'personal@example.com'), error => {
+      assert.match(error.message, /Expected personal@example\.com[\s\S]*email is unavailable[\s\S]*--login/)
+      assert.equal(error.message.includes('credential-like-output'), false)
+      return true
+    })
+    assert.equal(world.messages.some(message => /is ready/.test(message)), false)
+  }
+})
+
+test('the browser email hint is rejected for setup tokens before credential operations', async () => {
+  const world = fixture({ kind: 'claudeai-token', secret: { service: 'rice', account: 'personal' } })
+  await assert.rejects(world.run('--email', 'personal@example.com'), /--email is supported only for claudeai browser login/)
+  assert.deepEqual(world.calls, [])
+  assert.deepEqual(world.prepared, [])
+})
+
 test('a third-party logged-in status cannot stand in for the isolated Claude subscription', async () => {
   const world = fixture({ kind: 'claudeai', loginDir: '/isolated' }, { env: { HOME: '/fixture', CLAUDE_CODE_USE_ANTHROPIC_AWS: '1', CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '1', CLAUDE_CODE_USE_MANTLE: '1', CLAUDE_CODE_USE_GATEWAY: '1', CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '10', CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR: '11', CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture/snapshot' } })
   let authenticated = false
@@ -134,6 +221,7 @@ test('bad args and unsupported runtimes fail before any account or credential op
   let reads = 0
   const deps = { major: 22, platform: 'linux', env: {}, read: () => { reads++; throw Error('unexpected') } }
   for (const args of [[], ['personal', 'extra'], ['--config-dir'], ['../bad'], ['--unknown']]) await assert.rejects(runSetup(args, deps), /Usage:|needs a directory/)
+  for (const args of [['personal', '--email'], ['personal', '--email', '--login'], ['personal', '--email', 'invalid'], ['personal', '--email', 'a@b\nunsafe'], ['personal', '--email', 'a@b', '--email', 'c@d']]) await assert.rejects(runSetup(args, deps), /--email/)
   await assert.rejects(runSetup(['personal'], { ...deps, major: 20 }), /22 or later/)
   await assert.rejects(runSetup(['personal'], { ...deps, platform: 'freebsd' }), /macOS, Linux/)
   assert.equal(reads, 0)
@@ -207,7 +295,7 @@ test('the actual terminal helper isolates native subprocess auth and resumes fro
     const configPath = join(configDir, 'rice-session-accounts', 'accounts.json')
     const config = JSON.stringify({ accounts: { personal: { kind: 'claudeai', loginDir } } })
     writeFileSync(configPath, config)
-    const fake = `#!${process.execPath}\nimport {existsSync,writeFileSync} from 'node:fs';\nimport{join}from'node:path';\nconst[a,b]=process.argv.slice(2),e=process.env;\nif(e.CLAUDE_CONFIG_DIR!==e.CLAUDE_SECURESTORAGE_CONFIG_DIR||e.CLAUDECODE||e.CLAUDE_CODE_OAUTH_TOKEN||e.CLAUDE_CODE_USE_MANTLE||e.CLAUDE_BG_AUTH_SNAPSHOT_PATH)process.exit(12);\nconst p=join(e.CLAUDE_CONFIG_DIR,'fixture-auth-ready');\nif(a==='auth'&&b==='login'){writeFileSync(p,'ready');console.log('fixture native login');}\nelse if(a==='auth'&&b==='status'){const ok=existsSync(p);console.log(JSON.stringify({loggedIn:ok,authMethod:ok?'claude.ai':'none',apiProvider:'firstParty'}));process.exitCode=ok?0:1;}else process.exit(13);\n`
+    const fake = `#!${process.execPath}\nimport {existsSync,writeFileSync} from 'node:fs';\nimport{join}from'node:path';\nconst[a,b]=process.argv.slice(2),e=process.env;\nif(e.CLAUDE_CONFIG_DIR!==e.CLAUDE_SECURESTORAGE_CONFIG_DIR||e.CLAUDECODE||e.CLAUDE_CODE_OAUTH_TOKEN||e.CLAUDE_CODE_USE_MANTLE||e.CLAUDE_BG_AUTH_SNAPSHOT_PATH)process.exit(12);\nconst p=join(e.CLAUDE_CONFIG_DIR,'fixture-auth-ready');\nif(a==='auth'&&b==='login'){writeFileSync(p,'ready');console.log('fixture native login');}\nelse if(a==='auth'&&b==='status'){const ok=existsSync(p);console.log(JSON.stringify({loggedIn:ok,authMethod:ok?'claude.ai':'none',apiProvider:'firstParty',email:ok?'other@example.com':undefined}));process.exitCode=ok?0:1;}else process.exit(13);\n`
     writeFileSync(join(bin, 'claude'), fake)
     chmodSync(join(bin, 'claude'), 0o700)
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-parent-token', CLAUDE_CODE_USE_MANTLE: '1', CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture-parent-snapshot' }
@@ -221,6 +309,12 @@ test('the actual terminal helper isolates native subprocess auth and resumes fro
     const second = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 10_000 })
     assert.equal(second.status, 0, second.stderr)
     assert.equal(second.stdout.includes('fixture native login'), false)
+    assert.equal(readFileSync(configPath, 'utf8'), config)
+    const mismatch = spawnSync(process.execPath, [...args, '--login', '--email', 'personal@example.com'], { env, encoding: 'utf8', timeout: 10_000 })
+    assert.equal(mismatch.status, 1, mismatch.stderr)
+    assert.match(mismatch.stdout, /fixture native login/)
+    assert.equal(/is ready|Then switch/.test(mismatch.stdout), false)
+    assert.match(mismatch.stderr, /Expected personal@example\.com, but Claude is signed in as other@example\.com[\s\S]*--login/)
     assert.equal(readFileSync(configPath, 'utf8'), config)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

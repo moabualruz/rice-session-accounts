@@ -17,6 +17,7 @@ import { ACCOUNT_PICKER_ID, openAccountPicker, renderAccountPicker } from './pic
 import type { AccountRow } from './picker'
 import { registerDescendantAuth } from './descendants'
 import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, USAGE_URL } from './oauth'
+import { SessionAuthorizations } from './session-auth'
 
 const PLUGIN = 'rice-session-accounts'
 const activeAtom = atom({ plugin: 'rice-session-accounts', key: 'active' } as const, null)
@@ -33,12 +34,29 @@ let expiresAt: number | undefined
 let knownNames: string[] = [LOGIN_NAME]
 let transitionGeneration = 0
 let commitTail: Promise<void> = Promise.resolve()
+type ReportedLimit = { kind: string; percentUsed: number; resetsAt?: string }
+type AccountReport = { name: string; generation: number; email: string; tier: string; rateLimits: ReportedLimit[]; problem?: string }
+let accountReport: AccountReport | undefined
+const sessionAuthorizations = new SessionAuthorizations()
+let committingAccount = false
+let transitionProblem: string | undefined
+const ACCOUNT_RECOVERY = 'The session account is not confirmed. Run /rice-account login or select a saved account again before continuing.'
+const ACCOUNT_AUTH_RETRY = 'Session account authentication could not be prepared. Retry the request after the account selection completes, or use /rice-account login to recover.'
 
 // Claude 2.1.296 follows `$` only into helpers declared in this module.
 async function syncDescendantAuth($: EngineInterface): Promise<void> {
   const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-  const current = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
-  if (current !== (token || undefined)) await $.env.set('RICE_SESSION_ACCOUNTS_OAUTH_RELAY', token || undefined)
+  await setDescendantAuth($, token || undefined)
+}
+
+function refusedEnvironment(outcome: unknown): boolean {
+  return typeof outcome === 'object' && outcome !== null && 'deny' in outcome && typeof outcome.deny === 'string'
+}
+
+async function setDescendantAuth($: EngineInterface, token: string | undefined): Promise<void> {
+  if (await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') === token) return
+  const outcome: unknown = await $.env.set('RICE_SESSION_ACCOUNTS_OAUTH_RELAY', token)
+  if (refusedEnvironment(outcome) || await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') !== token) throw new Error('Claude refused the session descendant credential change. The account was not switched.')
 }
 
 async function variable($: EngineInterface, name: EnvName): Promise<string | undefined> {
@@ -127,7 +145,7 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
   }
 }
 
-async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<void> {
+async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<unknown> {
   switch (name) {
     case 'ANTHROPIC_API_KEY':
       return $.env.set('ANTHROPIC_API_KEY', value)
@@ -233,25 +251,6 @@ async function saveConfig($: EngineInterface, config: Config): Promise<void> {
 
 /** The managed variables as this process started, taken once and kept across reloads and /clear. */
 async function originalsOf($: EngineInterface): Promise<Originals> {
-  const startup = await $.env.get('RICE_SESSION_ACCOUNTS_INITIAL_ORIGINALS')
-  if (startup !== undefined) {
-    let supplied: Record<string, unknown>
-    try {
-      const value: unknown = JSON.parse(startup)
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid startup metadata')
-      supplied = value as Record<string, unknown>
-    } catch { throw new Error('The account launcher supplied invalid startup authentication metadata. Start a fresh managed launcher session.') }
-    const taken = {} as Originals
-    for (const name of MANAGED) {
-      const value = supplied[name]
-      if (value !== null && typeof value !== 'string') throw new Error('The account launcher supplied incomplete startup authentication metadata. Start a fresh managed launcher session.')
-      taken[name] = value
-    }
-    await $.env.set('RICE_SESSION_ACCOUNTS_INITIAL_ORIGINALS', undefined)
-    mirror = { ...mirror, originals: taken }
-    await update($, originalsAtom, () => taken)
-    return taken
-  }
   const kept = (await read($, originalsAtom)) ?? mirror.originals
   if (kept) {
     if (!(await read($, originalsAtom))) await update($, originalsAtom, () => kept)
@@ -266,8 +265,44 @@ async function originalsOf($: EngineInterface): Promise<Originals> {
   return taken
 }
 
-function statusText(name: string, account: AccountConfig): string | undefined {
-  return name === LOGIN_NAME ? undefined : `account ${name}${account.label ? ` (${account.label})` : ''}`
+function reportStatus(report: AccountReport): string {
+  const limits = report.rateLimits.map(limit => `${limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'wk' : limit.kind} ${Math.round(limit.percentUsed)}%`).join(', ')
+  return `account ${report.name} | ${report.email} | ${report.tier}${limits ? ` | ${limits}` : ''}${report.problem ? ` | ${report.problem}` : ''}`
+}
+
+function withReportedLimits<T>(result: T, rateLimits: ReportedLimit[]): T {
+  if (typeof result !== 'object' || result === null || !('value' in result) || typeof result.value !== 'object' || result.value === null) return result
+  return { ...result, value: { ...result.value, rateLimits } }
+}
+
+async function refreshReport($: EngineInterface, name: string, account: AccountConfig, machine: Machine, generation: number, secret?: string): Promise<void> {
+  const identity = await accountIdentity(machineIo($), account, machine)
+  let token = secret
+  if (account.kind === 'login') {
+    token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+    if (!token && !(await $.env.get('ANTHROPIC_API_KEY')) && !(await $.env.get('ANTHROPIC_AUTH_TOKEN'))) {
+      token = (await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken
+    }
+  }
+  let rateLimits: ReportedLimit[] = [], problem: string | undefined
+  try {
+    if (!token) problem = 'usage unavailable'
+    else {
+      const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
+      if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
+      else rateLimits = parseUsage(JSON.parse(response.text)).map(limit => ({
+        kind: limit.label === '5h' ? 'five_hour' : limit.label === 'wk' ? 'seven_day' : limit.label,
+        percentUsed: limit.percent,
+        ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
+      }))
+    }
+  } catch { problem = 'usage unavailable' }
+  // A request begun for A can complete after B has been selected. Native
+  // response headers have the same race, so selected-account reports use the
+  // selected account's usage endpoint and discard superseded results.
+  if (generation !== transitionGeneration || name !== (mirror.active?.name ?? LOGIN_NAME)) return
+  accountReport = { name, generation, ...identity, rateLimits, problem }
+  $.ui.status(reportStatus(accountReport))
 }
 
 function scheduleRenewal($: EngineInterface, name: string, now: number): void {
@@ -281,7 +316,7 @@ function scheduleRenewal($: EngineInterface, name: string, now: number): void {
 }
 
 async function renewIfActive($: EngineInterface, name: string): Promise<void> {
-  if (mirror.active?.name !== name) return
+  if (transitionProblem || mirror.active?.name !== name) return
   await switchTo($, name, true).catch((error: unknown) => {
     $.ui.log(`${PLUGIN}: could not renew ${name}: ${message(error)}`, { to: 'debug' })
     $.ui.toast(`${PLUGIN}: could not renew ${name}: ${message(error)}`)
@@ -299,8 +334,6 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
     throw new Error(`No account named ${name}. Saved: ${Object.keys(config.accounts).join(', ')}${extra}`)
   }
   if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
-  const nativeActive = await $.env.get('RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE') === '1'
-  if (name !== LOGIN_NAME && !nativeActive) throw new Error('Account switching requires the native account cache bridge. Run /rice-account setup-native <absolute path to a qualified Claude executable>, then start a new session with rice-account-claude or the configured rice-claude launcher.')
   const machine = await machineOf($)
   const originals = await originalsOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
@@ -315,39 +348,87 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
       if (isQuiet) return ''
       throw new Error('Another account choice superseded this switch. The newer selection was kept.')
     }
-    const previousName = mirror.active?.name ?? LOGIN_NAME
     const plan = planEnv(account, material.secret, originals)
-    for (const variableName of MANAGED) {
-      if ((await getManaged($, variableName)) !== plan[variableName]) await setManaged($, variableName, plan[variableName])
+    const previousMirror = mirror
+    const previousActive = (await read($, activeAtom)) ?? null
+    const previousExpiresAt = expiresAt
+    const previousReport = accountReport
+    const previousProblem = transitionProblem
+    const previousRelay = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
+    committingAccount = true
+    const precedingValues = new Map<Managed, string | undefined>()
+    let stateAttempted = false, timerChanged = false, now: number | undefined
+    try {
+      for (const variableName of MANAGED) {
+        const previous = await getManaged($, variableName)
+        if (previous === plan[variableName]) continue
+        precedingValues.set(variableName, previous)
+        const outcome = await setManaged($, variableName, plan[variableName])
+        if (refusedEnvironment(outcome) || (await getManaged($, variableName)) !== plan[variableName]) throw new Error(`Claude refused the session environment change for ${variableName}. The account was not switched.`)
+      }
+      await syncDescendantAuth($)
+      now = await $.clock.now()
+      const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
+      stateAttempted = true
+      await update($, activeAtom, () => active)
+      const saved = await read($, activeAtom)
+      if ((saved?.name ?? null) !== (active?.name ?? null) || saved?.switchedAt !== active?.switchedAt) throw new Error('Claude refused the session account state change. The account was not switched.')
+      mirror = { ...mirror, active }
+      expiresAt = material.expiresAt
+      timerChanged = true
+      scheduleRenewal($, name, now)
+      accountReport = { name, generation, email: 'Loading account', tier: 'Unknown', rateLimits: [], problem: 'loading usage' }
+      $.ui.status(reportStatus(accountReport))
+      transitionProblem = undefined
+    } catch (error) {
+      const rollbackProblems: string[] = []
+      mirror = previousMirror
+      expiresAt = previousExpiresAt
+      accountReport = previousReport
+      transitionProblem = previousProblem
+      if (stateAttempted) {
+        try {
+          await update($, activeAtom, () => previousActive)
+          const saved = await read($, activeAtom)
+          if ((saved?.name ?? null) !== (previousActive?.name ?? null) || saved?.switchedAt !== previousActive?.switchedAt) rollbackProblems.push('account state')
+        } catch { rollbackProblems.push('account state') }
+      }
+      for (const [variableName, previous] of [...precedingValues.entries()].reverse()) {
+        try {
+          const outcome = await setManaged($, variableName, previous)
+          if (refusedEnvironment(outcome) || await getManaged($, variableName) !== previous) rollbackProblems.push(variableName)
+        } catch { rollbackProblems.push(variableName) }
+      }
+      try { await setDescendantAuth($, previousRelay) } catch { rollbackProblems.push('descendant credentials') }
+      if (timerChanged) {
+        try { scheduleRenewal($, previousMirror.active?.name ?? LOGIN_NAME, now ?? await $.clock.now()) } catch { rollbackProblems.push('renewal timer') }
+      }
+      if (rollbackProblems.length > 0) {
+        accountReport = undefined
+        transitionProblem = ACCOUNT_RECOVERY
+        $.ui.status('account switch incomplete | use /rice-account login to recover')
+        throw new Error(`${message(error)} Rollback could not restore ${rollbackProblems.join(', ')}. ${ACCOUNT_RECOVERY}`)
+      }
+      $.ui.status(previousReport ? reportStatus(previousReport) : undefined)
+      throw error
     }
-    await syncDescendantAuth($)
-    const now = await $.clock.now()
-    const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
-    mirror = { ...mirror, active }
-    await update($, activeAtom, () => active)
-    expiresAt = material.expiresAt
-    scheduleRenewal($, name, now)
-    // Commit only a completed account transition, not same-account token renewal.
-    // The main-process bridge resets OAuth/quota caches and retires old responses.
-    if (previousName !== name) await $.env.set('RICE_SESSION_ACCOUNTS_AUTH_REVISION', name)
-    $.ui.status(statusText(name, account))
-    if (isQuiet) return ''
-    const email = account.kind === 'claudeai' ? await loginEmail(machineIo($), account.loginDir) : undefined
-
-    return name === LOGIN_NAME
-      ? `This session is back on this machine's /login. Other sessions were not touched.${nativeActive ? '' : ' Native account reporting needs a fresh rice-account-claude session; run /rice-account setup-native.'}`
-      : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
-  } finally { releaseCommit() }
+  } finally { committingAccount = false; releaseCommit() }
+  await refreshReport($, name, account, machine, generation, material.secret)
+  if (isQuiet) return ''
+  if (generation !== transitionGeneration) return 'A newer account choice superseded this selection. The newer account was kept.'
+  const email = accountReport?.name === name ? accountReport.email : await loginEmail(machineIo($), account.loginDir)
+  return name === LOGIN_NAME
+    ? `This session is back on this machine's /login. Other sessions were not touched.`
+    : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
 }
 
 /** After a reload (state kept) or a /clear (module kept), the account this process holds is put back in both. */
 async function restore($: EngineInterface): Promise<void> {
+  if (transitionProblem) return
   await originalsOf($)
-  const initial = await $.env.get('RICE_SESSION_ACCOUNTS_INITIAL_ACCOUNT')
-  if (initial !== undefined) await $.env.set('RICE_SESSION_ACCOUNTS_INITIAL_ACCOUNT', undefined)
-  const kept = initial ? { name: initial, switchedAt: await $.clock.now() } : (await read($, activeAtom)) ?? mirror.active
+  const kept = (await read($, activeAtom)) ?? mirror.active
   if (!kept) return
-  if (initial || !(await read($, activeAtom))) await update($, activeAtom, () => kept)
+  if (!(await read($, activeAtom))) await update($, activeAtom, () => kept)
   mirror = { ...mirror, active: kept }
   await switchTo($, kept.name, true).catch((error: unknown) => {
     $.ui.toast(`${PLUGIN}: could not keep ${kept.name}: ${message(error)}`)
@@ -368,6 +449,7 @@ function formatLimits(limits: { label: string; percent: number; resetsAt?: strin
 }
 
 async function usageText($: EngineInterface): Promise<string> {
+  if (transitionProblem) return transitionProblem
   const name = mirror.active?.name ?? LOGIN_NAME
   const { config } = await loadConfig($)
   const account = config.accounts[name]
@@ -375,9 +457,18 @@ async function usageText($: EngineInterface): Promise<string> {
   if (!(KINDS as readonly string[]).includes(account.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained for compatibility; use rice-multi-models for providers.'
   let init
   if (account.kind === 'login') {
-    const handle = (await $.session.authorize())?.handle
-    if (!handle) return 'This session has no Anthropic credential to look usage up with.'
-    init = oauthInit({ handle })
+    const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+    if (token) init = oauthInit({ token })
+    else {
+      const machine = await machineOf($)
+      const stored = await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
+      if (stored) init = oauthInit({ token: stored.claudeAiOauth.accessToken })
+      else {
+        const handle = (await $.session.authorize())?.handle
+        if (!handle) return 'This session has no Anthropic credential to look usage up with.'
+        init = oauthInit({ handle })
+      }
+    }
   } else if (account.kind === 'claudeai' || account.kind === 'claudeai-token') {
     const machine = await machineOf($)
     const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
@@ -390,6 +481,14 @@ async function usageText($: EngineInterface): Promise<string> {
   if (!response.ok) return `${name}: the usage lookup answered HTTP ${response.status}${account.kind === 'claudeai-token' ? ' (setup tokens may not reach it)' : ''}.`
 
   return `${name} usage:\n${formatLimits(parseUsage(JSON.parse(response.text)))}`
+}
+
+async function statusText($: EngineInterface): Promise<string> {
+  if (transitionProblem) return transitionProblem
+  const [version, model, cwd] = await Promise.all([$.session.version(), $.session.model(), $.session.cwd()])
+  const report = accountReport
+  const selected = report ? `Session account: ${report.name}\nEmail: ${report.email}\nPlan: ${report.tier}` : 'Session account: machine login'
+  return `${selected}\nClaude Code: ${version.version}\nModel: ${model}\nWorking directory: ${cwd}\n\n${await usageText($)}\n\nRice Accounts reports this session selection. The machine login is unchanged.`
 }
 
 async function checkText($: EngineInterface, name: string): Promise<string> {
@@ -462,14 +561,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     if (first === 'check') return await checkText($, rest[0] ?? mirror.active?.name ?? LOGIN_NAME)
     if (first === 'default') return await switchTo($, (await loadConfig($)).config.default)
     if (first === 'setup-native') {
-      let executable = args.trim().slice('setup-native'.length).trim()
-      if (executable.startsWith('"') || executable.startsWith("'")) {
-        const quote = executable[0]
-        if (executable.at(-1) !== quote) return 'Usage: /rice-account setup-native [absolute path to a qualified Claude executable]'
-        executable = executable.slice(1, -1)
-      }
-      const result = await $.process.run(['node', `${$.plugin.root}/native/launch.mjs`, '--install', ...(executable ? [executable] : [])], { timeoutMs: 40_000 })
-      return result.exitCode === 0 ? result.stdout.trim() : result.stderr.trim() || 'Native account launcher setup failed. Use an absolute path to a qualified native Claude executable.'
+      return 'Use this plugin inside ordinary claude. The previous launcher installation path is withdrawn.'
     }
     if (first === 'setup') {
       const name = rest[0]
@@ -527,7 +619,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
 }
 
 export const register: Register = on => {
-  registerDescendantAuth(on)
+  registerDescendantAuth(on, () => transitionProblem)
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== ACCOUNT_PICKER_ID) return next(e)
     return renderAccountPicker($.ui.resolve(e), () => accountRows($), name => switchTo($, name), {
@@ -541,7 +633,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'rice-account',
       description: 'Choose a Claude OAuth account by email and tier, or add, set up and check accounts',
-      argumentHint: '[<name> | list | setup <name> | setup-native [absolute executable] | check [name] | add <name> [kind] | remove <name>]',
+      argumentHint: '[<name> | list | usage | setup <name> | check [name] | add <name> [kind] | remove <name>]',
     })
     await restore($)
     await syncDescendantAuth($)
@@ -557,6 +649,77 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'rice-account' }, async ($, e) => ({ text: await runCommand($, e.args) }))
+
+  on('session.authorize', async ($, e, next) => {
+    if (transitionProblem) return { value: null }
+    if (!mirror.active) {
+      const result = await next(e)
+      if (result.value) sessionAuthorizations.trackNative(next.origin.plugin, result.value.handle)
+      return result
+    }
+    if (committingAccount || !(await $.env.get('CLAUDE_CODE_OAUTH_TOKEN'))) return { value: null }
+    if (transitionProblem || committingAccount || !mirror.active) return { value: null }
+    return { value: sessionAuthorizations.issue(next.origin.plugin) }
+  }).catch((_host, e, next) => next.called ? next(e) : { value: null })
+
+  on('http.fetch', async ($, e, next) => {
+    if (transitionProblem && next.origin.plugin !== PLUGIN) return { deny: transitionProblem }
+    if (!sessionAuthorizations.recognizes(e.init?.auth)) return next(e)
+    if (!mirror.active && !sessionAuthorizations.owns(e.init?.auth)) return next(e)
+    await commitTail
+    if (transitionProblem) return { deny: transitionProblem }
+    if (committingAccount) throw new Error('The session account is changing. Authorize it again when the selection completes.')
+    const name = mirror.active?.name
+    const generation = transitionGeneration
+    let token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+    if (!name && !token) {
+      const machine = await machineOf($)
+      token = (await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken
+    }
+    const disabled = Boolean(await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))
+    if (transitionProblem) return { deny: transitionProblem }
+    if (committingAccount || generation !== transitionGeneration || name !== mirror.active?.name) throw new Error('The session account changed while preparing this request. Retry the request.')
+    const init = sessionAuthorizations.prepare(e.url, e.init, next.origin.plugin, token, disabled)
+    return next({ ...e, init })
+  }).catch((_host, e, next) => next.called ? next(e) : { deny: ACCOUNT_AUTH_RETRY })
+
+  on('session.*', async (_$, e, next) => {
+    const result = await next(e)
+    if (String(next.event) === 'session.usage' && transitionProblem) return withReportedLimits(result, [])
+    if (String(next.event) !== 'session.usage' || !accountReport || accountReport.name !== (mirror.active?.name ?? LOGIN_NAME)) return result
+    return withReportedLimits(result, accountReport.rateLimits)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (accountReport && !transitionProblem) {
+      const name = mirror.active?.name ?? LOGIN_NAME
+      const { config } = await loadConfig($)
+      const account = config.accounts[name]
+      if (account) await refreshReport($, name, account, await machineOf($), transitionGeneration, await $.env.get('CLAUDE_CODE_OAUTH_TOKEN'))
+    }
+    return result
+  })
+
+  on('command.run', { command: 'usage' }, async ($, e, next) => {
+    if (!accountReport && !transitionProblem) return next(e)
+    return { text: await usageText($) }
+  })
+
+  on('command.run', { command: 'status' }, async ($, e, next) => {
+    if (!accountReport && !transitionProblem) return next(e)
+    return { text: await statusText($) }
+  })
+
+  on('model.*', (_$, e, next) => transitionProblem ? { deny: transitionProblem } : next(e))
+
+  on('turn.step', async function* (_$, e, next) {
+    if (!transitionProblem) return yield* next(e)
+    const answer = transitionProblem
+    yield { kind: 'text', index: 0, text: answer }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
+  })
 
   on('prompt.autocomplete', async ($, e, next) => {
     const found = await next(e)

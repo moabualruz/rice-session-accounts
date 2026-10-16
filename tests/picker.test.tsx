@@ -25,7 +25,7 @@ function pane(): MountTarget<'terminal', 'Pane'> {
 
 function fixture(on: On, isPlaced = true) {
   const environment = new Map<string, string>([
-    ['HOME', home], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', configDir], ['CLAUDE_CODE_OAUTH_TOKEN', 'fixture-machine-launch'], ['RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE', '1'],
+    ['HOME', home], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', configDir], ['CLAUDE_CODE_OAUTH_TOKEN', 'fixture-machine-launch'],
   ])
   const accounts: Record<string, AccountConfig> = { ...defaultConfig().accounts }
   const documents = new Map<string, string>()
@@ -59,8 +59,6 @@ function fixture(on: On, isPlaced = true) {
     else environment.set(input.name, input.value)
     return { value: undefined }
   })
-  on('state.get', () => ({ value: { value: undefined, version: 0 } }))
-  on('state.set', () => ({ value: { isSet: true, version: 1 } }))
   on('fs.exists', (_host, input) => ({ value: documents.has(input.path) }))
   on('fs.read', (_host, input) => ({ value: documents.get(input.path) ?? '{}' }))
   on('fs.write', (_host, input) => {
@@ -117,7 +115,7 @@ test('pressing an account row switches that exact account and closes the picker'
   const world = fixture(on)
   const ui = await $.ui.mount(pane())
   await ui.press({ key: 'account:extra-2' })
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-extra-2')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('extra-2'))
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.closed).toEqual([PANE])
@@ -131,7 +129,7 @@ test('the native keyboard select reaches accounts beyond digit shortcuts', async
   const ui = await $.ui.mount(pane())
   expect((await ui.find({ type: 'Select', key: 'account-picker-select' }))?.props.label).toContain('Account')
   await ui.select({ key: 'account-picker-select', value: 'extra-12' })
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-extra-12')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('extra-12'))
   expect(world.closed).toEqual([PANE])
   expect(world.writes).toEqual([])

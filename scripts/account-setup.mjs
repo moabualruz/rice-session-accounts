@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url'
 import { WINDOWS_CREDENTIAL_STORE, WINDOWS_PRIVATE_DIRECTORY } from './windows-store-payloads.mjs'
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/
+const USAGE = 'Usage: node account-setup.mjs [--config-dir <directory>] [--login] [--email <expected-email>] [--manual | --browser <executable>] <saved name>'
+
+function validEmail(value) {
+  return typeof value === 'string' && value.length <= 254 && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && /^[^@\s]+@[^@\s]+$/.test(value)
+}
 const AUTH_ENV = [
   'RICE_SESSION_ACCOUNTS_OAUTH_RELAY',
   'CLAUDECODE', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
@@ -159,6 +164,9 @@ export async function runSetup(args, overrides = {}) {
   const home = deps.platform === 'win32' ? deps.env.USERPROFILE || deps.env.HOME || homedir() : deps.env.HOME || homedir()
   let configDir = deps.env.CLAUDE_CONFIG_DIR || paths.join(home, '.claude')
   let force = false
+  let expectedEmail
+  let manual = false
+  let browser
   const names = []
   for (let at = 0; at < args.length; at++) {
     const word = args[at]
@@ -166,10 +174,21 @@ export async function runSetup(args, overrides = {}) {
       if (!args[at + 1] || args[at + 1].startsWith('--')) throw Error('--config-dir needs a directory.')
       configDir = paths.resolve(args[++at])
     } else if (word === '--login') force = true
-    else if (word.startsWith('-')) throw Error('Usage: node account-setup.mjs [--config-dir <directory>] [--login] <saved name>')
+    else if (word === '--manual') {
+      if (manual) throw Error('--manual may be provided only once.')
+      manual = true
+    } else if (word === '--browser') {
+      if (browser !== undefined || !args[at + 1] || args[at + 1].startsWith('-') || /[\u0000-\u001f\u007f]/.test(args[at + 1])) throw Error('--browser needs one browser executable and may be provided only once.')
+      browser = args[++at]
+    }
+    else if (word === '--email') {
+      if (expectedEmail !== undefined || !validEmail(args[at + 1]) || args[at + 1].startsWith('-')) throw Error('--email needs one valid expected email address and may be provided only once.')
+      expectedEmail = args[++at]
+    } else if (word.startsWith('-')) throw Error(USAGE)
     else names.push(word)
   }
-  if (names.length !== 1 || !NAME.test(names[0])) throw Error('Usage: node account-setup.mjs [--config-dir <directory>] [--login] <saved name>')
+  if (manual && browser !== undefined) throw Error('Choose --manual or --browser, not both.')
+  if (names.length !== 1 || !NAME.test(names[0])) throw Error(USAGE)
   deps.configDir = configDir
   const name = names[0]
   let config
@@ -178,23 +197,41 @@ export async function runSetup(args, overrides = {}) {
   const account = Object.hasOwn(config?.accounts ?? {}, name) ? config.accounts[name] : undefined
   if (!account || typeof account !== 'object') throw Error(`${name} is not saved. First run /rice-account add ${name}.`)
   if (account.kind === 'login') throw Error('The built-in login uses claude auth login directly.')
+  if (expectedEmail !== undefined && account.kind !== 'claudeai') throw Error('--email is supported only for claudeai browser login, not setup tokens or provider accounts.')
+  if ((manual || browser !== undefined) && account.kind !== 'claudeai') throw Error('--manual and --browser are supported only for claudeai browser login.')
   if (account.kind === 'claudeai') {
     if (deps.platform === 'win32' && deps.env.FORCE_WINDOWS_CREDMAN && !/^(?:0|false|no|off)$/i.test(deps.env.FORCE_WINDOWS_CREDMAN)) throw Error('The optional FORCE_WINDOWS_CREDMAN browser store is not supported by Rice Accounts. Run this setup without that override, or add a claudeai-token account for Windows Credential Manager.')
     if (!absoluteDirectory(account.loginDir, deps.platform)) throw Error(`${name} has no absolute loginDir. Check accounts.json.`)
     deps.prepare(account.loginDir)
     const env = loginEnvironment(deps.env, account.loginDir)
+    // Native Claude honors BROWSER for this child only. Literal true keeps
+    // its manual URL flow without opening the machine's default browser.
+    if (manual) env.BROWSER = 'true'
+    else if (browser !== undefined) env.BROWSER = browser
     const status = () => {
       const result = deps.exec('claude', ['auth', 'status', '--json'], { env })
       try {
         const value = JSON.parse(result.stdout)
-        return result.status === 0 && value.loggedIn === true && value.authMethod === 'claude.ai' && value.apiProvider === 'firstParty'
+        return {
+          ready: result.status === 0 && value.loggedIn === true && value.authMethod === 'claude.ai' && value.apiProvider === 'firstParty',
+          email: validEmail(value.email) ? value.email : undefined,
+        }
       }
-      catch { return false }
+      catch { return { ready: false } }
     }
-    if (force || !status()) {
+    let verified = force ? undefined : status()
+    if (!verified?.ready) {
       deps.log(`Signing in ${name} with Claude Code. Complete its browser or terminal sign-in.`)
-      successful(deps.exec('claude', ['auth', 'login', '--claudeai'], { env, interactive: true }), 'Claude login')
-      if (!status()) throw Error('Claude login is incomplete. Run the same command to resume.')
+      if (manual) deps.log('Manual sign-in: open the printed URL in the browser already signed into the intended account, then paste its code here. The default browser will not open.')
+      const args = ['auth', 'login', '--claudeai']
+      if (expectedEmail !== undefined) args.push('--email', expectedEmail)
+      successful(deps.exec('claude', args, { env, interactive: true }), 'Claude login')
+      verified = status()
+      if (!verified.ready) throw Error('Claude login is incomplete. Run the same command to resume.')
+    }
+    if (expectedEmail !== undefined && verified.email?.toLowerCase() !== expectedEmail.toLowerCase()) {
+      const actual = verified.email ? `Claude is signed in as ${verified.email}` : 'the signed-in email is unavailable'
+      throw Error(`Expected ${expectedEmail}, but ${actual}. Run the same setup command with --login and select the intended account in the browser. The --email hint only pre-populates the login page.`)
     }
     deps.log(`${name}: isolated Claude login is ready.`)
   } else if (account.kind === 'claudeai-token') {

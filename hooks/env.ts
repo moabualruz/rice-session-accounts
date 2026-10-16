@@ -69,9 +69,8 @@ const AUTH: readonly Managed[] = [
 ]
 
 /**
- * The environment for an account. `secret` is the account's token or key
- * (a claude.ai access token, an API key, a gateway token), absent for kinds
- * that use another tool's credentials. The machine login restores the
+ * The environment for an OAuth account. `secret` is its access token.
+ * The machine login restores the
  * process's own values; any other kind starts from them with every
  * credential and provider switch cleared, then sets its own.
  */
@@ -82,7 +81,11 @@ export function planEnv(account: AccountConfig, secret: string | undefined, orig
   switch (account.kind) {
     case 'claudeai':
       if (!account.loginDir) throw new Error('The browser account has no native login directory.')
+      if (!secret) throw new Error('The browser account has no OAuth access token.')
       plan.CLAUDE_SECURESTORAGE_CONFIG_DIR = account.loginDir
+      // The SDK reads this for each request. Changing only the storage folder
+      // leaves a process's already loaded credential cached.
+      plan.CLAUDE_CODE_OAUTH_TOKEN = secret
       break
     case 'claudeai-token':
       plan.CLAUDE_CODE_OAUTH_TOKEN = secret

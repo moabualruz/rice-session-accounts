@@ -20,13 +20,17 @@ async function childEnvironment($: EngineInterface, explicit: Record<string, str
  * Keep native child filtering intact, then restore the selected session token
  * through each supported child surface. No listener or transport is involved.
  */
-export function registerDescendantAuth(on: On): void {
+export function registerDescendantAuth(on: On, blocked: () => string | undefined = () => undefined): void {
   on('process.run', async ($, e, next) => {
+    const problem = blocked()
+    if (problem && next.origin.plugin !== 'rice-session-accounts') return { deny: problem }
     const env = await childEnvironment($, e.init?.env)
     return next(env === e.init?.env ? e : { ...e, init: { ...e.init, env } })
   }).catch((_host, e, next) => next.called ? next(e) : { deny: 'Account authentication could not be prepared for the child process. Retry the account switch.' })
 
   on('process.spawn', async function* ($, e, next) {
+    const problem = blocked()
+    if (problem && next.origin.plugin !== 'rice-session-accounts') return { deny: problem }
     const env = await childEnvironment($, e.env)
     return yield* next(env === e.env ? e : { ...e, env })
   }).catch(async function* (_host, e, next) {
@@ -35,6 +39,8 @@ export function registerDescendantAuth(on: On): void {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const problem = blocked()
+    if (problem) return { deny: problem }
     const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
     if (!token) return next(e)
     await syncDescendantAuth($)

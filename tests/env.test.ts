@@ -27,9 +27,9 @@ test('the machine login restores every managed variable as the process started',
   expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe(undefined)
 })
 
-test('a browser account selects native auth storage and clears injected credentials', async () => {
+test('a browser account selects its storage and sets its access token for the next SDK request', async () => {
   const plan = planEnv({ kind: 'claudeai', loginDir: '/x' }, 'oat-1', launched)
-  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe(undefined)
+  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe('oat-1')
   expect(plan.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('/x')
   expect(plan.ANTHROPIC_API_KEY).toBe(undefined)
   expect(plan.ANTHROPIC_AUTH_TOKEN).toBe(undefined)

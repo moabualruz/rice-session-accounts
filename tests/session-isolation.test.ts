@@ -21,7 +21,6 @@ function fixture(on: On) {
     ['USER', 'fixture'],
     ['CLAUDE_CONFIG_DIR', configDir],
     ['UNRELATED_SESSION_SETTING', 'keep-this-value'],
-    ['RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE', '1'],
   ])
   // Mix set and unset launch variables so returning to login must restore both.
   for (const [index, name] of MANAGED.entries()) {
@@ -153,9 +152,9 @@ test('mid-session account A to B to login switches the process and restores ever
 
   const accountA = await $.command.run(command('account-a'))
   expect(accountA.text ?? '').toContain('now uses account-a')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-a'))
-  expect(world.environment.get(RELAY)).toBe(undefined)
+  expect(world.environment.get(RELAY)).toBe('fixture-access-a')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.environment.get('ANTHROPIC_API_KEY')).toBe(undefined)
   expect(world.environment.get('CLAUDE_CODE_USE_GATEWAY')).toBe(undefined)
@@ -163,9 +162,9 @@ test('mid-session account A to B to login switches the process and restores ever
 
   const accountB = await $.command.run(command('account-b'))
   expect(accountB.text ?? '').toContain('now uses account-b')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
-  expect(world.environment.get(RELAY)).toBe(undefined)
+  expect(world.environment.get(RELAY)).toBe('fixture-access-b')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.active()?.name).toBe('account-b')
 
@@ -174,14 +173,17 @@ test('mid-session account A to B to login switches the process and restores ever
   expect(world.active()).toBe(null)
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.environment.get(RELAY)).toBe(world.launched.get('CLAUDE_CODE_OAUTH_TOKEN'))
-  expect([...world.environment.entries()].filter(([name]) => name !== 'RICE_SESSION_ACCOUNTS_AUTH_REVISION').sort()).toEqual([...world.launched.entries()].sort())
+  expect([...world.environment.entries()].sort()).toEqual([...world.launched.entries()].sort())
   expect(world.envWrites).not.toContain('CLAUDE_CONFIG_DIR')
   expect(world.envWrites).toContain('CLAUDE_SECURESTORAGE_CONFIG_DIR')
   expect(world.fileReads.some(path => path.startsWith(`${paths.base}/logins/`) && path.endsWith('/settings.json'))).toBe(false)
-  expect(world.envWrites.every(name => name === RELAY || name === 'RICE_SESSION_ACCOUNTS_AUTH_REVISION' || MANAGED.some(managed => managed === name))).toBe(true)
+  expect(world.envWrites.every(name => name === RELAY || MANAGED.some(managed => managed === name))).toBe(true)
   expect(world.processReads).toEqual([
     `${paths.loginDir('account-a')}/.credentials.json`,
+    `${paths.loginDir('account-a')}/.credentials.json`,
     `${paths.loginDir('account-b')}/.credentials.json`,
+    `${paths.loginDir('account-b')}/.credentials.json`,
+    `${configDir}/.credentials.json`,
   ])
   expect(world.writes).toEqual([])
   expect([...world.documents.entries()]).toEqual(world.originalDocuments)
@@ -198,36 +200,33 @@ test('a new session keeps the machine login even when the saved default names an
   expect([...world.documents.entries()]).toEqual(world.originalDocuments)
 })
 
-test('only complete account transitions commit a native cache revision', async ($, on) => {
+test('failed switches preserve the selected session token without native bridge metadata', async ($, on) => {
   const world = fixture(on)
   await $.session.start({ cwd: home, surface: 'terminal', isInteractive: true })
   await $.command.run(command('account-a'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-a')
-  const commits = world.envWrites.filter(name => name === 'RICE_SESSION_ACCOUNTS_AUTH_REVISION').length
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe(undefined)
   await $.command.run(command('account-a'))
-  expect(world.envWrites.filter(name => name === 'RICE_SESSION_ACCOUNTS_AUTH_REVISION').length).toBe(commits)
+  expect(world.envWrites).not.toContain('RICE_SESSION_ACCOUNTS_AUTH_REVISION')
   world.documents.delete(`${paths.loginDir('account-b')}/.credentials.json`)
   const failed = await $.command.run(command('account-b'))
   expect(failed.text ?? '').toContain('not signed in yet')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-a'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-a')
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe(undefined)
   await $.command.run(command('login'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('login')
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe(undefined)
 })
 
-test('plain Claude refuses a named switch before auth mutation and keeps login restoration available', async ($, on) => {
+test('plain Claude switches a saved browser account and keeps login restoration available', async ($, on) => {
   const world = fixture(on)
   world.environment.delete('RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE')
   await $.session.start({ cwd: home, surface: 'terminal', isInteractive: true })
-  const blocked = await $.command.run(command('account-a'))
-  expect(blocked.text ?? '').toContain('/rice-account setup-native')
-  expect(blocked.text ?? '').toContain('rice-account-claude')
-  expect(world.processReads).toEqual([])
-  expect(world.envWrites).toEqual([])
+  const switched = await $.command.run(command('account-a'))
+  expect(switched.text ?? '').toContain('now uses account-a')
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
   const restored = await $.command.run(command('login'))
   expect(restored.text ?? '').toContain("back on this machine's /login")
-  expect(restored.text ?? '').toContain('fresh rice-account-claude')
+  expect(restored.text ?? '').not.toContain('launcher')
 })
 
 test('a delayed account renewal cannot overwrite a newer explicit account choice', async ($, on) => {
@@ -249,7 +248,7 @@ test('a delayed account renewal cannot overwrite a newer explicit account choice
   await world.clock.settle()
   expect(world.active()?.name).toBe('account-b')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-b')
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
 })
 
 test('a slow explicit switch cannot undo a newer completed account choice', async ($, on) => {
@@ -264,5 +263,5 @@ test('a slow explicit switch cannot undo a newer completed account choice', asyn
   expect((await older).text ?? '').toContain('superseded')
   expect(world.active()?.name).toBe('account-b')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-b')
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
 })
