@@ -3,6 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { MountTarget } from 'claude-code/testing'
 
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
+import { headerToken } from '../hooks/env'
 import type { AccountConfig } from '../hooks/config'
 
 const PANE = 'rice-account-picker'
@@ -115,8 +116,8 @@ test('pressing an account row switches that exact account and closes the picker'
   const world = fixture(on)
   const ui = await $.ui.mount(pane())
   await ui.press({ key: 'account:extra-2' })
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-extra-2')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('extra-2'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-extra-2')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(undefined)
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.closed).toEqual([PANE])
   expect(world.notices.join('\n')).toContain('now uses extra-2')
@@ -129,8 +130,8 @@ test('the native keyboard select reaches accounts beyond digit shortcuts', async
   const ui = await $.ui.mount(pane())
   expect((await ui.find({ type: 'Select', key: 'account-picker-select' }))?.props.label).toContain('Account')
   await ui.select({ key: 'account-picker-select', value: 'extra-12' })
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-extra-12')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('extra-12'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-extra-12')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(undefined)
   expect(world.closed).toEqual([PANE])
   expect(world.writes).toEqual([])
   await ui.unmount()

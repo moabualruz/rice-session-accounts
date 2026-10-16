@@ -1,6 +1,8 @@
 import type { CommandRunInput, On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
+import { headerToken, oauthHeaders } from '../hooks/env'
+
 function environment(on: On, values: Record<string, string>): Map<string, string> {
   const variables = new Map(Object.entries(values))
   on('env.get', (_host, input) => ({ value: variables.get(input.name) }))
@@ -24,7 +26,8 @@ const driver = { plugins: [{ name: 'descendant-driver', register(on: On) {
       try { await $.process.run(['fixture-program']); return { text: 'unexpected child execution' } }
       catch (error) { return { text: error instanceof Error ? error.message : 'operation failed' } }
     }
-    if (e.args === 'explicit') await $.process.run(['fixture-program'], { env: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-child-choice' } })
+    if (e.args === 'explicit-api') await $.process.run(['fixture-program'], { env: { ANTHROPIC_API_KEY: 'fixture-api-choice' } })
+    else if (e.args === 'explicit') await $.process.run(['fixture-program'], { env: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-child-choice' } })
     else if (e.args === 'empty') await $.process.run(['fixture-program'], { env: { KEEP: 'yes' } })
     else if (e.args === 'spawn') {
       const output: string[] = []
@@ -67,6 +70,23 @@ test('an explicit child OAuth override takes precedence over its parent session'
   })
   await $.command.run(fixtureCommand('explicit'))
   expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'fixture-child-choice' })
+})
+
+test('selected headers follow explicit child authentication without inheriting the parent account', driver, async ($, on) => {
+  environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-native-baseline', RICE_SESSION_ACCOUNTS_OAUTH_RELAY: 'fixture-selected', ANTHROPIC_CUSTOM_HEADERS: oauthHeaders('X-Trace: retained', 'fixture-selected') })
+  const seen: (Record<string, string> | undefined)[] = []
+  on('process.run', (_host, input) => {
+    seen.push(input.init?.env)
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.command.run(fixtureCommand('explicit'))
+  await $.command.run(fixtureCommand('explicit-api'))
+  expect(seen[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-child-choice')
+  expect(headerToken(seen[0]?.ANTHROPIC_CUSTOM_HEADERS)).toBe('fixture-child-choice')
+  expect(seen[1]?.ANTHROPIC_API_KEY).toBe('fixture-api-choice')
+  expect(seen[1]?.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+  expect(headerToken(seen[1]?.ANTHROPIC_CUSTOM_HEADERS)).toBe(undefined)
+  expect(seen[1]?.ANTHROPIC_CUSTOM_HEADERS).toContain('X-Trace: retained')
 })
 
 test('streamed children inherit selected OAuth and keep their input and environment', driver, async ($, on) => {

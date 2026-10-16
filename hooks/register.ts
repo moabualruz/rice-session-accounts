@@ -6,7 +6,7 @@ import { loginEmail, materialFor } from './accounts'
 import type { Machine } from './accounts'
 import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig } from './config'
 import type { AccountConfig, Config, Kind } from './config'
-import { MANAGED, planEnv } from './env'
+import { headerToken, MANAGED, planEnv } from './env'
 import type { Managed, Originals } from './env'
 import type { EnvName, Io } from './io'
 import { message } from './io'
@@ -45,8 +45,12 @@ const ACCOUNT_AUTH_RETRY = 'Session account authentication could not be prepared
 
 // Claude 2.1.296 follows `$` only into helpers declared in this module.
 async function syncDescendantAuth($: EngineInterface): Promise<void> {
-  const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+  const token = await currentAccessToken($)
   await setDescendantAuth($, token || undefined)
+}
+
+async function currentAccessToken($: EngineInterface): Promise<string | undefined> {
+  return mirror.active ? headerToken(await $.env.get('ANTHROPIC_CUSTOM_HEADERS')) : $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
 }
 
 function refusedEnvironment(outcome: unknown): boolean {
@@ -90,6 +94,8 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
       return $.env.get('ANTHROPIC_API_KEY')
     case 'ANTHROPIC_AUTH_TOKEN':
       return $.env.get('ANTHROPIC_AUTH_TOKEN')
+    case 'ANTHROPIC_CUSTOM_HEADERS':
+      return $.env.get('ANTHROPIC_CUSTOM_HEADERS')
     case 'CLAUDE_CODE_OAUTH_TOKEN':
       return $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
@@ -151,6 +157,8 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
       return $.env.set('ANTHROPIC_API_KEY', value)
     case 'ANTHROPIC_AUTH_TOKEN':
       return $.env.set('ANTHROPIC_AUTH_TOKEN', value)
+    case 'ANTHROPIC_CUSTOM_HEADERS':
+      return $.env.set('ANTHROPIC_CUSTOM_HEADERS', value)
     case 'CLAUDE_CODE_OAUTH_TOKEN':
       return $.env.set('CLAUDE_CODE_OAUTH_TOKEN', value)
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
@@ -366,7 +374,7 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
         const outcome = await setManaged($, variableName, plan[variableName])
         if (refusedEnvironment(outcome) || (await getManaged($, variableName)) !== plan[variableName]) throw new Error(`Claude refused the session environment change for ${variableName}. The account was not switched.`)
       }
-      await syncDescendantAuth($)
+      await setDescendantAuth($, account.kind === 'login' ? plan.CLAUDE_CODE_OAUTH_TOKEN : material.secret)
       now = await $.clock.now()
       const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
       stateAttempted = true
@@ -657,7 +665,7 @@ export const register: Register = on => {
       if (result.value) sessionAuthorizations.trackNative(next.origin.plugin, result.value.handle)
       return result
     }
-    if (committingAccount || !(await $.env.get('CLAUDE_CODE_OAUTH_TOKEN'))) return { value: null }
+    if (committingAccount || !(await currentAccessToken($))) return { value: null }
     if (transitionProblem || committingAccount || !mirror.active) return { value: null }
     return { value: sessionAuthorizations.issue(next.origin.plugin) }
   }).catch((_host, e, next) => next.called ? next(e) : { value: null })
@@ -671,7 +679,7 @@ export const register: Register = on => {
     if (committingAccount) throw new Error('The session account is changing. Authorize it again when the selection completes.')
     const name = mirror.active?.name
     const generation = transitionGeneration
-    let token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+    let token = await currentAccessToken($)
     if (!name && !token) {
       const machine = await machineOf($)
       token = (await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken
@@ -696,7 +704,7 @@ export const register: Register = on => {
       const name = mirror.active?.name ?? LOGIN_NAME
       const { config } = await loadConfig($)
       const account = config.accounts[name]
-      if (account) await refreshReport($, name, account, await machineOf($), transitionGeneration, await $.env.get('CLAUDE_CODE_OAUTH_TOKEN'))
+      if (account) await refreshReport($, name, account, await machineOf($), transitionGeneration, await currentAccessToken($))
     }
     return result
   })

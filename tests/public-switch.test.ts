@@ -2,6 +2,7 @@ import type { CommandRunInput, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
+import { headerToken } from '../hooks/env'
 
 const directory = '/fixture/public-accounts/.claude'
 const paths = pathsFor(directory)
@@ -70,14 +71,14 @@ function fixture(on: On) {
   mock.clock(on, { now }); mock.store(on)
   on('env.get', async (_host, e) => {
     const value = environment.get(e.name)
-    if (e.name === 'CLAUDE_CODE_OAUTH_TOKEN' && refuseTokenRead) { refuseTokenRead = false; return { deny: 'Owned token read refusal' } }
-    if (e.name === 'CLAUDE_CODE_OAUTH_TOKEN' && heldTokenRead) { const h = heldTokenRead; heldTokenRead = undefined; h.started(); await h.wait }
+    if (e.name === 'ANTHROPIC_CUSTOM_HEADERS' && refuseTokenRead) { refuseTokenRead = false; return { deny: 'Owned token read refusal' } }
+    if (e.name === 'ANTHROPIC_CUSTOM_HEADERS' && heldTokenRead) { const h = heldTokenRead; heldTokenRead = undefined; h.started(); await h.wait }
     return { value }
   })
   on('env.set', (_host, e) => {
     if (failRelay && e.name === 'RICE_SESSION_ACCOUNTS_OAUTH_RELAY' && e.value === 'fixture-account-b') { failRelay = false; return { value: { deny: 'Owned post-env relay refusal' } } }
-    if (refuseRollback && e.name === 'CLAUDE_CODE_OAUTH_TOKEN' && e.value === 'fixture-account-a') return { value: { deny: 'Owned rollback refusal' } }
-    if (refuseB && e.name === 'CLAUDE_CODE_OAUTH_TOKEN' && e.value === 'fixture-account-b') return { value: { deny: 'Owned policy refusal' } }
+    if (refuseRollback && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-a') return { value: { deny: 'Owned rollback refusal' } }
+    if (refuseB && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-b') return { value: { deny: 'Owned policy refusal' } }
     if (e.value === undefined) environment.delete(e.name); else environment.set(e.name, e.value)
     return { value: {} }
   })
@@ -134,7 +135,7 @@ test('ordinary Claude switches browser accounts through session OAuth without a 
   await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
   const switched = await $.command.run(command('account-b'))
   expect(switched.text ?? '').toContain('now uses account-b')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(directory)
   expect(world.status.join('\n')).toContain('account-b@example.test')
   expect(world.status.join('\n')).toContain('Max')
@@ -167,7 +168,7 @@ test('a cached native A authorization cannot fall through when B supersedes its 
   hold.release()
   expect((await pending).text).toBe('refused')
   expect(world.cachedRequests).toEqual([])
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
 })
 
 test('failed credential preparation withholds authorization and cached native references before dispatch', safetyDriver, async ($, on) => {
@@ -204,7 +205,7 @@ test('a late usage response for A cannot replace the selected B reporting', asyn
   expect(selectingB.text ?? '').toContain('now uses account-b')
   held.release()
   await selectingA
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
   const usage = await $.command.run({ ...command(''), command: 'usage' })
   expect(usage.text ?? '').toContain('account-b usage:')
   expect(usage.text ?? '').toContain('wk 2%')
@@ -263,9 +264,9 @@ test('a refused rollback blocks dispatch until an explicit verified account sele
   world.failRelay(true)
   const result = await $.command.run(command('account-b'))
   expect(result.text ?? '').toContain('refused the session descendant credential change')
-  expect(result.text ?? '').toContain('Rollback could not restore CLAUDE_CODE_OAUTH_TOKEN')
+  expect(result.text ?? '').toContain('Rollback could not restore ANTHROPIC_CUSTOM_HEADERS')
   expect(result.text ?? '').toContain('session account is not confirmed')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
   expect(world.status.at(-1) ?? '').toContain('account switch incomplete')
   expect(world.status.at(-1) ?? '').not.toContain('account-a@')
   const processCount = world.processes.length

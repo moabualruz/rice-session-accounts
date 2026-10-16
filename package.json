@@ -8,7 +8,7 @@
     "test:legacy": "node --test tests/native.test.mjs",
     "test:plugin": "claude plugin test .",
     "test:processes": "node scripts/proof-public-auth.mjs",
-    "test:auth": "node scripts/proof-public-auth.mjs",
+    "test:auth": "node scripts/proof-public-auth.mjs && node scripts/proof-public-auth.mjs --baseline-storage",
     "check:compat": "npm test && npm run test:plugin && claude plugin validate --strict . && git diff --check && git diff --cached --check",
     "check": "npm run check:compat && npm run test:auth"
   }

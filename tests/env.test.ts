@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { AccountConfig } from '../hooks/config'
-import { MANAGED, planEnv } from '../hooks/env'
+import { headerToken, MANAGED, oauthHeaders, planEnv } from '../hooks/env'
 import type { Originals } from '../hooks/env'
 
 const none = Object.fromEntries(MANAGED.map(name => [name, null])) as Originals
@@ -27,10 +27,11 @@ test('the machine login restores every managed variable as the process started',
   expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe(undefined)
 })
 
-test('a browser account selects its storage and sets its access token for the next SDK request', async () => {
+test('a browser account selects SDK request headers and keeps native baseline credential ownership', async () => {
   const plan = planEnv({ kind: 'claudeai', loginDir: '/x' }, 'oat-1', launched)
-  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe('oat-1')
-  expect(plan.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('/x')
+  expect(headerToken(plan.ANTHROPIC_CUSTOM_HEADERS)).toBe('oat-1')
+  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe(undefined)
+  expect(plan.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(undefined)
   expect(plan.ANTHROPIC_API_KEY).toBe(undefined)
   expect(plan.ANTHROPIC_AUTH_TOKEN).toBe(undefined)
   expect(plan.CLAUDE_CODE_USE_BEDROCK).toBe(undefined)
@@ -38,11 +39,23 @@ test('a browser account selects its storage and sets its access token for the ne
   expect(plan.AWS_PROFILE).toBe('personal')
 })
 
-test('an OAuth setup-token account replaces the launch OAuth token and clears competing credentials', async () => {
+test('an OAuth setup-token account overrides SDK authorization without replacing the launch token', async () => {
   const plan = planEnv({ kind: 'claudeai-token', secret: { service: 's', account: 'a' } }, 'fixture-setup-token', { ...launched, CLAUDE_CODE_OAUTH_TOKEN: 'oat-launch' })
   expect(plan.ANTHROPIC_API_KEY).toBe(undefined)
-  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-setup-token')
+  expect(plan.CLAUDE_CODE_OAUTH_TOKEN).toBe('oat-launch')
+  expect(headerToken(plan.ANTHROPIC_CUSTOM_HEADERS)).toBe('fixture-setup-token')
   expect(plan.CLAUDE_CODE_USE_BEDROCK).toBe(undefined)
+})
+
+test('OAuth request headers preserve other headers and restore exact original authentication on login', async () => {
+  const original = 'X-Trace: kept\naUtHoRiZaTiOn: Bearer old\nx-api-key: old-key\nAnthropic-Beta: fixture-beta,oauth-2025-04-20'
+  const baseline = { ...launched, ANTHROPIC_CUSTOM_HEADERS: original, CLAUDE_SECURESTORAGE_CONFIG_DIR: '/machine/original-store' }
+  const selected = planEnv({ kind: 'claudeai', loginDir: '/isolated/b' }, 'selected-b', baseline)
+  expect(selected.ANTHROPIC_CUSTOM_HEADERS).toBe('X-Trace: kept\nanthropic-beta: fixture-beta,oauth-2025-04-20\nAuthorization: Bearer selected-b')
+  expect(selected.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('/machine/original-store')
+  expect(planEnv({ kind: 'login' }, undefined, baseline).ANTHROPIC_CUSTOM_HEADERS).toBe(original)
+  expect(() => oauthHeaders(original, 'token\nX-Injected: bad')).toThrow('HTTP header')
+  expect(headerToken('Authorization: Bearer one\nauthorization: Bearer two')).toBe(undefined)
 })
 
 test('legacy provider records cannot create an account switch environment', async () => {

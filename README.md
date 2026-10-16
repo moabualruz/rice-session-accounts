@@ -189,6 +189,11 @@ Other running sessions and fresh independent sessions keep their normal login.
 Returning to `login` restores this process's original credential environment.
 Normal tool permissions still apply to child commands.
 
+The original machine credential source remains available to Claude's own
+renewal flow. Returning to `login` uses that source's current grant, including a
+normal renewal made while another account was selected. The plugin renews the
+additional browser accounts in their separate native stores.
+
 Selected-account reporting comes from that account's OAuth usage endpoint.
 When the lookup is unavailable, the plugin says so and exposes no stale account
 windows. Delayed responses for the old account cannot overwrite the plugin's
@@ -286,7 +291,10 @@ an already-running agent's next request, both process APIs starting `claude -p`,
 delayed A responses, the actual user-entered `/usage` command, cached public
 authorization handles across selection and login restoration,
 and a fresh independent session's original account. Machine settings and account
-configuration must remain unchanged. No real grant, provider inference,
+configuration must remain unchanged. Both an original environment token and a
+native browser-login store are exercised. The storage case simulates an
+external vendor renewal and requires restoration to use the renewed grant.
+No real grant, provider inference,
 installation, permission override, preload or launcher is used.
 
 `npm run check:compat` runs the Node, plugin and validation checks without

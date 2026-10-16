@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import type { ActiveAccount, EnvSnapshot } from '../types'
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
-import { MANAGED } from '../hooks/env'
+import { headerToken, MANAGED } from '../hooks/env'
 
 const home = '/fixture/session-isolation'
 const configDir = `${home}/.claude`
@@ -26,6 +26,9 @@ function fixture(on: On) {
   for (const [index, name] of MANAGED.entries()) {
     if (index % 3 !== 0) environment.set(name, `fixture-launch-${name}`)
   }
+  // Storage selectors are paths, rather than arbitrary fixture labels.
+  environment.set('CLAUDE_SECURESTORAGE_CONFIG_DIR', configDir)
+  environment.set('CLAUDE_CODE_OAUTH_TOKEN', 'fixture-launch-oauth')
   const launchToken = environment.get('CLAUDE_CODE_OAUTH_TOKEN')
   if (launchToken) environment.set(RELAY, launchToken)
   const launched = new Map(environment)
@@ -118,7 +121,7 @@ function fixture(on: On) {
     return { value: { exitCode: 127, stdout: '', stderr: 'Unsupported fixture process', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('process.spawn', async function* () { throw new Error('The lifecycle fixture must not start a real child') })
-  on('http.fetch', () => { throw new Error('The lifecycle fixture must not make a network request') })
+  on('http.fetch', () => ({ deny: 'The lifecycle fixture must not make a network request' }))
   on('session.start', (_host, input) => ({ cwd: input.cwd }))
   on('command.register', (_host, input) => ({ value: { command: input.name } }))
   on('ui.status', () => ({ value: undefined }))
@@ -152,8 +155,8 @@ test('mid-session account A to B to login switches the process and restores ever
 
   const accountA = await $.command.run(command('account-a'))
   expect(accountA.text ?? '').toContain('now uses account-a')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-a'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-a')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
   expect(world.environment.get(RELAY)).toBe('fixture-access-a')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.environment.get('ANTHROPIC_API_KEY')).toBe(undefined)
@@ -162,8 +165,8 @@ test('mid-session account A to B to login switches the process and restores ever
 
   const accountB = await $.command.run(command('account-b'))
   expect(accountB.text ?? '').toContain('now uses account-b')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-b')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
   expect(world.environment.get(RELAY)).toBe('fixture-access-b')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.active()?.name).toBe('account-b')
@@ -175,7 +178,8 @@ test('mid-session account A to B to login switches the process and restores ever
   expect(world.environment.get(RELAY)).toBe(world.launched.get('CLAUDE_CODE_OAUTH_TOKEN'))
   expect([...world.environment.entries()].sort()).toEqual([...world.launched.entries()].sort())
   expect(world.envWrites).not.toContain('CLAUDE_CONFIG_DIR')
-  expect(world.envWrites).toContain('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+  expect(world.envWrites).not.toContain('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+  expect(world.envWrites).not.toContain('CLAUDE_CODE_OAUTH_TOKEN')
   expect(world.fileReads.some(path => path.startsWith(`${paths.base}/logins/`) && path.endsWith('/settings.json'))).toBe(false)
   expect(world.envWrites.every(name => name === RELAY || MANAGED.some(managed => managed === name))).toBe(true)
   expect(world.processReads).toEqual([
@@ -210,8 +214,8 @@ test('failed switches preserve the selected session token without native bridge 
   world.documents.delete(`${paths.loginDir('account-b')}/.credentials.json`)
   const failed = await $.command.run(command('account-b'))
   expect(failed.text ?? '').toContain('not signed in yet')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-a'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-a')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
   expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe(undefined)
   await $.command.run(command('login'))
   expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe(undefined)
@@ -223,7 +227,7 @@ test('plain Claude switches a saved browser account and keeps login restoration 
   await $.session.start({ cwd: home, surface: 'terminal', isInteractive: true })
   const switched = await $.command.run(command('account-a'))
   expect(switched.text ?? '').toContain('now uses account-a')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-a')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-a')
   const restored = await $.command.run(command('login'))
   expect(restored.text ?? '').toContain("back on this machine's /login")
   expect(restored.text ?? '').not.toContain('launcher')
@@ -247,8 +251,8 @@ test('a delayed account renewal cannot overwrite a newer explicit account choice
   held.release()
   await world.clock.settle()
   expect(world.active()?.name).toBe('account-b')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-b')
 })
 
 test('a slow explicit switch cannot undo a newer completed account choice', async ($, on) => {
@@ -262,6 +266,6 @@ test('a slow explicit switch cannot undo a newer completed account choice', asyn
   held.release()
   expect((await older).text ?? '').toContain('superseded')
   expect(world.active()?.name).toBe('account-b')
-  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-access-b')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-b')
 })

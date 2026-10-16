@@ -16,8 +16,10 @@ const root=fileURLToPath(new URL('../',import.meta.url))
 const fixture=mkdtempSync(join(tmpdir(),'rice-public-auth-'))
 const plugin=join(fixture,'plugin'), driver=join(fixture,'driver'), config=join(fixture,'.claude')
 const native=process.env.RICE_ACCOUNTS_PROOF_CLAUDE||'claude'
+const storageBaseline=process.argv.includes('--baseline-storage')
 const started=Date.now(), requests=[], results=[]
 const tokenA='owned-public-oauth-a', tokenB='owned-public-oauth-b'
+const rotatedTokenA='owned-public-oauth-a-renewed'
 const waitMs=process.platform==='win32'?45000:15000
 const childMs=process.platform==='win32'?120000:60000
 let child, baseline, timedOut=false
@@ -54,9 +56,10 @@ const server=createServer(async(request,response)=>{
   let text='';for await(const bytes of request)text+=bytes
   const body=JSON.parse(text), messages=JSON.stringify(body.messages)
   const role=['FRESH','RESTORED','CHILD_STREAM','CHILD','LATE_A','EXISTING_A','B_AFTER_LATE'].find(name=>messages.includes('OWNED_'+name))||'MAIN'
-  const account=request.headers.authorization===`Bearer ${tokenA}`?'a':request.headers.authorization===`Bearer ${tokenB}`?'b':'unexpected'
+  const bearer=request.headers.authorization
+  const account=[`Bearer ${tokenA}`,`Bearer ${rotatedTokenA}`].includes(bearer)?'a':bearer===`Bearer ${tokenB}`?'b':'unexpected'
   const index=requests.filter(row=>row.role===role).length
-  requests.push({role,index,account,elapsedMs:Date.now()-started})
+  requests.push({role,index,account,renewedBaseline:bearer===`Bearer ${rotatedTokenA}`,elapsedMs:Date.now()-started})
   writeFileSync(join(fixture,'request-'+role),'observed')
   if(role==='LATE_A'&&index===0){
     const until=Date.now()+childMs-5000
@@ -85,27 +88,30 @@ try {
     if(name!=='login')writeFileSync(join(folder,'.claude.json'),JSON.stringify({oauthAccount:{emailAddress:name+'@example.test'}}))
   }
   writeFileSync(join(config,'rice-session-accounts/accounts.json'),JSON.stringify({default:'account-b',accounts:{login:{kind:'login'},...Object.fromEntries(Object.entries(folders).map(([name,loginDir])=>[name,{kind:'claudeai',loginDir}]))}}))
-  const protectedFiles=[join(config,'settings.json'),join(config,'rice-session-accounts/accounts.json')]
+  const protectedFiles=[join(config,'settings.json'),join(config,'rice-session-accounts/accounts.json'),join(config,'.credentials.json')]
   const before=protectedFiles.map(file=>readFileSync(file,'utf8'))
+  let expectedMachineCredential=before[2],originalCredentialPreservedBeforeRenewal=true
   const register=join(plugin,'hooks/register.ts'), production=readFileSync(register,'utf8')
   const helpers=`
 const proofDirectory=${JSON.stringify(fixture)}
 const proofCredentials:Record<string,unknown>=${JSON.stringify(references)}
+const proofMachineRefs=new Set(${JSON.stringify([config+'/.credentials.json','Claude Code-credentials-'+createHash('sha256').update(config.normalize('NFC')).digest('hex').slice(0,8)])})
 let proofPrepared=false
 const proofWait=async($:EngineInterface,name:string)=>{const r=await $.process.run(['node','-e',${JSON.stringify(waitSource)},proofDirectory+'/'+name,${JSON.stringify(String(waitMs))}],{timeoutMs:${waitMs+5000}});if(r.exitCode!==0)throw Error('owned barrier failed: '+name)}
 `
   const hooks=`
   on('http.fetch',{url:USAGE_URL},async(_$,e,next)=>{
-    const isA=e.init?.headers?.Authorization===${JSON.stringify('Bearer '+tokenA)}
+    const isA=${JSON.stringify(['Bearer '+tokenA,'Bearer '+rotatedTokenA])}.includes(e.init?.headers?.Authorization??'')
     return {value:{ok:true,status:200,headers:{},text:JSON.stringify({five_hour:{utilization:isA?100:1},seven_day:{utilization:isA?100:2}})}}
   })
-  on('http.fetch',{url:PROFILE_URL},async(_$,e)=>({value:{ok:true,status:200,headers:{},text:JSON.stringify({selectedA:e.init?.headers?.Authorization===${JSON.stringify('Bearer '+tokenA)},selectedB:e.init?.headers?.Authorization===${JSON.stringify('Bearer '+tokenB)},nativeHandleRemoved:e.init?.auth===undefined,oauthBeta:e.init?.headers?.['anthropic-beta']?.includes('oauth-2025-04-20')===true})}}))
-  on('process.run',{argv:[/^(?:node|\\/usr\\/bin\\/security)$/]},async(_$,e,next)=>{
+  on('http.fetch',{url:PROFILE_URL},async(_$,e)=>({value:{ok:true,status:200,headers:{},text:JSON.stringify({selectedA:${JSON.stringify(['Bearer '+tokenA,'Bearer '+rotatedTokenA])}.includes(e.init?.headers?.Authorization??''),selectedB:e.init?.headers?.Authorization===${JSON.stringify('Bearer '+tokenB)},nativeHandleRemoved:e.init?.auth===undefined,oauthBeta:e.init?.headers?.['anthropic-beta']?.includes('oauth-2025-04-20')===true})}}))
+  on('process.run',{argv:[/^(?:node|\\/usr\\/bin\\/security)$/]},async($,e,next)=>{
     let ref:string|undefined
     if(e.argv[0]==='/usr/bin/security'&&e.argv[1]==='find-generic-password')ref=e.argv[e.argv.indexOf('-s')+1]
     if(e.argv[0]==='node'&&e.argv[3]==='read'&&e.argv[4]?.endsWith('/.credentials.json'))ref=e.argv[4]
     if(ref===undefined)return next(e)
     if(!Object.hasOwn(proofCredentials,ref))throw Error('unowned credential reference')
+    if(proofMachineRefs.has(ref))return {value:{exitCode:0,stdout:await $.fs.read(${JSON.stringify(config+'/.credentials.json')}),stderr:'',isStdoutTruncated:false,isStderrTruncated:false}}
     return {value:{exitCode:0,stdout:JSON.stringify(proofCredentials[ref]),stderr:'',isStdoutTruncated:false,isStderrTruncated:false}}
   })
   on('tool.call',{tool:'Read'},async($,e,next)=>{const result=await next(e);await $.fs.write(proofDirectory+'/read-ready','ready');await proofWait($,'release-read');return result})
@@ -132,7 +138,8 @@ const proofWait=async($:EngineInterface,name:string)=>{const r=await $.process.r
       let streamed=''
       for await(const chunk of $.process.spawn({argv:[...childArgs,'OWNED_CHILD_STREAM: answer briefly.'],env:{CLAUDECODE:'',RICE_ACCOUNTS_PROOF_ROLE:'child'}})){if(chunk.stream==='stdout')streamed+=chunk.text}
       const streamedResult=JSON.parse(streamed)
-      await $.fs.write(proofDirectory+'/observations.json',JSON.stringify({usageA,switched,usageAfterSwitch,usageAfterLateA,children:{runExitCode:directChild.exitCode,runAnswer:directResult.result==='OWNED_PUBLIC_AUTH_OK',spawnAnswer:streamedResult.result==='OWNED_PUBLIC_AUTH_OK',runError:directResult.is_error,spawnError:streamedResult.is_error}}))
+      const nativeSourcePreserved=(await $.env.get('CLAUDE_CODE_OAUTH_TOKEN'))===${JSON.stringify(storageBaseline?undefined:tokenA)}&&(await $.env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))===${JSON.stringify(config)}
+      await $.fs.write(proofDirectory+'/observations.json',JSON.stringify({usageA,switched,usageAfterSwitch,usageAfterLateA,nativeSourcePreserved,children:{runExitCode:directChild.exitCode,runAnswer:directResult.result==='OWNED_PUBLIC_AUTH_OK',spawnAnswer:streamedResult.result==='OWNED_PUBLIC_AUTH_OK',runError:directResult.is_error,spawnError:streamedResult.is_error}}))
       return yield*next(e)
     }catch(error){await $.fs.write(proofDirectory+'/failure.json',JSON.stringify({error:error instanceof Error?error.message:'unknown'}));throw error}
   })
@@ -164,7 +171,7 @@ export const register:Register=on=>{
 `)
   server.listen(0,'127.0.0.1');await once(server,'listening')
   const env=Object.fromEntries(['PATH','LANG','LC_ALL','SystemRoot','SystemDrive','ComSpec','PATHEXT','ProgramFiles','ProgramFiles(x86)'].filter(name=>process.env[name]!==undefined).map(name=>[name,process.env[name]]))
-  Object.assign(env,{HOME:fixture,USER:'fixture',USERPROFILE:fixture,TMPDIR:join(fixture,'tmp'),CLAUDE_CONFIG_DIR:config,CLAUDE_SECURESTORAGE_CONFIG_DIR:config,CLAUDE_CODE_OAUTH_TOKEN:tokenA,ANTHROPIC_BASE_URL:`http://127.0.0.1:${server.address().port}`,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',DISABLE_AUTOUPDATER:'1',RICE_ACCOUNTS_PROOF_ROLE:'controller'})
+  Object.assign(env,{HOME:fixture,USER:'fixture',USERPROFILE:fixture,TMPDIR:join(fixture,'tmp'),CLAUDE_CONFIG_DIR:config,CLAUDE_SECURESTORAGE_CONFIG_DIR:config,...(storageBaseline?{}:{CLAUDE_CODE_OAUTH_TOKEN:tokenA}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${server.address().port}`,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',DISABLE_AUTOUPDATER:'1',RICE_ACCOUNTS_PROOF_ROLE:'controller'})
   if(process.platform==='win32')Object.assign(env,{OS:'Windows_NT',USERNAME:'fixture',TEMP:join(fixture,'tmp'),TMP:join(fixture,'tmp')})
   const version=spawnSync(native,['--version'],{cwd:fixture,env,encoding:'utf8',timeout:10000})
   assert.equal(version.status,0,'ordinary Claude prerequisite must run')
@@ -187,7 +194,16 @@ export const register:Register=on=>{
       if(results.length===1)send('/usage')
       else if(results.length===2)send('/owned-account-auth')
       else if(results.length===3)send('/status')
-      else if(results.length===4)send('/rice-account login')
+      else if(results.length===4){
+        originalCredentialPreservedBeforeRenewal=readFileSync(protectedFiles[2],'utf8')===before[2]
+        if(storageBaseline){
+          // Simulate an ordinary vendor renewal by another process. The
+          // plugin must restore the current native source, not pin old A.
+          expectedMachineCredential=JSON.stringify(credential(rotatedTokenA))
+          writeFileSync(protectedFiles[2],expectedMachineCredential,{mode:0o600})
+        }
+        send('/rice-account login')
+      }
       else if(results.length===5)send('/owned-account-auth')
       else if(results.length===6)send('OWNED_RESTORED: answer briefly.')
       else child.stdin.end()
@@ -203,19 +219,22 @@ export const register:Register=on=>{
   const [freshExitCode]=await once(baseline,'close');clearTimeout(freshTimer)
   const read=name=>existsSync(join(fixture,name))?JSON.parse(readFileSync(join(fixture,name),'utf8')):null
   const observations=read('observations.json'),failure=read('failure.json')
-  const settingsUnchanged=protectedFiles.every((file,index)=>readFileSync(file,'utf8')===before[index])
-  const receipt={scope:'production hooks in ordinary unmodified Claude; local synthetic native SDK',platform:process.platform,exitCode,freshExitCode,timedOut,elapsedMs:Date.now()-started,requests,observations,failure,results,settingsUnchanged,preload:false,launchers:false,stderrChars:stderr.length,freshAnswer:freshOutput.includes('OWNED_PUBLIC_AUTH_OK')}
+  const settingsUnchanged=protectedFiles.every((file,index)=>readFileSync(file,'utf8')===(index===2?expectedMachineCredential:before[index]))
+  const receipt={scope:'production hooks in ordinary unmodified Claude; local synthetic native SDK',platform:process.platform,baseline:storageBaseline?'native-storage':'environment-token',exitCode,freshExitCode,timedOut,elapsedMs:Date.now()-started,requests,observations,failure,results,settingsUnchanged,preload:false,launchers:false,stderrChars:stderr.length,freshAnswer:freshOutput.includes('OWNED_PUBLIC_AUTH_OK')}
   console.log(JSON.stringify(receipt))
   assert.equal(failure,null,'owned public production fixture must complete')
   assert.equal(exitCode,0);assert.equal(freshExitCode,0)
   assert.equal(observations.usageA.rateLimits.some(limit=>limit.percentUsed===100),true,'A must establish exhausted native/session usage')
   assert.equal(observations.usageAfterSwitch.rateLimits.some(limit=>limit.percentUsed===100),false,'selected B usage must replace A immediately')
   assert.equal(observations.usageAfterLateA.rateLimits.some(limit=>limit.percentUsed===100),false,'late A headers must not replace selected B reporting')
+  assert.equal(observations.nativeSourcePreserved,true,'selected account headers must preserve native baseline credential ownership and refresh inputs')
+  assert.equal(originalCredentialPreservedBeforeRenewal,true,'selecting B must not change the original native grant')
   assert.equal(requests.find(row=>row.role==='EXISTING_A')?.account,'a')
   assert.equal(requests.some(row=>row.role==='EXISTING_A'&&row.account==='b'),true,'already-running agent must use B on its next request')
   for(const role of ['B_AFTER_LATE','CHILD','CHILD_STREAM','MAIN'])assert.equal(requests.find(row=>row.role===role)?.account,'b',role+' must use B')
   assert.deepEqual(observations.children,{runExitCode:0,runAnswer:true,spawnAnswer:true,runError:false,spawnError:false},'both public process APIs must keep B in an ordinary claude -p descendant')
   for(const role of ['RESTORED','FRESH'])assert.equal(requests.find(row=>row.role===role)?.account,'a',role+' must preserve normal login A')
+  if(storageBaseline)for(const role of ['RESTORED','FRESH'])assert.equal(requests.find(row=>row.role===role)?.renewedBaseline,true,role+' must use the current renewed native grant, not an old access token')
   assert.equal(results.length,7,'one ordinary session must process inference, reporting, cached authorization, login restoration and later inference')
   assert.match(results[1].text,/account-b usage:[\s\S]*wk 2%/,'native user-entered /usage must show selected B usage')
   const authText=results[2].text,authResult=JSON.parse(authText.slice(authText.indexOf('{')))

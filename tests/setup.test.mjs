@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import { test } from 'node:test'
+import { Script } from 'node:vm'
 import { loginEnvironment, runSetup } from '../scripts/account-setup.mjs'
 
 function fixture(account, options = {}) {
@@ -19,10 +20,10 @@ function fixture(account, options = {}) {
 }
 
 test('isolated native login clears inherited session authentication and binds both storage directories', () => {
-  const environment = { PATH: '/bin', CLAUDECODE: '1', ANTHROPIC_API_KEY: 'fixture-key', ANTHROPIC_AUTH_TOKEN: 'fixture-token', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth', RICE_SESSION_ACCOUNTS_OAUTH_RELAY: 'fixture-parent-relay', CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_HOST_CREDS_FILE: '/shared', CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'MY_SECRET', CLAUDE_SECURESTORAGE_CONFIG_DIR: '/shared', MY_SECRET: 'fixture-host-secret' }
+  const environment = { PATH: '/bin', CLAUDECODE: '1', ANTHROPIC_API_KEY: 'fixture-key', ANTHROPIC_AUTH_TOKEN: 'fixture-token', ANTHROPIC_CUSTOM_HEADERS: 'Authorization: Bearer fixture-parent', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-oauth', RICE_SESSION_ACCOUNTS_OAUTH_RELAY: 'fixture-parent-relay', CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_HOST_CREDS_FILE: '/shared', CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'MY_SECRET', CLAUDE_SECURESTORAGE_CONFIG_DIR: '/shared', MY_SECRET: 'fixture-host-secret' }
   const isolated = loginEnvironment(environment, '/isolated login')
   assert.equal(isolated.PATH, '/bin')
-  for (const key of ['CLAUDECODE', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'RICE_SESSION_ACCOUNTS_OAUTH_RELAY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_AUTH_ENV_VAR']) assert.equal(isolated[key], undefined)
+  for (const key of ['CLAUDECODE', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_CUSTOM_HEADERS', 'CLAUDE_CODE_OAUTH_TOKEN', 'RICE_SESSION_ACCOUNTS_OAUTH_RELAY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_AUTH_ENV_VAR']) assert.equal(isolated[key], undefined)
   assert.equal(isolated.CLAUDE_CONFIG_DIR, '/isolated login')
   assert.equal(isolated.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/isolated login')
   assert.equal(environment.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/shared')
@@ -295,10 +296,42 @@ test('the actual terminal helper isolates native subprocess auth and resumes fro
     const configPath = join(configDir, 'rice-session-accounts', 'accounts.json')
     const config = JSON.stringify({ accounts: { personal: { kind: 'claudeai', loginDir } } })
     writeFileSync(configPath, config)
-    const fake = `#!${process.execPath}\nimport {existsSync,writeFileSync} from 'node:fs';\nimport{join}from'node:path';\nconst[a,b]=process.argv.slice(2),e=process.env;\nif(e.CLAUDE_CONFIG_DIR!==e.CLAUDE_SECURESTORAGE_CONFIG_DIR||e.CLAUDECODE||e.CLAUDE_CODE_OAUTH_TOKEN||e.CLAUDE_CODE_USE_MANTLE||e.CLAUDE_BG_AUTH_SNAPSHOT_PATH)process.exit(12);\nconst p=join(e.CLAUDE_CONFIG_DIR,'fixture-auth-ready');\nif(a==='auth'&&b==='login'){writeFileSync(p,'ready');console.log('fixture native login');}\nelse if(a==='auth'&&b==='status'){const ok=existsSync(p);console.log(JSON.stringify({loggedIn:ok,authMethod:ok?'claude.ai':'none',apiProvider:'firstParty',email:ok?'other@example.com':undefined}));process.exitCode=ok?0:1;}else process.exit(13);\n`
-    writeFileSync(join(bin, 'claude'), fake)
-    chmodSync(join(bin, 'claude'), 0o700)
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-parent-token', CLAUDE_CODE_USE_MANTLE: '1', CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture-parent-snapshot' }
+    const payloadPath = join(root, 'fixture auth.cjs')
+    const payload = `const { existsSync, writeFileSync } = require('node:fs');
+const { basename, join } = require('node:path');
+module.exports = ([a, b]) => {
+  const e = process.env;
+  if (e.CLAUDE_CONFIG_DIR !== e.CLAUDE_SECURESTORAGE_CONFIG_DIR || e.CLAUDECODE || e.CLAUDE_CODE_OAUTH_TOKEN || e.CLAUDE_CODE_USE_MANTLE || e.CLAUDE_BG_AUTH_SNAPSHOT_PATH) process.exit(12);
+  const p = join(e.CLAUDE_CONFIG_DIR, 'fixture-auth-ready');
+  if (a === 'auth' && b === 'login') { writeFileSync(p, 'ready'); console.log('fixture native login'); }
+  else if (a === 'auth' && b === 'status') { const ok = existsSync(p); console.log(JSON.stringify({ loggedIn: ok, authMethod: ok ? 'claude.ai' : 'none', apiProvider: 'firstParty', email: ok ? 'other@example.com' : undefined })); process.exitCode = ok ? 0 : 1; }
+  else process.exit(13);
+};
+if (basename(process.argv[1] ?? '') === 'auth') { module.exports(['auth', ...process.argv.slice(2)]); process.exit(process.exitCode ?? 0); }
+`
+    new Script(payload, { filename: payloadPath })
+    writeFileSync(payloadPath, payload)
+    const preload = `--require ${JSON.stringify(payloadPath.replaceAll('\\', '/'))}`
+    const env = { ...process.env, CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-parent-token', CLAUDE_CODE_USE_MANTLE: '1', CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture-parent-snapshot' }
+    const inheritedPath = process.env.PATH ?? process.env.Path ?? ''
+    for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key]
+    env.PATH = `${bin}${delimiter}${inheritedPath}`
+    if (process.platform === 'win32') {
+      // CreateProcess needs a real executable. This owned copy uses the same
+      // synthetic auth code through a test-only preload, without a shell.
+      copyFileSync(process.execPath, join(bin, 'claude.exe'))
+      env.NODE_OPTIONS = preload
+    } else {
+      const fake = `#!${process.execPath}\nrequire(${JSON.stringify(payloadPath)})(process.argv.slice(2));\n`
+      new Script(fake, { filename: join(bin, 'claude') })
+      writeFileSync(join(bin, 'claude'), fake)
+      chmodSync(join(bin, 'claude'), 0o700)
+    }
+    // Exercise the Windows preload prerequisite on every host, before Node
+    // tries to resolve the deliberately absent script named "auth".
+    const probe = spawnSync(process.execPath, ['auth', 'status', '--json'], { env: { ...loginEnvironment(env, loginDir), NODE_OPTIONS: preload }, encoding: 'utf8', timeout: 10_000 })
+    assert.equal(probe.status, 1, probe.stderr)
+    assert.equal(JSON.parse(probe.stdout).loggedIn, false)
     const args = [resolve('scripts/account-setup.mjs'), '--config-dir', configDir, 'personal']
     const first = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 10_000 })
     assert.equal(first.status, 0, first.stderr)
