@@ -1,6 +1,8 @@
 import type { AccountConfig, Paths } from './config'
+import { readLogin, readSecret, writeLogin } from './credentials'
+import type { LoginLocation } from './credentials'
 import type { Io } from './io'
-import { isSameGrant, keychainAccountName, liveServiceName, parseCredential, readItem, writeItem } from './keychain'
+import { isSameGrant } from './keychain'
 import type { Credential, StorageVariables } from './keychain'
 import { withLock } from './lock'
 import { AnthropicError, applyRefresh, needsRefresh, refreshInit, TOKEN_URL } from './oauth'
@@ -11,11 +13,7 @@ export type Machine = { claudeDir: string; user: string | undefined; storage: St
 /** What a switch needs from an account's credential store; the secret stays in memory only. */
 export type Material = { secret?: string; expiresAt?: number }
 
-export function loginCommand(account: AccountConfig): string {
-  return `CLAUDE_CONFIG_DIR="${account.loginDir}" claude auth login --claudeai`
-}
-
-/** The secret, and when it expires for a login that does, read from the keychain. */
+/** The secret, and when it expires for a login that does, read from its platform store. */
 export async function materialFor(io: Io, name: string, account: AccountConfig, paths: Paths, machine: Machine): Promise<Material> {
   if (account.kind === 'claudeai') {
     const credential = await freshLogin(io, name, account, paths, machine)
@@ -23,10 +21,10 @@ export async function materialFor(io: Io, name: string, account: AccountConfig, 
     return { secret: credential.claudeAiOauth.accessToken, expiresAt: credential.claudeAiOauth.expiresAt }
   }
   if (!account.secret) return {}
-  const text = await readItem(io, account.secret.service, account.secret.account)
+  const text = await readSecret(io, account.secret)
   if (text === null || text.trim() === '') {
     throw new Error(
-      `no keychain item for ${name}: security add-generic-password -U -s ${account.secret.service} -a ${account.secret.account} -w`,
+      `${name} has no stored secret yet: /rice-account setup ${name}`,
     )
   }
 
@@ -34,10 +32,7 @@ export async function materialFor(io: Io, name: string, account: AccountConfig, 
 }
 
 async function machineLogin(io: Io, machine: Machine): Promise<Credential | null> {
-  const service = await liveServiceName(machine.storage, machine.claudeDir)
-  const text = await readItem(io, service, keychainAccountName(machine.user))
-
-  return text === null ? null : parseCredential(text)
+  return readLogin(io, { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
 }
 
 /**
@@ -48,31 +43,34 @@ async function machineLogin(io: Io, machine: Machine): Promise<Credential | null
  */
 export async function freshLogin(io: Io, name: string, account: AccountConfig, paths: Paths, machine: Machine): Promise<Credential> {
   if (!account.loginDir) throw new Error(`${name} has no loginDir`)
-  const service = await liveServiceName({ configDir: account.loginDir }, machine.claudeDir)
-  const keychainAccount = keychainAccountName(machine.user)
+  const location: LoginLocation = {
+    storage: { configDir: account.loginDir, secureStorageDir: account.loginDir },
+    defaultConfigDir: machine.claudeDir,
+    user: machine.user,
+  }
   const load = async (): Promise<Credential> => {
-    const text = await readItem(io, service, keychainAccount)
-    if (text === null) throw new Error(`${name} is not signed in yet: ${loginCommand(account)}`)
+    const value = await readLogin(io, location)
+    if (value === null) throw new Error(`${name} is not signed in yet: /rice-account setup ${name}`)
 
-    return parseCredential(text)
+    return value
   }
   const first = await load()
   if (!needsRefresh(first, await io.now())) return first
-  const own = await machineLogin(io, machine).catch(() => null)
-  if (isSameGrant(first, own)) throw new Error(`${name} holds this machine's own /login; switch to "login" instead`)
 
   return withLock(io, paths.lock(name), { staleMs: 60_000, tries: 20 }, async () => {
     const current = await load()
     if (!needsRefresh(current, await io.now())) return current
+    const own = await machineLogin(io, machine)
+    if (isSameGrant(current, own)) throw new Error(`${name} holds this machine's own /login; switch to "login" instead`)
     const response = await io.fetch(TOKEN_URL, refreshInit(current))
     if (!response.ok) {
-      throw new AnthropicError(`the ${name} login could not be renewed (HTTP ${response.status}); sign it in again: ${loginCommand(account)}`, response.status)
+      throw new AnthropicError(`the ${name} login could not be renewed (HTTP ${response.status}); sign it in again: /rice-account setup ${name}`, response.status)
     }
     const fresh = applyRefresh(current, response.text, await io.now())
-    await writeItem(io, service, keychainAccount, JSON.stringify(fresh))
+    const saved = await writeLogin(io, location, fresh, current)
     io.log(`renewed the ${name} login`)
 
-    return fresh
+    return saved
   })
 }
 

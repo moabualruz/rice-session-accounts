@@ -1,0 +1,12 @@
+{
+  "name": "rice-session-accounts",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:plugin": "claude plugin test .",
+    "test:processes": "node scripts/proof-session-processes.mjs",
+    "check": "npm test && npm run test:plugin && claude plugin validate --strict . && npm run test:processes && git diff --check && git diff --cached --check"
+  }
+}

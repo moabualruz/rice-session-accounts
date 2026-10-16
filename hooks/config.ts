@@ -1,10 +1,12 @@
 /**
  * The saved accounts: a JSON file of names, kinds and where each one's secret
- * lives. Secrets themselves stay in the macOS keychain; this file holds none.
+ * lives. This file holds no credentials.
  */
 
-export const KINDS = ['login', 'claudeai', 'claudeai-token', 'api-key', 'gateway', 'bedrock', 'vertex', 'foundry'] as const
-export type Kind = (typeof KINDS)[number]
+export const KINDS = ['login', 'claudeai', 'claudeai-token'] as const
+// Read legacy provider records so ordinary OAuth edits preserve them verbatim.
+const STORED_KINDS = [...KINDS, 'api-key', 'gateway', 'bedrock', 'vertex', 'foundry'] as const
+export type Kind = (typeof STORED_KINDS)[number]
 
 /** The keychain service a secret saved by name lives under, its account being the saved account's name. */
 export const SECRET_SERVICE = 'rice-session-accounts'
@@ -28,7 +30,7 @@ export type AccountConfig = {
   models?: Record<string, string>
 }
 
-export type Config = { default: string; accounts: Record<string, AccountConfig> }
+export type Config = { default: string; accounts: Record<string, AccountConfig>; legacy?: Record<string, unknown> }
 
 export const LOGIN_NAME = 'login'
 
@@ -55,7 +57,7 @@ export function isAccountName(name: string): boolean {
 }
 
 function isKind(value: unknown): value is Kind {
-  return typeof value === 'string' && (KINDS as readonly string[]).includes(value)
+  return typeof value === 'string' && (STORED_KINDS as readonly string[]).includes(value)
 }
 
 function stringField(raw: Record<string, unknown>, key: string): string | undefined {
@@ -94,6 +96,10 @@ export function parseConfig(text: string): { config: Config; problems: string[] 
         problems.push(`${name}: unknown kind ${JSON.stringify(entry.kind)} (one of ${KINDS.join(', ')})`)
         continue
       }
+      if (!(KINDS as readonly string[]).includes(entry.kind)) {
+        config.legacy ??= Object.create(null) as Record<string, unknown>
+        config.legacy[name] = value
+      }
       const secret = entry.secret as { service?: unknown; account?: unknown } | undefined
       const models = entry.models && typeof entry.models === 'object' ? (entry.models as Record<string, unknown>) : undefined
       const account: AccountConfig = {
@@ -127,11 +133,11 @@ export function parseConfig(text: string): { config: Config; problems: string[] 
 }
 
 export function serializeConfig(config: Config): string {
-  return `${JSON.stringify(config, null, 2)}\n`
+  return `${JSON.stringify({ default: config.default, accounts: { ...config.accounts, ...config.legacy } }, null, 2)}\n`
 }
 
 /** The options `/rice-account add` takes, as `key=value` words. */
-export const ADD_OPTIONS = ['label', 'aws_profile', 'region', 'project', 'resource', 'base_url', 'service', 'secret'] as const
+export const ADD_OPTIONS = ['label', 'service'] as const
 
 /**
  * A new account and what the person still does once, in a terminal, before
@@ -146,10 +152,33 @@ export function addAccount(
   paths: Paths,
 ): { config: Config; steps: string[] } {
   if (!isAccountName(name)) throw new Error(`"${name}" is not a usable name (letters, digits, . _ -, up to 40)`)
-  if (config.accounts[name]) throw new Error(`an account named ${name} is saved already; /rice-account remove ${name} first`)
+  if (!(KINDS as readonly string[]).includes(kind)) throw new Error('Rice Accounts supports Anthropic OAuth accounts only. Use rice-multi-models for provider accounts.')
+  if (config.legacy && Object.hasOwn(config.legacy, name)) throw new Error(`${name} is a preserved provider entry. Use another name for an OAuth account.`)
+  for (const option of Object.keys(options)) {
+    if (!(ADD_OPTIONS as readonly string[]).includes(option)) throw new Error(`Unknown option: ${option}`)
+  }
+  const allowed: Record<Kind, readonly string[]> = {
+    login: [], claudeai: ['label'], 'claudeai-token': ['label', 'service'], 'api-key': ['label', 'service'],
+    gateway: ['label', 'service', 'base_url'], bedrock: ['label', 'aws_profile', 'region', 'base_url', 'secret', 'service'],
+    vertex: ['label', 'project', 'region', 'base_url'], foundry: ['label', 'resource', 'base_url', 'secret', 'service'],
+  }
+  for (const option of Object.keys(options)) {
+    if (!allowed[kind].includes(option)) throw new Error(`Option ${option} does not apply to ${kind}`)
+  }
+  if (options.secret && !((kind === 'bedrock' && options.secret === 'bearer') || (kind === 'foundry' && options.secret === 'key'))) {
+    throw new Error('Use secret=bearer for Bedrock or secret=key for Foundry.')
+  }
+  if (options.service && (kind === 'bedrock' || kind === 'foundry') && !options.secret) throw new Error('service= requires secret=bearer for Bedrock or secret=key for Foundry.')
+  const existing = config.accounts[name]
+  if (existing) {
+    if (existing.kind !== kind || Object.keys(options).length > 0) {
+      throw new Error(`${name} is already saved as ${existing.kind}; use /rice-account setup ${name} to finish it. Existing settings were kept.`)
+    }
+    return { config, steps: [] }
+  }
   const service = options.service ?? SECRET_SERVICE
   const secret: SecretRef = { service, account: name }
-  const storeSecret = (what: string) => `security add-generic-password -U -s ${service} -a ${name} -w   # then paste the ${what} at the prompt`
+  const storeSecret = (what: string) => `The terminal setup helper will ask for the ${what} without echoing it.`
   const account: AccountConfig = { kind, label: options.label }
   const steps: string[] = []
   switch (kind) {
@@ -157,8 +186,7 @@ export function addAccount(
       throw new Error("the machine's /login is saved already as \"login\"")
     case 'claudeai': {
       account.loginDir = paths.loginDir(name)
-      steps.push(`CLAUDE_CONFIG_DIR="${account.loginDir}" claude auth login --claudeai`)
-      steps.push('# signs that folder in with its own keychain item; your main login and other sessions stay as they are')
+      steps.push('The terminal setup helper signs in this isolated account using Claude Code.')
       break
     }
     case 'claudeai-token':
@@ -166,45 +194,8 @@ export function addAccount(
       steps.push('claude setup-token   # sign in as that account; it prints a one-year token')
       steps.push(storeSecret('token'))
       break
-    case 'api-key':
-      account.secret = secret
-      steps.push(storeSecret('Console API key'))
-      break
-    case 'gateway':
-      if (!options.base_url) throw new Error('a gateway account needs base_url=<https://...>')
-      account.baseUrl = options.base_url
-      account.secret = secret
-      steps.push(storeSecret('gateway token'))
-      break
-    case 'bedrock':
-      account.awsProfile = options.aws_profile
-      account.region = options.region
-      account.baseUrl = options.base_url
-      if (options.secret === 'bearer') {
-        account.secret = secret
-        steps.push(storeSecret('Bedrock API key (bearer token)'))
-      } else {
-        steps.push(`aws sso login${options.aws_profile ? ` --profile ${options.aws_profile}` : ''}   # or any way that gives this AWS profile credentials`)
-      }
-      break
-    case 'vertex':
-      if (!options.project) throw new Error('a vertex account needs project=<gcp-project-id>')
-      account.projectId = options.project
-      account.region = options.region
-      account.baseUrl = options.base_url
-      steps.push('gcloud auth application-default login   # or set GOOGLE_APPLICATION_CREDENTIALS before starting Claude Code')
-      break
-    case 'foundry':
-      if (!options.resource && !options.base_url) throw new Error('a foundry account needs resource=<name> or base_url=<https://...>')
-      account.resource = options.resource
-      account.baseUrl = options.base_url
-      if (options.secret === 'key') {
-        account.secret = secret
-        steps.push(storeSecret('Foundry API key'))
-      } else {
-        steps.push('az login   # Foundry then uses your Azure credentials')
-      }
-      break
+    default:
+      throw new Error('Rice Accounts supports Anthropic OAuth accounts only.')
   }
   const problems = accountProblems(name, account)
   if (problems.length > 0) throw new Error(problems.join('; '))
@@ -219,7 +210,7 @@ export function removeAccount(config: Config, name: string): Config {
   const accounts = { ...config.accounts }
   delete accounts[name]
 
-  return { default: config.default === name ? LOGIN_NAME : config.default, accounts }
+  return { ...config, default: config.default === name ? LOGIN_NAME : config.default, accounts }
 }
 
 export function describeAccount(name: string, account: AccountConfig): string {

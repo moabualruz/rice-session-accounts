@@ -1,7 +1,7 @@
 {
   "name": "rice-session-accounts",
-  "version": "0.1.0",
-  "description": "Saved Anthropic accounts (claude.ai login or token, Console API key, gateway, Bedrock, Vertex, Foundry); /account switches only this session",
+  "version": "0.2.0",
+  "description": "Choose an Anthropic OAuth account by email and tier for this session; resumable setup on macOS, Linux and WSL, with the machine's configuration preserved",
   "types": "./types/index.d.ts",
   "license": "MIT",
   "author": {

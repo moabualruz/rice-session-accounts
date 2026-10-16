@@ -4,12 +4,18 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { ActiveAccount, EnvSnapshot } from '../types'
 import { loginEmail, materialFor } from './accounts'
 import type { Machine } from './accounts'
-import { addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig } from './config'
+import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig } from './config'
 import type { AccountConfig, Config, Kind } from './config'
 import { MANAGED, planEnv } from './env'
 import type { Managed, Originals } from './env'
 import type { EnvName, Io } from './io'
 import { message } from './io'
+import { readLogin } from './credentials'
+import { setupText, shellQuote } from './setup'
+import { accountIdentity } from './identity'
+import { ACCOUNT_PICKER_ID, openAccountPicker, renderAccountPicker } from './picker'
+import type { AccountRow } from './picker'
+import { registerDescendantAuth } from './descendants'
 import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, USAGE_URL } from './oauth'
 
 const PLUGIN = 'rice-session-accounts'
@@ -24,8 +30,14 @@ const originalsAtom = atom({ plugin: 'rice-session-accounts', key: 'originals' }
 let mirror: { active: ActiveAccount | null; originals: EnvSnapshot | null } = { active: null, originals: null }
 let renewal: Timer | undefined
 let expiresAt: number | undefined
-let remap: Record<string, string> = {}
 let knownNames: string[] = [LOGIN_NAME]
+
+// Claude 2.1.296 follows `$` only into helpers declared in this module.
+async function syncDescendantAuth($: EngineInterface): Promise<void> {
+  const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
+  const current = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
+  if (current !== (token || undefined)) await $.env.set('RICE_SESSION_ACCOUNTS_OAUTH_RELAY', token || undefined)
+}
 
 async function variable($: EngineInterface, name: EnvName): Promise<string | undefined> {
   switch (name) {
@@ -56,6 +68,26 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
       return $.env.get('CLAUDE_CODE_USE_VERTEX')
     case 'CLAUDE_CODE_USE_FOUNDRY':
       return $.env.get('CLAUDE_CODE_USE_FOUNDRY')
+    case 'CLAUDE_CODE_USE_ANTHROPIC_AWS':
+      return $.env.get('CLAUDE_CODE_USE_ANTHROPIC_AWS')
+    case 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD':
+      return $.env.get('CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD')
+    case 'CLAUDE_CODE_USE_MANTLE':
+      return $.env.get('CLAUDE_CODE_USE_MANTLE')
+    case 'CLAUDE_CODE_USE_GATEWAY':
+      return $.env.get('CLAUDE_CODE_USE_GATEWAY')
+    case 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR':
+      return $.env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')
+    case 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR':
+      return $.env.get('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')
+    case 'CLAUDE_BG_AUTH_SNAPSHOT_PATH':
+      return $.env.get('CLAUDE_BG_AUTH_SNAPSHOT_PATH')
+    case 'CLAUDE_CODE_HOST_CREDS_FILE':
+      return $.env.get('CLAUDE_CODE_HOST_CREDS_FILE')
+    case 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST':
+      return $.env.get('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST')
+    case 'CLAUDE_CODE_HOST_AUTH_ENV_VAR':
+      return $.env.get('CLAUDE_CODE_HOST_AUTH_ENV_VAR')
     case 'AWS_PROFILE':
       return $.env.get('AWS_PROFILE')
     case 'AWS_REGION':
@@ -95,6 +127,26 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
       return $.env.set('CLAUDE_CODE_USE_VERTEX', value)
     case 'CLAUDE_CODE_USE_FOUNDRY':
       return $.env.set('CLAUDE_CODE_USE_FOUNDRY', value)
+    case 'CLAUDE_CODE_USE_ANTHROPIC_AWS':
+      return $.env.set('CLAUDE_CODE_USE_ANTHROPIC_AWS', value)
+    case 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD':
+      return $.env.set('CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', value)
+    case 'CLAUDE_CODE_USE_MANTLE':
+      return $.env.set('CLAUDE_CODE_USE_MANTLE', value)
+    case 'CLAUDE_CODE_USE_GATEWAY':
+      return $.env.set('CLAUDE_CODE_USE_GATEWAY', value)
+    case 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR':
+      return $.env.set('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', value)
+    case 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR':
+      return $.env.set('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', value)
+    case 'CLAUDE_BG_AUTH_SNAPSHOT_PATH':
+      return $.env.set('CLAUDE_BG_AUTH_SNAPSHOT_PATH', value)
+    case 'CLAUDE_CODE_HOST_CREDS_FILE':
+      return $.env.set('CLAUDE_CODE_HOST_CREDS_FILE', value)
+    case 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST':
+      return $.env.set('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', value)
+    case 'CLAUDE_CODE_HOST_AUTH_ENV_VAR':
+      return $.env.set('CLAUDE_CODE_HOST_AUTH_ENV_VAR', value)
     case 'AWS_PROFILE':
       return $.env.set('AWS_PROFILE', value)
     case 'AWS_REGION':
@@ -148,7 +200,7 @@ async function loadConfig($: EngineInterface): Promise<{ config: Config; problem
   const paths = pathsFor((await machineOf($)).claudeDir)
   if (!(await $.fs.exists(paths.config))) return { config: defaultConfig(), problems: [] }
   const loaded = parseConfig(await $.fs.read(paths.config))
-  knownNames = Object.keys(loaded.config.accounts)
+  knownNames = Object.entries(loaded.config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(([name]) => name)
 
   return loaded
 }
@@ -156,7 +208,7 @@ async function loadConfig($: EngineInterface): Promise<{ config: Config; problem
 async function saveConfig($: EngineInterface, config: Config): Promise<void> {
   const paths = pathsFor((await machineOf($)).claudeDir)
   await $.fs.write(paths.config, serializeConfig(config))
-  knownNames = Object.keys(config.accounts)
+  knownNames = Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(([name]) => name)
 }
 
 /** The managed variables as this process started, taken once and kept across reloads and /clear. */
@@ -204,8 +256,9 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   if (!account) {
     const extra = problems.length > 0 ? ` (accounts.json: ${problems.join('; ')})` : ''
 
-    return `No account named ${name}. Saved: ${Object.keys(config.accounts).join(', ')}${extra}`
+    throw new Error(`No account named ${name}. Saved: ${Object.keys(config.accounts).join(', ')}${extra}`)
   }
+  if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
   const machine = await machineOf($)
   const originals = await originalsOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
@@ -213,11 +266,11 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   for (const variableName of MANAGED) {
     if ((await getManaged($, variableName)) !== plan[variableName]) await setManaged($, variableName, plan[variableName])
   }
+  await syncDescendantAuth($)
   const now = await $.clock.now()
   const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
   mirror = { ...mirror, active }
   await update($, activeAtom, () => active)
-  remap = account.models ?? {}
   expiresAt = material.expiresAt
   scheduleRenewal($, name, now)
   $.ui.status(statusText(name, account))
@@ -258,6 +311,7 @@ async function usageText($: EngineInterface): Promise<string> {
   const { config } = await loadConfig($)
   const account = config.accounts[name]
   if (!account) return `No account named ${name}.`
+  if (!(KINDS as readonly string[]).includes(account.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained for compatibility; use rice-multi-models for providers.'
   let init
   if (account.kind === 'login') {
     const handle = (await $.session.authorize())?.handle
@@ -281,7 +335,15 @@ async function checkText($: EngineInterface, name: string): Promise<string> {
   const { config } = await loadConfig($)
   const account = config.accounts[name]
   if (!account) return `No account named ${name}.`
+  if (!(KINDS as readonly string[]).includes(account.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
   const machine = await machineOf($)
+  if (account.kind === 'login') {
+    const stored = await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
+    if (!stored) return 'This machine has no saved Claude OAuth login. Run claude auth login in a terminal.'
+    const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: stored.claudeAiOauth.accessToken }))
+    if (!response.ok) return `login: the profile lookup answered HTTP ${response.status}.`
+    return `login: signed in as ${parseProfile(response.text).email}.`
+  }
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
   if (account.kind === 'claudeai' || account.kind === 'claudeai-token') {
     const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: material.secret ?? '' }))
@@ -290,38 +352,37 @@ async function checkText($: EngineInterface, name: string): Promise<string> {
 
     return `${name}: signed in as ${owner.email}${owner.organizationName ? ` (${owner.organizationName})` : ''}.`
   }
-  if (account.kind === 'api-key') {
-    const response = await $.http.fetch('https://api.anthropic.com/v1/models?limit=1', {
-      headers: { 'x-api-key': material.secret ?? '', 'anthropic-version': '2023-06-01' },
-    })
-
-    return response.ok ? `${name}: the API key works.` : `${name}: the API key was refused (HTTP ${response.status}).`
-  }
-
-  return `${name}: ${material.secret ? 'secret found in the keychain; ' : ''}its credentials are checked on the first request after /rice-account ${name}.`
+  return `${name}: OAuth account is ready.`
 }
 
 async function listText($: EngineInterface): Promise<string> {
   const { config, problems } = await loadConfig($)
-  const current = mirror.active?.name ?? LOGIN_NAME
-  const lines = await Promise.all(
-    Object.entries(config.accounts).map(async ([name, account]) => {
-      const email = account.kind === 'claudeai' ? await loginEmail(machineIo($), account.loginDir) : undefined
-      const marks = [name === current ? 'this session' : '', name === config.default ? 'default' : ''].filter(Boolean).join(', ')
-
-      return `${name === current ? '*' : ' '} ${describeAccount(name, account)}${email ? `  ${email}` : ''}${marks ? `  [${marks}]` : ''}`
-    }),
-  )
+  const rows = await accountRows($)
+  const lines = rows.map(row => `${row.selected ? '*' : ' '} ${describeAccount(row.name, config.accounts[row.name]!)} | ${row.email} | ${row.tier}${row.selected ? ' [this session]' : ''}`)
   const notes = problems.length > 0 ? `\nSkipped in accounts.json: ${problems.join('; ')}` : ''
 
-  return `${lines.join('\n')}${notes}\n\n/rice-account <name> switches this session only. /rice-account add <name> <kind> saves another (kinds: ${KINDS.filter(kind => kind !== 'login').join(', ')}).`
+  return `${lines.join('\n')}${notes}\n\n/rice-account <name> switches this session only. /rice-account add <name> [kind] saves another (default: claudeai). /rice-account setup <name> resumes setup.`
+}
+
+async function accountRows($: EngineInterface): Promise<AccountRow[]> {
+  const { config } = await loadConfig($)
+  const machine = await machineOf($)
+  const io = machineIo($)
+  const current = mirror.active?.name ?? LOGIN_NAME
+  return Promise.all(Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(async ([name, account]) => ({
+    name, kind: account.kind, selected: name === current, ...await accountIdentity(io, account, machine),
+  })))
 }
 
 function parseOptions(words: readonly string[]): Record<string, string> {
   const options: Record<string, string> = {}
   for (const word of words) {
     const at = word.indexOf('=')
-    if (at > 0) options[word.slice(0, at)] = word.slice(at + 1)
+    if (at <= 0 || at === word.length - 1) throw new Error('Expected key=value for each option; credentials are entered in the terminal helper.')
+    const key = word.slice(0, at)
+    if (!(ADD_OPTIONS as readonly string[]).includes(key)) throw new Error(`Unknown option: ${key}`)
+    if (options[key] !== undefined) throw new Error(`Repeated option: ${key}`)
+    options[key] = word.slice(at + 1)
   }
 
   return options
@@ -331,33 +392,49 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const [first, ...rest] = words
   try {
-    if (!first || first === 'list') return await listText($)
+    if (!first) {
+      if (await openAccountPicker(() => $.ui.open({ id: ACCOUNT_PICKER_ID, title: 'Choose account', focus: true, closeOnEscape: true }))) return 'Choose an account in the account list. This changes only this session.'
+      return await listText($)
+    }
+    if (first === 'list') return await listText($)
     if (first === 'usage') return await usageText($)
     if (first === 'check') return await checkText($, rest[0] ?? mirror.active?.name ?? LOGIN_NAME)
     if (first === 'default') return await switchTo($, (await loadConfig($)).config.default)
-    if (first === 'add') {
-      const [name, kind, ...more] = rest
-      if (!name || !kind || !(KINDS as readonly string[]).includes(kind)) {
-        return `Usage: /rice-account add <name> <kind> [key=value ...]\nKinds: ${KINDS.filter(each => each !== 'login').join(', ')}\nOptions: label=, aws_profile=, region=, project=, resource=, base_url=, service=, secret=bearer|key`
-      }
+    if (first === 'setup') {
+      const name = rest[0]
       const { config } = await loadConfig($)
-      const added = addAccount(config, name, kind as Kind, parseOptions(more), pathsFor((await machineOf($)).claudeDir))
-      await saveConfig($, added.config)
+      if (!name || !config.accounts[name] || rest.length !== 1) return 'Usage: /rice-account setup <saved name>'
+      if (!(KINDS as readonly string[]).includes(config.accounts[name]!.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
+      if (name === LOGIN_NAME) return 'The built-in login uses this machine\'s Claude Code authentication. Run claude auth login in a terminal.'
+      return setupText($.plugin.root, (await machineOf($)).claudeDir, name)
+    }
+    if (first === 'add') {
+      const [name, word, ...tail] = rest
+      const { config } = await loadConfig($)
+      const kind = word && !word.includes('=') ? word : config.accounts[name ?? '']?.kind ?? 'claudeai'
+      const more = word?.includes('=') ? [word, ...tail] : tail
+      if (!name || kind === 'login' || !(KINDS as readonly string[]).includes(kind)) {
+        return `Usage: /rice-account add <name> [kind] [key=value ...]\nDefault kind: claudeai\nKinds: ${KINDS.filter(each => each !== 'login').join(', ')}\nOptions: label=, service= (setup tokens only). Configure provider accounts in rice-multi-models.`
+      }
+      const machine = await machineOf($)
+      const added = addAccount(config, name, kind as Kind, parseOptions(more), pathsFor(machine.claudeDir))
+      if (added.config !== config) await saveConfig($, added.config)
 
-      return `Saved ${name}. Run once in a terminal (secrets go to the keychain prompt, never into this session):\n${added.steps.join('\n')}`
+      return setupText($.plugin.root, machine.claudeDir, name, !config.accounts[name])
     }
     if (first === 'remove') {
       const name = rest[0]
       if (!name) return 'Usage: /rice-account remove <name>'
-      if (mirror.active?.name === name) return `${name} is this session's account; /rice-account default first.`
+      if (mirror.active?.name === name) return `${name} is this session's account; /rice-account login first.`
       const { config } = await loadConfig($)
       const account = config.accounts[name]
+      if (config.legacy && Object.hasOwn(config.legacy, name) || account && !(KINDS as readonly string[]).includes(account.kind)) return 'This provider entry is retained. Rice Accounts manages OAuth accounts only.'
       await saveConfig($, removeAccount(config, name))
       const cleanup =
         account?.kind === 'claudeai'
-          ? `\nIts login folder and keychain item stay; remove them with: CLAUDE_CONFIG_DIR="${account.loginDir}" claude auth logout`
+          ? `\nIts native login is retained. To sign it out in a terminal: env -u CLAUDECODE CLAUDE_CONFIG_DIR=${shellQuote(account.loginDir ?? '')} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(account.loginDir ?? '')} claude auth logout`
           : account?.secret
-            ? `\nIts keychain item stays; remove it with: security delete-generic-password -s ${account.secret.service} -a ${account.secret.account}`
+            ? '\nIts credential is retained in the OS keyring. Remove it with your OS credential manager when no account uses it.'
             : ''
 
       return `Removed ${name} from accounts.json.${cleanup}`
@@ -365,27 +442,38 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     if (first === 'set-default') {
       const name = rest[0]
       const { config } = await loadConfig($)
-      if (!name || !config.accounts[name]) return 'Usage: /rice-account set-default <saved name>'
+      if (!name || !config.accounts[name] || !(KINDS as readonly string[]).includes(config.accounts[name]!.kind) || rest.length !== 1) return 'This legacy command expects a saved OAuth account name. Use /rice-account <name> to switch this session.'
       await saveConfig($, { ...config, default: name })
 
-      return `${name} is the default account now (/rice-account default switches to it). Sessions still start on this machine's /login.`
+      return `The legacy /rice-account default target is ${name}. Use /rice-account ${name} to switch this session. New sessions still start on this machine's normal Claude login.`
     }
 
+    if (rest.length > 0) return 'Usage: /rice-account <saved name> or /rice-account setup <saved name>'
     return await switchTo($, first)
   } catch (error) {
-    return `${PLUGIN}: ${message(error)}`
+    return message(error).replace(/^(?:rice-session-accounts:\s*)+/, '')
   }
 }
 
 export const register: Register = on => {
+  registerDescendantAuth(on)
+  on('ui.render', { component: 'Pane' }, ($, e, next) => {
+    if (e.requestId !== ACCOUNT_PICKER_ID) return next(e)
+    return renderAccountPicker($.ui.resolve(e), () => accountRows($), name => switchTo($, name), {
+      invalidate: () => $.ui.invalidate('ui.render'),
+      log: text => $.ui.log(text),
+      close: () => $.ui.close({ id: ACCOUNT_PICKER_ID }),
+    })
+  })
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({
       name: 'rice-account',
-      description: 'Switch this session to a saved Anthropic account, or list, add and check them',
-      argumentHint: '[<name> | default | list | usage | check [name] | add <name> <kind> | remove <name>]',
+      description: 'Choose a Claude OAuth account by email and tier, or add, set up and check accounts',
+      argumentHint: '[<name> | list | setup <name> | check [name] | add <name> [kind] | remove <name>]',
     })
     await restore($)
+    await syncDescendantAuth($)
 
     return started
   })
@@ -398,12 +486,6 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'rice-account' }, async ($, e) => ({ text: await runCommand($, e.args) }))
-
-  on('turn.step', async function* ($, e, next) {
-    const model = remap[e.model]
-
-    return yield* next(model ? { ...e, model } : e)
-  })
 
   on('prompt.autocomplete', async ($, e, next) => {
     const found = await next(e)

@@ -14,6 +14,16 @@ export const MANAGED = [
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+  'CLAUDE_CODE_USE_MANTLE',
+  'CLAUDE_CODE_USE_GATEWAY',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+  'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR',
+  'CLAUDE_BG_AUTH_SNAPSHOT_PATH',
+  'CLAUDE_CODE_HOST_CREDS_FILE',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   'AWS_PROFILE',
   'AWS_REGION',
   'AWS_BEARER_TOKEN_BEDROCK',
@@ -42,6 +52,16 @@ const AUTH: readonly Managed[] = [
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+  'CLAUDE_CODE_USE_MANTLE',
+  'CLAUDE_CODE_USE_GATEWAY',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+  'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR',
+  'CLAUDE_BG_AUTH_SNAPSHOT_PATH',
+  'CLAUDE_CODE_HOST_CREDS_FILE',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   'AWS_BEARER_TOKEN_BEDROCK',
   'ANTHROPIC_FOUNDRY_API_KEY',
 ]
@@ -57,38 +77,13 @@ export function planEnv(account: AccountConfig, secret: string | undefined, orig
   const plan = Object.fromEntries(MANAGED.map(name => [name, originals[name] ?? undefined])) as EnvPlan
   if (account.kind === 'login') return plan
   for (const name of AUTH) plan[name] = undefined
-  const keep = (value: string | undefined, name: Managed) => value ?? originals[name] ?? undefined
   switch (account.kind) {
     case 'claudeai':
     case 'claudeai-token':
       plan.CLAUDE_CODE_OAUTH_TOKEN = secret
       break
-    case 'api-key':
-      plan.ANTHROPIC_API_KEY = secret
-      break
-    case 'gateway':
-      plan.ANTHROPIC_BASE_URL = account.baseUrl
-      plan.ANTHROPIC_AUTH_TOKEN = secret
-      break
-    case 'bedrock':
-      plan.CLAUDE_CODE_USE_BEDROCK = '1'
-      plan.AWS_PROFILE = keep(account.awsProfile, 'AWS_PROFILE')
-      plan.AWS_REGION = keep(account.region, 'AWS_REGION')
-      plan.ANTHROPIC_BEDROCK_BASE_URL = keep(account.baseUrl, 'ANTHROPIC_BEDROCK_BASE_URL')
-      plan.AWS_BEARER_TOKEN_BEDROCK = secret
-      break
-    case 'vertex':
-      plan.CLAUDE_CODE_USE_VERTEX = '1'
-      plan.ANTHROPIC_VERTEX_PROJECT_ID = account.projectId
-      plan.CLOUD_ML_REGION = keep(account.region, 'CLOUD_ML_REGION')
-      plan.ANTHROPIC_VERTEX_BASE_URL = keep(account.baseUrl, 'ANTHROPIC_VERTEX_BASE_URL')
-      break
-    case 'foundry':
-      plan.CLAUDE_CODE_USE_FOUNDRY = '1'
-      plan.ANTHROPIC_FOUNDRY_RESOURCE = keep(account.resource, 'ANTHROPIC_FOUNDRY_RESOURCE')
-      plan.ANTHROPIC_FOUNDRY_BASE_URL = keep(account.baseUrl, 'ANTHROPIC_FOUNDRY_BASE_URL')
-      plan.ANTHROPIC_FOUNDRY_API_KEY = secret
-      break
+    default:
+      throw new Error('Rice Accounts supports Anthropic OAuth accounts only.')
   }
 
   return plan
