@@ -60,8 +60,9 @@ function fixture(on: On) {
   let activeVersion = 0
   let originals: EnvSnapshot | null | undefined
   let originalsVersion = 0
+  let heldRead: { path: string; start: () => void; wait: Promise<void> } | undefined
 
-  mock.clock(on, { now })
+  const clock = mock.clock(on, { now })
   mock.store(on)
   on('env.get', (_host, input) => ({ value: environment.get(input.name) }))
   on('env.set', (_host, input) => {
@@ -98,13 +99,19 @@ function fixture(on: On) {
   })
   on('fs.stat', () => { throw new Error('No stat is required for unexpired fixture credentials') })
   on('fs.list', () => ({ value: [] }))
-  on('process.run', (_host, input) => {
+  on('process.run', async (_host, input) => {
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {
       return { value: { exitCode: 0, stdout: 'Linux\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && input.argv[3] === 'read') {
       const path = input.argv[4] ?? ''
       processReads.push(path)
+      if (heldRead?.path === path) {
+        const held = heldRead
+        heldRead = undefined
+        held.start()
+        await held.wait
+      }
       const text = documents.get(path)
       return { value: { exitCode: text === undefined ? 44 : 0, stdout: text ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -128,6 +135,14 @@ function fixture(on: On) {
     documents,
     originalDocuments,
     processReads,
+    clock,
+    holdNextRead(path: string) {
+      let start = () => {}, release = () => {}
+      const started = new Promise<void>(resolve => { start = resolve })
+      const wait = new Promise<void>(resolve => { release = resolve })
+      heldRead = { path, start, wait }
+      return { started, release }
+    },
     active: () => active,
   }
 }
@@ -213,4 +228,41 @@ test('plain Claude refuses a named switch before auth mutation and keeps login r
   const restored = await $.command.run(command('login'))
   expect(restored.text ?? '').toContain("back on this machine's /login")
   expect(restored.text ?? '').toContain('fresh rice-account-claude')
+})
+
+test('a delayed account renewal cannot overwrite a newer explicit account choice', async ($, on) => {
+  const world = fixture(on)
+  const path = `${paths.loginDir('account-a')}/.credentials.json`
+  const credential = JSON.parse(world.documents.get(path) ?? '{}')
+  credential.claudeAiOauth.expiresAt = now + 600_000
+  world.documents.set(path, JSON.stringify(credential))
+  await $.session.start({ cwd: home, surface: 'terminal', isInteractive: true })
+  await $.command.run(command('account-a'))
+  const held = world.holdNextRead(path)
+  await world.clock.advance(300_000)
+  await held.started
+  await $.command.run(command('account-b'))
+  // Another native reader renewed A while this session's renewal was waiting.
+  credential.claudeAiOauth.expiresAt = now + 3_600_000
+  world.documents.set(path, JSON.stringify(credential))
+  held.release()
+  await world.clock.settle()
+  expect(world.active()?.name).toBe('account-b')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-b')
+})
+
+test('a slow explicit switch cannot undo a newer completed account choice', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start({ cwd: home, surface: 'terminal', isInteractive: true })
+  await $.command.run(command('account-a'))
+  const held = world.holdNextRead(`${paths.loginDir('account-a')}/.credentials.json`)
+  const older = $.command.run(command('account-a'))
+  await held.started
+  await $.command.run(command('account-b'))
+  held.release()
+  expect((await older).text ?? '').toContain('superseded')
+  expect(world.active()?.name).toBe('account-b')
+  expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(paths.loginDir('account-b'))
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_AUTH_REVISION')).toBe('account-b')
 })

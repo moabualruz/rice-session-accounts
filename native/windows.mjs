@@ -10,14 +10,22 @@ export const absoluteWindowsPath = value => typeof value === 'string' && !/[\0\r
 export const WINDOWS_BOOTSTRAP_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+function Set-BootstrapStage([string]$value) {
+  $script:stage = $value
+  [Console]::Error.WriteLine('rice-bootstrap-stage=' + $value)
+}
+Set-BootstrapStage 'identity'
 try {
   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
   $sid = $identity.User.Value
   function Assert-PrivatePath([string]$path, [bool]$directory) {
+    Set-BootstrapStage 'inspect-private-path'
     $item = Get-Item -Force -LiteralPath $path
     if ($item.PSIsContainer -ne $directory -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'unsafe bootstrap type' }
+    Set-BootstrapStage 'read-private-acl'
     $sections = [System.Security.AccessControl.AccessControlSections]'Access,Owner'
     $acl = if ($directory) { [System.IO.Directory]::GetAccessControl($path, $sections) } else { [System.IO.File]::GetAccessControl($path, $sections) }
+    Set-BootstrapStage 'private-path-owner'
     $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
     # Elevated tokens can create files owned by their TokenOwner group.
     # The directory still has our explicit user owner and files need its private DACL.
@@ -26,6 +34,7 @@ try {
     if ($owner -notin $owners -or ($directory -and -not $acl.AreAccessRulesProtected)) { throw 'unsafe bootstrap owner' }
     $write = [System.Security.AccessControl.FileSystemRights]::Write -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.Access) {
+      Set-BootstrapStage 'private-path-writers'
       $writer = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
       if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and ($rule.FileSystemRights -band $write) -ne 0 -and $writer -notin @($sid, 'S-1-5-18', 'S-1-5-32-544')) { throw 'unsafe bootstrap writer' }
     }
@@ -49,10 +58,12 @@ public static class RiceNativeBootstrapPath {
     if (-not $base) { continue }
     $directory = Join-Path $base ('rice-accounts-' + $sid)
     $existed = [System.IO.Directory]::Exists($directory)
+    Set-BootstrapStage 'create-private-directory'
     try { [void][System.IO.Directory]::CreateDirectory($directory, $security) } catch { continue }
     Assert-PrivatePath $directory $true
     $plain = $directory
     if ($plain -match '\s') {
+      Set-BootstrapStage 'shorten-directory'
       try {
         Add-Type -TypeDefinition $shortPathSource
         $buffer = New-Object System.Text.StringBuilder(32768)
@@ -66,12 +77,13 @@ public static class RiceNativeBootstrapPath {
     }
     $file = Join-Path $directory $env:RICE_NATIVE_BOOTSTRAP_FILE
     if (Test-Path -LiteralPath $file) { Assert-PrivatePath $file $false }
+    Set-BootstrapStage 'return-private-path'
     [pscustomobject]@{directory=$plain} | ConvertTo-Json -Compress
     exit 0
   }
   throw 'no private plain bootstrap path'
 } catch {
-  [Console]::Error.WriteLine('Windows native bootstrap could not establish a private, space-free path.')
+  [Console]::Error.WriteLine('Windows native bootstrap could not establish a private, space-free path. stage=' + $stage + '; class=' + $_.Exception.GetType().Name)
   exit 1
 }
 `
@@ -92,7 +104,9 @@ export function windowsBootstrapDirectory(filename, options = {}) {
       if (typeof value.directory === 'string' && absoluteWindowsPath(value.directory) && !/\s/.test(value.directory)) return value.directory
     } catch { /* Only a validated private path may be used for executable code. */ }
   }
-  throw failure('Windows native bootstrap needs a private, space-free temporary path. Check your user TEMP permissions, then run /rice-account setup-native again.')
+  const stage = Array.from(result.stderr?.matchAll(/stage=([a-z-]+)/g) ?? []).at(-1)?.[1]
+  const timeout = result.error?.code === 'ETIMEDOUT'
+  throw failure(`Windows native bootstrap ${timeout ? 'timed out establishing' : 'needs'} a private, space-free temporary path${stage ? ` (stage=${stage})` : ''}. Check your user TEMP permissions, then run /rice-account setup-native again.`)
 }
 
 export const WINDOWS_LAUNCHER_MARKER = '@echo off\r\nrem rice-session-accounts installed launcher\r\n'

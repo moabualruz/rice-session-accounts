@@ -25,6 +25,7 @@ jobs:
           claude_bin="$RUNNER_TEMP/claude-native/node_modules/.bin/claude"
           test "$("$claude_bin" --version)" = '${{ matrix.claude }} (Claude Code)'
           printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
+          printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
       - run: npm run check
       - name: Check the owner's dash policy
         shell: bash

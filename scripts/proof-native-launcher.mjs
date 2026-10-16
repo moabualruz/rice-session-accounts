@@ -1,7 +1,7 @@
 // Own installation fixture, no account login or installed plugin changes.
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const root = fileURLToPath(new URL('../', import.meta.url))
 const fixture = mkdtempSync(join(tmpdir(), 'rice-account-launcher-'))
 const config = join(fixture, '.claude'), selection = join(config, 'rice-session-accounts/native-launcher.json')
-const native = process.env.RICE_ACCOUNTS_PROOF_CLAUDE || 'claude'
+const native = realpathSync(process.env.RICE_ACCOUNTS_PROOF_CLAUDE || execFileSync('which', ['claude'], { encoding: 'utf8' }).trim())
 const env = { PATH: process.env.PATH, HOME: fixture, USERPROFILE: fixture, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1' }
 const run = (file, args) => spawnSync(process.execPath, [file, ...args], { cwd: fixture, env, encoding: 'utf8', timeout: 40000 })
 try {

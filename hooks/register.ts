@@ -31,6 +31,8 @@ let mirror: { active: ActiveAccount | null; originals: EnvSnapshot | null } = { 
 let renewal: Timer | undefined
 let expiresAt: number | undefined
 let knownNames: string[] = [LOGIN_NAME]
+let transitionGeneration = 0
+let commitTail: Promise<void> = Promise.resolve()
 
 // Claude 2.1.296 follows `$` only into helpers declared in this module.
 async function syncDescendantAuth($: EngineInterface): Promise<void> {
@@ -288,6 +290,7 @@ async function renewIfActive($: EngineInterface, name: string): Promise<void> {
 
 /** Puts this process on an account: its secret read, the managed variables set, the state and status updated. */
 async function switchTo($: EngineInterface, name: string, isQuiet = false): Promise<string> {
+  const generation = isQuiet ? transitionGeneration : ++transitionGeneration
   const { config, problems } = await loadConfig($)
   const account = config.accounts[name]
   if (!account) {
@@ -298,31 +301,43 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
   const nativeActive = await $.env.get('RICE_SESSION_ACCOUNTS_NATIVE_ACTIVE') === '1'
   if (name !== LOGIN_NAME && !nativeActive) throw new Error('Account switching requires the native account cache bridge. Run /rice-account setup-native <absolute path to a qualified Claude executable>, then start a new session with rice-account-claude or the configured rice-claude launcher.')
-  const previousName = mirror.active?.name ?? LOGIN_NAME
   const machine = await machineOf($)
   const originals = await originalsOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
-  const plan = planEnv(account, material.secret, originals)
-  for (const variableName of MANAGED) {
-    if ((await getManaged($, variableName)) !== plan[variableName]) await setManaged($, variableName, plan[variableName])
-  }
-  await syncDescendantAuth($)
-  const now = await $.clock.now()
-  const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
-  mirror = { ...mirror, active }
-  await update($, activeAtom, () => active)
-  expiresAt = material.expiresAt
-  scheduleRenewal($, name, now)
-  // Commit only a completed account transition, not same-account token renewal.
-  // The main-process bridge resets OAuth/quota caches and retires old responses.
-  if (previousName !== name) await $.env.set('RICE_SESSION_ACCOUNTS_AUTH_REVISION', name)
-  $.ui.status(statusText(name, account))
-  if (isQuiet) return ''
-  const email = account.kind === 'claudeai' ? await loginEmail(machineIo($), account.loginDir) : undefined
+  // Credential refresh may finish after the person selected another account.
+  // Prepare in parallel, then serialize environment/state commits and reject old work.
+  const preceding = commitTail
+  let releaseCommit = () => {}
+  commitTail = new Promise<void>(resolve => { releaseCommit = resolve })
+  await preceding
+  try {
+    if (generation !== transitionGeneration || isQuiet && mirror.active?.name !== name) {
+      if (isQuiet) return ''
+      throw new Error('Another account choice superseded this switch. The newer selection was kept.')
+    }
+    const previousName = mirror.active?.name ?? LOGIN_NAME
+    const plan = planEnv(account, material.secret, originals)
+    for (const variableName of MANAGED) {
+      if ((await getManaged($, variableName)) !== plan[variableName]) await setManaged($, variableName, plan[variableName])
+    }
+    await syncDescendantAuth($)
+    const now = await $.clock.now()
+    const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
+    mirror = { ...mirror, active }
+    await update($, activeAtom, () => active)
+    expiresAt = material.expiresAt
+    scheduleRenewal($, name, now)
+    // Commit only a completed account transition, not same-account token renewal.
+    // The main-process bridge resets OAuth/quota caches and retires old responses.
+    if (previousName !== name) await $.env.set('RICE_SESSION_ACCOUNTS_AUTH_REVISION', name)
+    $.ui.status(statusText(name, account))
+    if (isQuiet) return ''
+    const email = account.kind === 'claudeai' ? await loginEmail(machineIo($), account.loginDir) : undefined
 
-  return name === LOGIN_NAME
-    ? `This session is back on this machine's /login. Other sessions were not touched.${nativeActive ? '' : ' Native account reporting needs a fresh rice-account-claude session; run /rice-account setup-native.'}`
-    : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
+    return name === LOGIN_NAME
+      ? `This session is back on this machine's /login. Other sessions were not touched.${nativeActive ? '' : ' Native account reporting needs a fresh rice-account-claude session; run /rice-account setup-native.'}`
+      : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
+  } finally { releaseCommit() }
 }
 
 /** After a reload (state kept) or a /clear (module kept), the account this process holds is put back in both. */

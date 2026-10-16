@@ -24,6 +24,14 @@ delete env.RICE_ACCOUNTS_PROOF_CLAUDE
 const run = (file, args, extra = {}) => spawnSync(process.execPath, [file, ...args], { env: { ...env, ...extra }, cwd: fixture, encoding: 'utf8', timeout: 30000 })
 const quoted = value => `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`
 const cmd = args => spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${[command, ...args].map(quoted).join(' ')}"`], { env, cwd: fixture, encoding: 'utf8', timeout: 30000, windowsVerbatimArguments: true })
+function diagnose(phase, result) {
+  if (result.status === 0) return
+  process.stdout.write(`${JSON.stringify({ phase, status: result.status, errorCode: result.error?.code,
+    controlledError: result.stderr?.match(/rice-session-accounts: [^\r\n]{1,600}/)?.[0],
+    moduleNotFound: /MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/.test(result.stderr ?? ''), shellPathFailure: /not recognized|cannot find|not found/i.test(result.stderr ?? ''),
+    nodePresent: existsSync(process.execPath), entryPresent: existsSync(entry), commandPresent: existsSync(command), selectionPresent: existsSync(selection),
+  })}\n`)
+}
 try {
   cpSync(join(root, 'native'), join(plugin, 'native'), { recursive: true })
   cpSync(join(root, '.claude-plugin'), join(plugin, '.claude-plugin'), { recursive: true })
@@ -41,10 +49,12 @@ try {
     rmSync(path)
   }
   const installed = run(join(plugin, 'native/launch.mjs'), ['--install', native])
+  diagnose('managed-install', installed)
   assert.equal(installed.status, 0, 'private Windows bootstrap activates the real native adapter before installation')
   const saved = readFileSync(selection, 'utf8')
   assert.deepEqual(JSON.parse(saved), { format: 1, executable: native, claudeVersion: '2.1.299' })
   const version = cmd(['--version'])
+  diagnose('managed-version', version)
   assert.equal(version.status, 0, 'plain managed .cmd launcher uses the saved qualified runtime')
   assert.match(version.stdout, /^2\.1\.299 \(Claude Code\)\s*$/)
   assert.equal(run(join(plugin, 'native/launch.mjs'), ['--install']).status, 0, 'setup repeats with the verified saved runtime')
