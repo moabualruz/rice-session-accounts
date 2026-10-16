@@ -40,7 +40,7 @@ try {
     Set-BootstrapStage 'private-directory-inheritance'
     if ($directory -and -not $acl.AreAccessRulesProtected) { throw 'unsafe bootstrap inheritance' }
     $write = [System.Security.AccessControl.FileSystemRights]::Write -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership
-    foreach ($rule in $acl.Access) {
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
       Set-BootstrapStage 'private-path-writers'
       $writer = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
       if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and ($rule.FileSystemRights -band $write) -ne 0 -and $writer -notin @($sid, 'S-1-5-18', 'S-1-5-32-544')) { throw 'unsafe bootstrap writer' }
