@@ -12,26 +12,33 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 function Set-BootstrapStage([string]$value) {
   $script:stage = $value
+  # Captured by the parent only. Preserve the final phase if PowerShell hangs.
   [Console]::Error.WriteLine('rice-bootstrap-stage=' + $value)
 }
 Set-BootstrapStage 'identity'
 try {
   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
   $sid = $identity.User.Value
+  Set-BootstrapStage 'identity-ready'
   function Assert-PrivatePath([string]$path, [bool]$directory) {
     Set-BootstrapStage 'inspect-private-path'
-    $item = Get-Item -Force -LiteralPath $path
-    if ($item.PSIsContainer -ne $directory -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'unsafe bootstrap type' }
+    $attributes = [System.IO.File]::GetAttributes($path)
+    Set-BootstrapStage 'private-path-type'
+    if ((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -ne $directory) { throw 'unsafe bootstrap type' }
+    Set-BootstrapStage 'private-path-reparse'
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'unsafe bootstrap reparse point' }
     Set-BootstrapStage 'read-private-acl'
     $sections = [System.Security.AccessControl.AccessControlSections]'Access,Owner'
     $acl = if ($directory) { [System.IO.Directory]::GetAccessControl($path, $sections) } else { [System.IO.File]::GetAccessControl($path, $sections) }
     Set-BootstrapStage 'private-path-owner'
     $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    # Elevated tokens can create files owned by their TokenOwner group.
-    # The directory still has our explicit user owner and files need its private DACL.
+    # Elevated Windows tokens can create files owned by their TokenOwner group.
+    # Directories have our explicit user owner; files still require the private DACL.
     $owners = @($sid)
     if (-not $directory) { $owners += $identity.Owner.Value }
-    if ($owner -notin $owners -or ($directory -and -not $acl.AreAccessRulesProtected)) { throw 'unsafe bootstrap owner' }
+    if ($owner -notin $owners) { throw 'unsafe bootstrap owner' }
+    Set-BootstrapStage 'private-directory-inheritance'
+    if ($directory -and -not $acl.AreAccessRulesProtected) { throw 'unsafe bootstrap inheritance' }
     $write = [System.Security.AccessControl.FileSystemRights]::Write -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.Access) {
       Set-BootstrapStage 'private-path-writers'
@@ -47,16 +54,18 @@ public static class RiceNativeBootstrapPath {
   public static extern uint GetShortPathName(string path, StringBuilder output, uint length);
 }
 '@
-  $security = New-Object System.Security.AccessControl.DirectorySecurity
+  Set-BootstrapStage 'construct-private-acl'
+  $security = [System.Security.AccessControl.DirectorySecurity]::new()
   $security.SetAccessRuleProtection($true, $false)
   $security.SetOwner($identity.User)
   $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
   $security.AddAccessRule($rule)
   $bases = @($env:RICE_NATIVE_BOOTSTRAP_TEMP)
-  if ($env:RICE_NATIVE_BOOTSTRAP_WINDOWS) { $bases += Join-Path $env:RICE_NATIVE_BOOTSTRAP_WINDOWS 'Temp' }
-  foreach ($base in $bases | Select-Object -Unique) {
-    if (-not $base) { continue }
-    $directory = Join-Path $base ('rice-accounts-' + $sid)
+  if ($env:RICE_NATIVE_BOOTSTRAP_WINDOWS) { $bases += [System.IO.Path]::Combine($env:RICE_NATIVE_BOOTSTRAP_WINDOWS, 'Temp') }
+  $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($base in $bases) {
+    if (-not $base -or -not $seen.Add($base)) { continue }
+    $directory = [System.IO.Path]::Combine($base, ('rice-accounts-' + $sid))
     $existed = [System.IO.Directory]::Exists($directory)
     Set-BootstrapStage 'create-private-directory'
     try { [void][System.IO.Directory]::CreateDirectory($directory, $security) } catch { continue }
@@ -66,19 +75,31 @@ public static class RiceNativeBootstrapPath {
       Set-BootstrapStage 'shorten-directory'
       try {
         Add-Type -TypeDefinition $shortPathSource
-        $buffer = New-Object System.Text.StringBuilder(32768)
+        $buffer = [System.Text.StringBuilder]::new(32768)
         $length = [RiceNativeBootstrapPath]::GetShortPathName($directory, $buffer, [uint32]$buffer.Capacity)
         if ($length -gt 0 -and $length -lt $buffer.Capacity -and [System.IO.Directory]::Exists($buffer.ToString())) { $plain = $buffer.ToString() }
-      } catch { <# A plain fallback base does not need the optional short-path API. #> }
+      } catch { <# A plain fallback base does not require the optional short-path API. #> }
     }
     if ($plain -match '\s') {
       if (-not $existed -and [System.IO.Directory]::GetFileSystemEntries($directory).Length -eq 0) { [System.IO.Directory]::Delete($directory) }
       continue
     }
-    $file = Join-Path $directory $env:RICE_NATIVE_BOOTSTRAP_FILE
-    if (Test-Path -LiteralPath $file) { Assert-PrivatePath $file $false }
+    $file = [System.IO.Path]::Combine($directory, $env:RICE_NATIVE_BOOTSTRAP_FILE)
+    if ([System.IO.File]::Exists($file) -or [System.IO.Directory]::Exists($file)) { Assert-PrivatePath $file $false }
     Set-BootstrapStage 'return-private-path'
-    [pscustomobject]@{directory=$plain} | ConvertTo-Json -Compress
+    # No cmdlet auto-loading in the required path: a stripped child environment
+    # can block Windows PowerShell module discovery under an isolated profile.
+    $json = [System.Text.StringBuilder]::new()
+    [void]$json.Append('{"directory":"')
+    foreach ($character in $plain.ToCharArray()) {
+      $code = [int]$character
+      if ($code -eq 34) { [void]$json.Append('\"') }
+      elseif ($code -eq 92) { [void]$json.Append('\\') }
+      elseif ($code -lt 32) { [void]$json.Append('\u').Append($code.ToString('x4')) }
+      else { [void]$json.Append($character) }
+    }
+    [void]$json.Append('"}')
+    [Console]::Out.WriteLine($json.ToString())
     exit 0
   }
   throw 'no private plain bootstrap path'
