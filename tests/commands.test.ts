@@ -1,6 +1,8 @@
 import type { CommandRunInput, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { fixturePath } from './fixture-path'
+
 import type { Config } from '../hooks/config'
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 
@@ -22,16 +24,16 @@ function fixture(on: On, initial?: Config) {
   mock.store(on)
   on('state.get', () => ({ value: { value: undefined, version: 0 } }))
   on('state.set', () => ({ value: { isSet: true, version: 1 } }))
-  on('fs.exists', (_host, input) => ({ value: files.has(input.path) }))
+  on('fs.exists', (_host, input) => ({ value: files.has(fixturePath(input.path)) }))
   on('fs.read', (_host, input) => {
-    reads.push(input.path)
-    const text = files.get(input.path)
+    reads.push(fixturePath(input.path))
+    const text = files.get(fixturePath(input.path))
     if (text === undefined) throw new Error('ENOENT: isolated fixture file')
     return { value: text }
   })
   on('fs.write', (_host, input) => {
-    writes.push(input)
-    files.set(input.path, input.text)
+    writes.push({ ...input, path: fixturePath(input.path) })
+    files.set(fixturePath(input.path), input.text)
     return { value: undefined }
   })
   on('fs.stat', () => { throw new Error('ENOENT: isolated fixture file') })

@@ -1,5 +1,7 @@
 import type { CommandRunInput, On, PaneOpenArgs } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+
+import { fixturePath } from './fixture-path'
 import type { MountTarget } from 'claude-code/testing'
 
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
@@ -60,11 +62,11 @@ function fixture(on: On, isPlaced = true) {
     else environment.set(input.name, input.value)
     return { value: undefined }
   })
-  on('fs.exists', (_host, input) => ({ value: documents.has(input.path) }))
-  on('fs.read', (_host, input) => ({ value: documents.get(input.path) ?? '{}' }))
+  on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
+  on('fs.read', (_host, input) => ({ value: documents.get(fixturePath(input.path)) ?? '{}' }))
   on('fs.write', (_host, input) => {
-    writes.push(input.path)
-    documents.set(input.path, input.text)
+    writes.push(fixturePath(input.path))
+    documents.set(fixturePath(input.path), input.text)
     return { value: undefined }
   })
   on('fs.list', () => ({ value: [] }))

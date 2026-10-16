@@ -1,6 +1,8 @@
 import type { CommandRunInput, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { fixturePath } from './fixture-path'
+
 import type { ActiveAccount, EnvSnapshot } from '../types'
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 import { headerToken, MANAGED } from '../hooks/env'
@@ -87,16 +89,16 @@ function fixture(on: On) {
     originalsVersion += 1
     return { value: { isSet: true, version: originalsVersion } }
   })
-  on('fs.exists', (_host, input) => ({ value: documents.has(input.path) }))
+  on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
   on('fs.read', (_host, input) => {
-    fileReads.push(input.path)
-    const text = documents.get(input.path)
+    fileReads.push(fixturePath(input.path))
+    const text = documents.get(fixturePath(input.path))
     if (text === undefined) return { value: '{}' }
     return { value: text }
   })
   on('fs.write', (_host, input) => {
-    writes.push(input.path)
-    documents.set(input.path, input.text)
+    writes.push(fixturePath(input.path))
+    documents.set(fixturePath(input.path), input.text)
     return { value: undefined }
   })
   on('fs.stat', () => { throw new Error('No stat is required for unexpired fixture credentials') })

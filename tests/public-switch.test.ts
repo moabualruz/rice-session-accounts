@@ -1,6 +1,8 @@
 import type { CommandRunInput, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { fixturePath } from './fixture-path'
+
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 import { headerToken } from '../hooks/env'
 
@@ -87,9 +89,9 @@ function fixture(on: On) {
     if (failState && e.value?.name === 'account-b') { failState = false; return next({ ...e, value: e.previous ?? null }) }
     return next(e)
   })
-  on('fs.exists', (_host, e) => ({ value: documents.has(e.path) }))
-  on('fs.read', (_host, e) => ({ value: documents.get(e.path) ?? '{}' }))
-  on('fs.write', (_host, e) => { writes.push(e.path); return { value: undefined } })
+  on('fs.exists', (_host, e) => ({ value: documents.has(fixturePath(e.path)) }))
+  on('fs.read', (_host, e) => ({ value: documents.get(fixturePath(e.path)) ?? '{}' }))
+  on('fs.write', (_host, e) => { writes.push(fixturePath(e.path)); return { value: undefined } })
   on('fs.list', () => ({ value: [] }))
   on('process.run', (_host, e) => {
     processes.push(e.argv)
