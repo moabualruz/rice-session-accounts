@@ -35,7 +35,7 @@ test('cached session references use B on the next dispatch while an already prep
   expect(auth.prepare('https://api.anthropic.com/api/oauth/profile', { auth: 'observed-startup-handle' }, 'caller', 'synthetic-b', false)?.headers?.Authorization).toBe('Bearer synthetic-b')
   expect(() => auth.prepare('https://api.anthropic.com/', { auth: 'observed-startup-handle' }, 'another', 'synthetic-b', false)).toThrow('calling plugin')
   const separateSession = new SessionAuthorizations()
-  expect(() => separateSession.prepare('https://api.anthropic.com/', { auth: reference.handle }, 'caller', 'synthetic-c', false)).toThrow('calling plugin session')
+  expect(() => separateSession.prepare('https://api.anthropic.com/', { auth: reference.handle }, 'caller', 'synthetic-c', false)).toThrow('authorize() again')
   expect(separateSession.recognizes('observed-startup-handle')).toBe(false)
 })
 

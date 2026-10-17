@@ -108,7 +108,10 @@ export class SessionAuthorizations {
   /** Prepare own references and observed native references; unknown handles stay native. */
   prepare(urlText: string, init: HttpInit | undefined, plugin: string, token: string | undefined, networkDisabled: boolean): HttpInit | undefined {
     if (!this.recognizes(init?.auth)) return undefined
-    if (this.ownerOf(init?.auth) !== plugin) throw new Error(FOREIGN_HANDLE)
+    const owner = this.ownerOf(init?.auth)
+    // A reference this module issued but no longer holds (a reload dropped it) is unknown, not foreign.
+    if (owner === undefined) throw new Error(UNKNOWN_HANDLE)
+    if (owner !== plugin) throw new Error(FOREIGN_HANDLE)
     if (networkDisabled) throw new Error(NETWORK_DISABLED)
     let url: URL
     try { url = new URL(urlText) } catch { throw new Error(NOT_ABSOLUTE) }

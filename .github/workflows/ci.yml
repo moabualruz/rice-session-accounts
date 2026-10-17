@@ -37,14 +37,14 @@ jobs:
           test "$("$claude_bin" --version)" = "${CLAUDE_VERSION} (Claude Code)"
           printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
           printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
-      # Unit tests, plugin tests, typecheck (after the plugin types are laid), strict validation,
+      # Unit tests, plugin tests, strict validation,
       # the dash policy and diff checks.
       - name: Check compatibility contracts
-        if: matrix.claude != '2.1.301'
+        if: ${{ !contains(fromJSON('["2.1.301","2.1.302"]'), matrix.claude) }}
         run: npm run check:compat
-      # The same checks plus the ordinary-Claude auth and bash proofs, which bind to this version.
+      # The same checks plus the type check and the ordinary-Claude auth and bash proofs, which bind to these versions.
       - name: Check current ordinary-Claude behavior
-        if: matrix.claude == '2.1.301'
+        if: contains(fromJSON('["2.1.301","2.1.302"]'), matrix.claude)
         run: npm run check
   macos:
     name: macos (Claude Code ${{ matrix.claude }})
@@ -73,6 +73,8 @@ jobs:
           printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
       - name: Check compatibility contracts
         run: npm run check:compat
+      - name: Type-check against this Claude Code
+        run: npm run typecheck
       # The proof skips unless GITHUB_ACTIONS=true (set by the runner) and
       # RICE_ACCOUNTS_PROOF_KEYCHAIN=1 on darwin, so it never touches a developer keychain.
       - name: Check the macOS keychain adapter
@@ -109,10 +111,10 @@ jobs:
           "RICE_ACCOUNTS_PROOF_CLAUDE=$nativeExecutable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $nativePrefix 'node_modules/.bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Check compatibility contracts
-        if: matrix.claude != '2.1.301'
+        if: ${{ !contains(fromJSON('["2.1.301","2.1.302"]'), matrix.claude) }}
         run: npm run check:compat
       - name: Check current ordinary-Claude behavior
-        if: matrix.claude == '2.1.301'
+        if: contains(fromJSON('["2.1.301","2.1.302"]'), matrix.claude)
         run: npm run check
       - name: Check native Windows credential storage
         run: node scripts/proof-windows-storage.mjs

@@ -9,7 +9,7 @@ import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_N
 import type { AccountConfig, Config, Kind } from './config'
 import { readLogin } from './credentials'
 import { argvInvokesClaude, commandInvokesClaude, GUARD_FAILED } from './descendants'
-import { headerToken, MANAGED, planEnv } from './env'
+import { headerToken, MANAGED, oauthHeaders, planEnv, withoutAuthHeaders } from './env'
 import type { Managed, Originals } from './env'
 import { accountIdentity } from './identity'
 import type { EnvName, Io } from './io'
@@ -39,6 +39,9 @@ const USAGE_REFRESH_MS = 60_000
 const RENEWAL_BACKOFF_MS = 30_000
 const RENEWAL_BACKOFF_MAX_MS = 600_000
 const LOADING_USAGE = 'loading usage'
+/** RICE_SESSION_ACCOUNTS_SELECTED: a non-secret marker in the process environment naming the selected account; it survives /clear and a reload, which empty `$.state`. Literal at its call sites because the validator lists the variables a module touches. */
+/** What a lockout puts in place of the unconfirmed bearer, so requests nothing hooks fail loudly instead of using the wrong account. */
+const LOCKOUT_BEARER = 'rice-session-accounts-account-not-confirmed'
 
 type ReportedLimit = { kind: string; percentUsed: number; resetsAt?: string }
 type AccountReport = { name: string; generation: number; email: string; tier: string; rateLimits: ReportedLimit[]; problem?: string; isStale?: boolean }
@@ -185,7 +188,7 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
   }
 }
 
-async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<void> {
+async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<unknown> {
   switch (name) {
     case 'ANTHROPIC_API_KEY':
       return $.env.set('ANTHROPIC_API_KEY', value)
@@ -249,9 +252,20 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
 }
 
 /** Sets one managed variable and reads it back; a refusal or a value that did not stick throws. */
+/** A refusal text that may echo the value it was asked to set, with that value and any bearer removed. */
+function redacted(text: string, value: string | undefined): string {
+  const hidden = value && value.length >= 8 ? text.split(value).join('[value]') : text
+  return hidden.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+}
+
 async function setManagedChecked($: EngineInterface, name: Managed, value: string | undefined): Promise<void> {
   let refusal: string | undefined
-  try { await setManaged($, name, value) } catch (error) { refusal = message(error) }
+  try {
+    const outcome = await setManaged($, name, value)
+    // The engine holds a write it will not make by resolving with a reason.
+    if (typeof outcome === 'object' && outcome !== null && 'deny' in outcome && typeof outcome.deny === 'string') refusal = outcome.deny
+  } catch (error) { refusal = message(error) }
+  if (refusal !== undefined) refusal = redacted(refusal, value)
   if (refusal !== undefined || (await getManaged($, name)) !== value) {
     throw new Error(`Claude refused the session environment change for ${name}${refusal ? ` (${refusal.replace(/\.$/, '')})` : ''}. The account was not switched.`)
   }
@@ -344,6 +358,9 @@ async function originalsOf($: EngineInterface): Promise<Originals> {
   }
   const taken = {} as Originals
   for (const name of MANAGED) taken[name] = (await getManaged($, name)) ?? null
+  // After /clear and a reload the environment can still hold a selected account's generated
+  // header; it is not a launch value, so only its non-authentication lines are kept.
+  if (await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED')) taken.ANTHROPIC_CUSTOM_HEADERS = withoutAuthHeaders(taken.ANTHROPIC_CUSTOM_HEADERS ?? undefined) ?? null
   local.mirror = { ...local.mirror, originals: taken }
   await update($, originalsAtom, () => taken)
 
@@ -420,10 +437,29 @@ async function lockoutProblem($: EngineInterface): Promise<string | undefined> {
 async function enterLockout($: EngineInterface, problem: string): Promise<void> {
   local.transitionProblem = problem
   local.accountReport = undefined
+  // A lookup begun before the lockout must not overwrite its status.
+  local.commitAttempts += 1
+  await neutralizeBearer($)
   local.renewal?.cancel()
   local.renewal = undefined
   $.ui.status(LOCKOUT_STATUS)
   try { await update($, problemAtom, () => problem) } catch (error) { $.ui.log(`The account lockout could not be kept for a reload: ${message(error)}`, { to: 'debug' }) }
+}
+
+/**
+ * While the account is unconfirmed, requests that no hook sees (the permission
+ * classifier, titles, MCP servers, other tools) must not go out on a bearer
+ * nobody confirmed: the generated bearer line becomes one no server accepts.
+ * Best effort; a verified switch or `login` sets the real headers again.
+ */
+async function neutralizeBearer($: EngineInterface): Promise<void> {
+  try {
+    const headers = await $.env.get('ANTHROPIC_CUSTOM_HEADERS')
+    if (!headerToken(headers) || headerToken(headers) === LOCKOUT_BEARER) return
+    await $.env.set('ANTHROPIC_CUSTOM_HEADERS', oauthHeaders(headers, LOCKOUT_BEARER))
+  } catch (error) {
+    $.ui.log(`The unconfirmed bearer could not be neutralized: ${message(error)}`, { to: 'debug' })
+  }
 }
 
 async function leaveLockout($: EngineInterface): Promise<void> {
@@ -489,6 +525,7 @@ async function refreshReport($: EngineInterface, taken: Selection, account: Acco
       if (!token) problem = 'usage unavailable'
       else {
         local.usageCheckedAt = await $.clock.now()
+        if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) throw new Error('usage lookups are off while nonessential traffic is disabled')
         const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
         if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
         else {
@@ -561,13 +598,18 @@ async function renewIfActive($: EngineInterface, name: string): Promise<void> {
   }
 }
 
+/** Best effort: the marker only helps a later load recognize an environment that holds a generated bearer. */
+async function setMarker($: EngineInterface, name: string | undefined): Promise<void> {
+  try { if ((await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED')) !== name) await $.env.set('RICE_SESSION_ACCOUNTS_SELECTED', name) } catch (error) { $.ui.log(`The account marker was not updated: ${message(error)}`, { to: 'debug' }) }
+}
+
 /**
  * Puts this process on an account: its secret read, the managed variables
  * set, the state and status updated. `isQuiet` renews or restores the
  * account the session holds, from the copy taken when it was selected.
  */
-async function switchTo($: EngineInterface, name: string, isQuiet = false): Promise<string> {
-  const sequence = isQuiet ? local.committedSelection : ++local.selections
+async function switchTo($: EngineInterface, name: string, isQuiet = false, expectedSelection?: number): Promise<string> {
+  const sequence = isQuiet ? expectedSelection ?? local.committedSelection : ++local.selections
   let account = isQuiet && local.mirror.active?.name === name ? keptAccount(local.mirror.active) : undefined
   if (!account) {
     const { config, problems } = await loadConfig($)
@@ -612,6 +654,7 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
         precedingValues.set(variableName, before)
         await setManagedChecked($, variableName, plan[variableName])
       }
+      await setMarker($, name === LOGIN_NAME ? undefined : name)
       const now = await $.clock.now()
       const snapshot = snapshotOf(account)
       const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now, ...(snapshot ? { account: snapshot } : {}) }
@@ -639,6 +682,7 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
       for (const [variableName, before] of [...precedingValues.entries()].reverse()) {
         try { await setManagedChecked($, variableName, before) } catch { rollbackProblems.push(variableName) }
       }
+      await setMarker($, previous.mirror.active?.name)
       if (timerChanged) {
         try { scheduleExpiry($, previous.mirror.active?.name ?? LOGIN_NAME, await $.clock.now()) } catch { rollbackProblems.push('renewal timer') }
       }
@@ -659,6 +703,7 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
       : { name, generation: taken.generation, email: 'Loading account', tier: 'Unknown', rateLimits: [], problem: LOADING_USAGE }
     $.ui.status(reportStatus(local.accountReport))
   } finally { local.committingAccount = false; releaseCommit() }
+  if (!isQuiet) local.renewalFailures.delete(name)
   if (!keepsReport) await refreshReport($, taken, account, material.secret)
   if (isQuiet) return ''
   if (local.committedSelection !== sequence) return 'A newer account choice superseded this selection. The newer account was kept.'
@@ -689,6 +734,8 @@ async function foreignGateway($: EngineInterface): Promise<string | undefined> {
  */
 async function restore($: EngineInterface): Promise<void> {
   if (await lockoutProblem($)) return
+  // A selection the person commits while this restore awaits must not be undone by it.
+  const startedAt = local.committedSelection
   let kept: ActiveAccount | null = null
   try {
     const saved = await read($, activeAtom)
@@ -699,10 +746,12 @@ async function restore($: EngineInterface): Promise<void> {
       return
     }
     await originalsOf($)
+    if (local.committedSelection !== startedAt) return
     if (!saved) await update($, activeAtom, () => kept)
     local.mirror = { ...local.mirror, active: kept }
-    await switchTo($, kept.name, true)
+    await switchTo($, kept.name, true, startedAt)
   } catch (error) {
+    if (local.committedSelection !== startedAt) return
     const problem = `The session account${kept ? ` ${kept.name}` : ''} could not be put back (${message(error).replace(/\.$/, '')}). ${ACCOUNT_RECOVERY}`
     await enterLockout($, problem)
     $.ui.toast(problem)
@@ -933,7 +982,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
  * re-entry was never run, and refuses only on a lockout this module holds.
  */
 function whenFailed(failure: HookFailure): string | undefined {
-  return failure.kind === 're-entry' ? local.transitionProblem : local.transitionProblem ?? ACCOUNT_RECOVERY
+  return String(failure.kind) === 're-entry' ? local.transitionProblem : local.transitionProblem ?? ACCOUNT_RECOVERY
 }
 
 /** Whether /usage and /status answer for the session selection rather than natively. */
@@ -1005,15 +1054,22 @@ export const register: Register = on => {
       $.ui.status(LOCKOUT_STATUS)
     }
     local.isStarted = true
+    // /clear empties `$.state` while the process keeps the selected account's environment; a
+    // reload before the next turn then finds a generated bearer it can no longer attribute.
+    if (!problem && !active && await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED') && !(await read($, originalsAtom).catch(() => null))) {
+      await enterLockout($, ACCOUNT_RECOVERY)
+      $.ui.toast(ACCOUNT_RECOVERY)
+    }
     const started = await next(e)
+    // Saved names for the typeahead from the start, not only after a first lookup.
+    await loadConfig($).catch(error => $.ui.log(`accounts.json was not read: ${message(error)}`, { to: 'debug' }))
+    // Putting the account back comes before anything that could fail without bearing on it.
+    await restore($)
     await $.command.register({
       name: 'rice-account',
       description: 'Choose the Claude OAuth account for this session by email and plan, or add, set up and check accounts',
       argumentHint: ARGUMENT_HINT,
-    })
-    // Saved names for the typeahead from the start, not only after a first lookup.
-    await loadConfig($).catch(error => $.ui.log(`accounts.json was not read: ${message(error)}`, { to: 'debug' }))
-    await restore($)
+    }).catch(error => $.ui.log(`The /rice-account command was not registered: ${message(error)}`, { to: 'debug' }))
 
     return started
   })
@@ -1054,8 +1110,8 @@ export const register: Register = on => {
   on('http.fetch', async ($, e, next) => {
     const isOwn = next.origin.plugin === PLUGIN
     const problem = await lockoutProblem($)
-    if (problem && !isOwn) return { deny: problem }
     const auth = e.init?.auth
+    if (problem && !isOwn && (auth !== undefined || /^https:\/\/api\.anthropic\.com(?:[/:?#]|$)/i.test(e.url))) return { deny: problem }
     if (auth === undefined) return next(e)
     const selected = await activeAccount($)
     if (!local.authorizations.recognizes(auth)) {

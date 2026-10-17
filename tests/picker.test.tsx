@@ -72,7 +72,7 @@ function fixture(on: On, isPlaced = true, launchToken?: string) {
     envWrites.push(input.name)
     if (input.value === undefined) environment.delete(input.name)
     else environment.set(input.name, input.value)
-    return { value: undefined }
+    return { value: {} }
   })
   on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
   on('fs.read', (_host, input) => ({ value: documents.get(fixturePath(input.path)) ?? '{}' }))

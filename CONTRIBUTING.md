@@ -29,20 +29,21 @@ Run everything from the repository root.
 | Command | What it covers |
 | --- | --- |
 | `npm test` | Every `tests/**/*.test.mjs` unit test with Node's built-in runner (terminal setup helper, credential files). |
-| `npm run test:plugin` | `claude plugin test .`: the `*.test.ts` and `*.test.tsx` suites against the real mod runtime. It also lays `.claude-plugin/types/`. |
-| `npm run typecheck` | TypeScript 6.0.3 over `hooks/`, `types/` and `tests/` with the plugin types. |
+| `npm run test:plugin` | `claude plugin test .`: the `*.test.ts` and `*.test.tsx` suites against the real mod runtime. |
+| `npm run typecheck` | TypeScript 6.0.3 over `hooks/`, `types/` and `tests/` against the declarations of the installed Claude Code (fetched from its own authoring skill; no account or inference). |
 | `npm run check:dashes` | Fails on an en dash or em dash in any tracked text file and lists file, line and column. |
-| `npm run check:compat` | `test`, `test:plugin`, `typecheck`, `claude plugin validate --strict .`, `check:dashes`, `git diff --check` and `git diff --cached --check`. Works on any supported Claude Code version. |
-| `npm run test:auth` | The ordinary-Claude proofs: `scripts/proof-public-auth.mjs` (environment token and native storage baselines) and `npm run test:bash`. Needs Claude Code 2.1.301. |
+| `npm run check:compat` | `test`, `test:plugin`, `claude plugin validate --strict .`, `check:dashes`, `git diff --check` and `git diff --cached --check`. Works on any supported Claude Code version. |
+| `npm run test:auth` | The ordinary-Claude proofs: `scripts/proof-public-auth.mjs` (environment token and native storage baselines) and `npm run test:bash`. Needs Claude Code 2.1.301 or 2.1.302. |
 | `npm run test:bash` | `scripts/proof-public-bash.mjs`: the real-binary proof for the Bash path. |
 | `npm run test:keychain` | `scripts/proof-macos-keychain.mjs`: the macOS keychain adapter. It skips unless it runs on darwin with `GITHUB_ACTIONS=true` and `RICE_ACCOUNTS_PROOF_KEYCHAIN=1`, so it never touches a developer keychain; CI runs it. |
-| `npm run check` | `check:compat` followed by `test:auth`. This is the full local gate. |
+| `npm run check` | `check:compat`, then `typecheck`, then `test:auth`. This is the full local gate and needs Claude Code 2.1.301 or 2.1.302. |
 
-`typecheck` runs `npx --yes -p typescript@6.0.3 tsc -p . --noEmit`. TypeScript is deliberately not a
-dependency, so npx downloads the pinned version on demand. `tsconfig.json` extends
-`.claude-plugin/types/tsconfig.json`, which is ignored by Git and is laid by
-`claude plugin test .` or `claude plugin validate .`. Run one of those first when you call
-`npm run typecheck` on a fresh checkout; `check:compat` already runs them in that order.
+`typecheck` loads the `plugin-authoring` skill in a throwaway session pointed at a local refusal
+server (so a model request would fail loudly), reads the declaration file the skill names, and
+runs TypeScript 6.0.3 over the repository. TypeScript is deliberately not a dependency; `npm exec`
+downloads the pinned version on demand. Set `RICE_ACCOUNTS_PROOF_CLAUDE` to check against a specific
+Claude Code binary. Older engines (2.1.296 and 2.1.299) are covered by `check:compat` only, because
+their declarations predate APIs the code uses.
 
 Native Windows storage is checked by `node scripts/proof-windows-storage.mjs` on a Windows machine.
 

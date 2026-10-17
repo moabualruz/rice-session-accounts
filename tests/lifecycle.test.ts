@@ -84,7 +84,7 @@ function fixture(on: On, options: Options = {}) {
     if (refusedHeader !== undefined && input.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(input.value) === refusedHeader) return { deny: 'Owned rollback refusal' }
     if (input.value === undefined) environment.delete(input.name)
     else environment.set(input.name, input.value)
-    return { value: undefined }
+    return { value: {} }
   })
   on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
   on('fs.read', (_host, input) => ({ value: documents.get(fixturePath(input.path)) ?? '{}' }))
@@ -391,4 +391,43 @@ test('a switch on the default endpoint adds no gateway notice', async ($, on) =>
   fixture(on)
   await $.session.start(START)
   expect((await $.command.run(command('account-b'))).text ?? '').not.toContain('receives the account')
+})
+
+test('a lockout puts a bearer no server accepts in place of the unconfirmed one, and a verified switch replaces it', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start(START)
+  await $.command.run(command('account-a'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-account-a')
+  world.refuseSwitch('account-b', 'fixture-access-account-a')
+  await $.command.run(command('account-b'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('rice-session-accounts-account-not-confirmed')
+  world.allow()
+  await $.command.run(command('account-b'))
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-account-b')
+})
+
+test('after /clear and a reload the selected account is not mistaken for the launch login', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start(START)
+  await $.command.run(command('account-b'))
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_SELECTED')).toBe('account-b')
+  world.clearState()
+  await $.session.start(START)
+  expect(world.status.at(-1) ?? '').toContain('account not confirmed')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('rice-session-accounts-account-not-confirmed')
+  expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe(undefined)
+  expect(world.environment.get('RICE_SESSION_ACCOUNTS_SELECTED')).toBe(undefined)
+})
+
+test('an explicit selection made while a restore is waiting is not undone by it', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start(START)
+  await $.command.run(command('account-a'))
+  world.clearState()
+  const switching = $.command.run(command('account-b'))
+  await $.turn.start({ text: 'Owned turn after /clear', turnId: 'owned-restore-race' })
+  await switching
+  expect(world.active()?.name).toBe('account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-account-b')
 })

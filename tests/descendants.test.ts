@@ -19,7 +19,7 @@ function environment(on: On, values: Record<string, string>): { variables: Map<s
     writes.push(input.name)
     if (input.value === undefined) variables.delete(input.name)
     else variables.set(input.name, input.value)
-    return { value: undefined }
+    return { value: {} }
   })
   return { variables, writes }
 }
@@ -137,4 +137,23 @@ test('a damaged stored lockout refuses a child claude and passes other children'
   expect(runs).toBe(0)
   expect((await $.command.run(fixtureCommand('plain-run'))).text).toBe('started')
   expect(runs).toBe(1)
+})
+
+test('claude is found after shell keywords, eval, redirections, quoting and env -S', async () => {
+  for (const command of [
+    'if claude -p x; then echo ok; fi', 'while true; do claude -p x; done', '! claude -p x', 'eval claude -p x', 'eval "claude -p x"',
+    '>out.txt claude -p x', '2>&1 claude -p x', '> out.txt claude -p x', 'exec -a worker claude -p x', 'c\\laude -p x', '"claude" -p x',
+    '"/opt/My Tools/claude" -p x', "'/opt/My Tools/claude.exe' -p x", 'env -S "claude -p x"', 'env --split-string="claude -p x"',
+    'npx @anthropic-ai/claude-code -p x', 'claude.ps1 -p x', 'cmd /c call claude -p x', '~/.local/share/claude/versions/2.1.302 -p x',
+  ]) expect(commandInvokesClaude(command), command).toBe(true)
+  for (const command of ['echo "run claude later"', "printf 'claude;claude'", 'echo claude | cat', 'git log --grep=claude', 'cat "My Tools/claude notes.txt"', 'ls .claude', 'x=claude; echo $x']) {
+    expect(commandInvokesClaude(command), command).toBe(false)
+  }
+})
+
+test('argument vectors reach claude through env -S and a shell -c', async () => {
+  expect(argvInvokesClaude(['env', '-S', 'claude -p x'])).toBe(true)
+  expect(argvInvokesClaude(['/bin/sh', '-c', 'eval "claude -p x"'])).toBe(true)
+  expect(argvInvokesClaude(['/usr/bin/env', 'FOO=1', '/opt/tools/claude', '-p'])).toBe(true)
+  expect(argvInvokesClaude(['git', 'status'])).toBe(false)
 })

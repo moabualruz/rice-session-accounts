@@ -92,7 +92,7 @@ function fixture(on: On) {
     if (refuseRollback && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-a') return { deny: 'Owned rollback refusal' }
     if (refuseB && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-b') return { deny: 'Owned policy refusal' }
     if (e.value === undefined) environment.delete(e.name); else environment.set(e.name, e.value)
-    return { value: undefined }
+    return { value: {} }
   })
   on('state.set', { plugin: 'rice-session-accounts', key: 'active' }, (_host, e, next) => {
     activeWrites.push(e.value?.name ?? null)
@@ -309,7 +309,7 @@ test('a refused rollback blocks every account-bearing dispatch until an explicit
   expect(result.text ?? '').toContain('refused the session account state change')
   expect(result.text ?? '').toContain('Rollback could not restore ANTHROPIC_CUSTOM_HEADERS')
   expect(result.text ?? '').toContain('session account is not confirmed')
-  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('rice-session-accounts-account-not-confirmed')
   expect(world.status.at(-1) ?? '').toContain('account not confirmed')
   expect(world.status.at(-1) ?? '').not.toContain('account-a@')
   const processCount = world.processes.length

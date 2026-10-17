@@ -70,7 +70,7 @@ function fixture(on: On) {
     envWrites.push(input.name)
     if (input.value === undefined) environment.delete(input.name)
     else environment.set(input.name, input.value)
-    return { value: undefined }
+    return { value: {} }
   })
   on('state.get', { plugin: 'rice-session-accounts', key: 'active' }, () => ({ value: { value: active, version: activeVersion } }))
   on('state.set', { plugin: 'rice-session-accounts', key: 'active' }, (_host, input) => {
@@ -183,7 +183,7 @@ test('mid-session account A to B to login switches the process and restores ever
   expect(world.envWrites).not.toContain('CLAUDE_CODE_OAUTH_TOKEN')
   expect(world.envWrites).not.toContain('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
   expect(world.fileReads.some(path => path.startsWith(`${paths.base}/logins/`) && path.endsWith('/settings.json'))).toBe(false)
-  expect(world.envWrites.every(name => MANAGED.some(managed => managed === name))).toBe(true)
+  expect(world.envWrites.every(name => name === 'RICE_SESSION_ACCOUNTS_SELECTED' || MANAGED.some(managed => managed === name))).toBe(true)
   // This session launched with an auth token, so the machine's stored login is never read for it.
   expect(world.processReads).toEqual([
     `${paths.loginDir('account-a')}/.credentials.json`,
