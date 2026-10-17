@@ -1,7 +1,7 @@
 import type { SecretRef } from './config'
 import type { Io, RunFailure } from './io'
 import { message, runFailure, trustedRun } from './io'
-import { fitCredential, KeychainError, keychainAccountName, liveServiceName, parseCredential, readItem, resolveKeychainAccount, writeItem } from './keychain'
+import { fitCredential, KeychainError, keychainAccountName, liveServiceName, readItem, resolveKeychainAccount, writeItem } from './keychain'
 import type { Credential, StorageVariables } from './keychain'
 import { WINDOWS_CREDENTIAL_STORE } from '../scripts/windows-store-payloads.mjs'
 
@@ -10,8 +10,14 @@ export type LoginLocation = { storage: StorageVariables; defaultConfigDir: strin
 
 /** Appended to the native credential path: the renewed login written ahead of the store. */
 export const PENDING_SUFFIX = '.rice-pending'
-/** A leftover temporary or pending copy older than this is recovered or removed. */
+/** The pending file format this version writes and reads; a file of any other format is ignored. */
+export const PENDING_VERSION = 2
+/** A leftover temporary copy, or a pending file of another format, is removed only once it is older than this. */
 export const STALE_COPY_MS = 5 * 60 * 1000
+/** The largest pending file read on macOS; the Node program applies the same cap. */
+const PENDING_LIMIT = 1024 * 1024
+/** How many spent refresh tokens a renewal kept in memory remembers it descends from. */
+const SPENT_KEPT = 32
 
 let platformCache: { key: string; platform: Promise<HostPlatform> } | undefined
 
@@ -71,14 +77,28 @@ export function nativeCredentialPath(location: LoginLocation, home: string | und
  * specifiers) so that an old Node, such as Ubuntu 22.04's Node 12, parses it
  * and reaches the version guard instead of failing with a syntax error.
  *
- * Operations: `read` prints the document, first adopting a newer renewal from
- * the `.rice-pending` file or a temporary copy older than five minutes (left
- * by a killed write), then removing those copies; `write` replaces only the
- * OAuth grant when the stored refresh token is still the expected one;
- * `pending` writes the renewal ahead of the store. Writes create an exclusive
- * 0600 temporary file, fsync it, rename it over the target (retried for about
- * 3 seconds while Windows Defender or an indexer holds the file) and fsync the
- * folder on POSIX.
+ * The `.rice-pending` file beside the store holds
+ * `{"version":2,"base":B,"credential":{"claudeAiOauth":G}}`: G is the newest
+ * renewed grant not saved to the store yet, and B the refresh token the store
+ * held when the first unsaved renewal began. A pending renewal is usable only
+ * while the store still holds B (rule B in `pendingState`); expiry times never
+ * decide which login is newer.
+ *
+ * Operations: `read` prints the store, or the store with a usable pending
+ * grant, and never writes or removes anything; `examine` prints
+ * `{"stored":document or null,"pending":{"base":B,"credential":...} or null}`
+ * (null for a missing store; otherwise its exit codes are `read`'s), also
+ * without writing; `write` replaces only the OAuth grant when the stored
+ * refresh token is still the expected one, and leaves the pending file alone;
+ * `pending` writes `{base, credential}` from stdin as the pending file;
+ * `clearpending` removes the pending file only when its base is the one on
+ * stdin (or when it is not version 2 and older than five minutes). `write` and
+ * `pending` also remove temporary copies older than five minutes left by a
+ * killed write. Writes create an exclusive 0600 temporary file, fsync it,
+ * rename it over the target and fsync the folder on POSIX; a rename refused
+ * as busy is retried for about 3 seconds, and on Windows also one refused
+ * with EPERM or EACCES while Defender or an indexer holds the file. stdin is
+ * read in a loop that waits out EAGAIN from a non-blocking pipe.
  *
  * Exit codes: 43 a valid document without OAuth; 44 only ENOENT, never an
  * unreadable store; 45 a symbolic link; 46 unreadable, malformed or not
@@ -107,7 +127,6 @@ function sleep(ms) {
 function isObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function isOAuth(value) { return isObject(value) && typeof value.accessToken === 'string' && typeof value.refreshToken === 'string' && typeof value.expiresAt === 'number' && isFinite(value.expiresAt); }
 function grantOf(document) { return isObject(document) && isOAuth(document.claudeAiOauth) ? document.claudeAiOauth : null; }
-function isNewer(candidate, current) { return candidate.expiresAt > current.expiresAt && candidate.refreshToken !== current.refreshToken; }
 function copy(source) {
   var target = {};
   for (var key in source) {
@@ -124,6 +143,7 @@ function merged(document, oauth) {
   next.claudeAiOauth = inner;
   return next;
 }
+function grantOnly(oauth) { return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }; }
 function remove(file) { try { fs.unlinkSync(file); } catch (ignored) {} }
 function readJson(file, strict) {
   var fd;
@@ -158,11 +178,46 @@ function readStored() {
   if (!isOAuth(document.claudeAiOauth)) fail(46);
   return document;
 }
+function readStoredOrNull() {
+  try { return readStored(); } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+function pendingOf(document) {
+  if (!isObject(document) || document.version !== 2 || typeof document.base !== 'string' || document.base === '') return null;
+  var grant = grantOf(document.credential);
+  return grant === null ? null : { base: document.base, credential: { claudeAiOauth: grantOnly(grant) } };
+}
+function readPending() { return pendingOf(readJson(pendingPath, false)); }
+function bestOf(stored, pending) {
+  return pending !== null && stored.claudeAiOauth.refreshToken === pending.base ? merged(stored, pending.credential.claudeAiOauth) : stored;
+}
+function isStale(file) {
+  var stat = null;
+  try { stat = fs.lstatSync(file); } catch (ignored) {}
+  return stat !== null && stat.isFile() && Date.now() - stat.mtimeMs >= staleMs;
+}
+function removeStaleCopies() {
+  var folder = paths.dirname(path);
+  var prefix = paths.basename(path) + '.rice-';
+  var names = [];
+  try { names = fs.readdirSync(folder); } catch (ignored) {}
+  for (var index = 0; index < names.length; index += 1) {
+    var name = names[index];
+    if (name.indexOf(prefix) !== 0 || !/^[0-9]+-[0-9a-f-]{16,64}$/.test(name.slice(prefix.length))) continue;
+    var file = paths.join(folder, name);
+    if (file !== temporary && isStale(file)) remove(file);
+  }
+}
+function isRetryable(code) {
+  if (code === 'EBUSY') return true;
+  return process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES');
+}
 function renameWithRetry(from, to) {
   for (var attempt = 0; ; attempt += 1) {
     try { fs.renameSync(from, to); return; } catch (error) {
-      var code = error && error.code;
-      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw error;
+      if (!isRetryable(error && error.code)) throw error;
       if (attempt >= retryDelays.length) fail(48);
       sleep(retryDelays[attempt]);
     }
@@ -185,49 +240,28 @@ function writeAtomic(target, document) {
   temporary = undefined;
   syncFolder(paths.dirname(target));
 }
-function leftovers() {
-  var found = [];
-  var pending = grantOf(readJson(pendingPath, false));
-  if (pending) found.push({ file: pendingPath, oauth: pending });
-  var folder = paths.dirname(path);
-  var prefix = paths.basename(path) + '.rice-';
-  var names = [];
-  try { names = fs.readdirSync(folder); } catch (ignored) {}
-  var now = Date.now();
-  for (var index = 0; index < names.length; index += 1) {
-    var name = names[index];
-    if (name.indexOf(prefix) !== 0 || !/^[0-9]+-[0-9a-f-]{16,64}$/.test(name.slice(prefix.length))) continue;
-    var file = paths.join(folder, name);
-    var stat = null;
-    try { stat = fs.lstatSync(file); } catch (ignored) {}
-    if (stat === null || !stat.isFile() || now - stat.mtimeMs < staleMs) continue;
-    found.push({ file: file, oauth: grantOf(readJson(file, false)) });
-  }
-  return found;
-}
-function adopt(document) {
-  var found = leftovers();
-  var best = null;
-  for (var index = 0; index < found.length; index += 1) {
-    var oauth = found[index].oauth;
-    if (oauth && isNewer(oauth, document.claudeAiOauth) && (best === null || oauth.expiresAt > best.expiresAt)) best = oauth;
-  }
-  var next = best === null ? document : merged(document, best);
-  if (best !== null) {
-    try { writeAtomic(path, next); } catch (ignored) {
-      if (temporary) { remove(temporary); temporary = undefined; }
-      return next;
+function readInput() {
+  var chunk = Buffer.alloc(65536);
+  var chunks = [];
+  var size = 0;
+  var deadline = Date.now() + 10000;
+  for (;;) {
+    var count;
+    try { count = fs.readSync(0, chunk, 0, chunk.length, null); } catch (error) {
+      var code = error && error.code;
+      if (code === 'EAGAIN' && Date.now() < deadline) { sleep(5); continue; }
+      if (code === 'EOF') break;
+      throw error;
     }
+    if (count === 0) break;
+    size += count;
+    if (size > limit) fail(46);
+    chunks.push(Buffer.from(chunk.subarray(0, count)));
   }
-  for (var each = 0; each < found.length; each += 1) remove(found[each].file);
-  return next;
-}
-function clearPending(oauth) {
-  var held = grantOf(readJson(pendingPath, false));
-  if (held && (held.refreshToken === oauth.refreshToken || held.expiresAt <= oauth.expiresAt)) remove(pendingPath);
+  return Buffer.concat(chunks, size).toString('utf8');
 }
 function input() {
-  var value = JSON.parse(fs.readFileSync(0, 'utf8'));
+  var value = JSON.parse(readInput());
   if (!isObject(value)) fail(46);
   return value;
 }
@@ -237,23 +271,29 @@ try {
   if (!path || !paths.isAbsolute(path) || /[\0\r\n]/.test(path) || process.platform === 'win32' && !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(path)) fail(46);
   var output = null;
   if (operation === 'read') {
-    output = adopt(readStored());
+    output = bestOf(readStored(), readPending());
+  } else if (operation === 'examine') {
+    output = { stored: readStoredOrNull(), pending: readPending() };
   } else if (operation === 'write') {
     var request = input();
     var oauth = request.oauth;
     if (!isOAuth(oauth) || typeof request.expectedRefreshToken !== 'string') fail(46);
     var current = readStored();
-    if (current.claudeAiOauth.refreshToken !== request.expectedRefreshToken) {
-      clearPending(oauth);
-      fail(47);
-    }
+    if (current.claudeAiOauth.refreshToken !== request.expectedRefreshToken) fail(47);
     output = merged(current, oauth);
     writeAtomic(path, output);
-    clearPending(oauth);
+    removeStaleCopies();
   } else if (operation === 'pending') {
-    var renewal = input().claudeAiOauth;
-    if (!isOAuth(renewal)) fail(46);
-    writeAtomic(pendingPath, { claudeAiOauth: { accessToken: renewal.accessToken, refreshToken: renewal.refreshToken, expiresAt: renewal.expiresAt } });
+    var renewal = input();
+    var grant = grantOf(renewal.credential);
+    if (typeof renewal.base !== 'string' || renewal.base === '' || grant === null) fail(46);
+    removeStaleCopies();
+    writeAtomic(pendingPath, { version: 2, base: renewal.base, credential: { claudeAiOauth: grantOnly(grant) } });
+  } else if (operation === 'clearpending') {
+    var expected = input().base;
+    if (typeof expected !== 'string' || expected === '') fail(46);
+    var held = readPending();
+    if (held !== null ? held.base === expected : isStale(pendingPath)) remove(pendingPath);
   } else fail(46);
   if (output !== null) process.stdout.write(JSON.stringify(output));
 } catch (error) {
@@ -273,41 +313,80 @@ export const FILE_EXIT = { noOAuth: 43, missing: 44, link: 45, invalid: 46, chan
 
 /**
  * The darwin pending writer: no Node there, so a POSIX shell writes the
- * owner-only (umask 077) copy through an exclusive temporary file, renames it
- * into place and asks the system to flush (`sync`).
+ * owner-only (umask 077) copy. It first removes its own temporary copies
+ * older than five minutes (`<pending>.tmp.<pid>.<random>`, and the fixed
+ * `<pending>.tmp` of earlier versions), then creates a temporary file named
+ * with its process id and a random suffix exclusively (noclobber), so
+ * concurrent writers never share or delete one another's copy, flushes it
+ * (`sync`), renames it into place and flushes again. stdin is the document.
  */
-const PENDING_SH = [
-  'umask 077',
-  'rm -f "$0.tmp" || exit 1',
-  'set -C',
-  'if cat > "$0.tmp" && mv -f "$0.tmp" "$0"; then /bin/sync 2>/dev/null; exit 0; fi',
-  'rm -f "$0.tmp"',
-  'exit 1',
-].join('\n')
+const PENDING_SH = String.raw`umask 077
+d=$(/usr/bin/dirname "$0") && b=$(/usr/bin/basename "$0") || exit 1
+/usr/bin/find "$d" -maxdepth 1 -type f \( -name "$b.tmp" -o -name "$b.tmp.[0-9]*" \) -mmin +5 -exec /bin/rm -f {} + 2>/dev/null
+r=$(/usr/bin/od -An -N8 -tx1 /dev/urandom 2>/dev/null | /usr/bin/tr -d ' \n')
+t="$0.tmp.$$.$r"
+set -C
+: > "$t" || exit 1
+if /bin/cat >> "$t" && /bin/sync && /bin/mv -f "$t" "$0"; then /bin/sync; exit 0; fi
+/bin/rm -f "$t"
+exit 1
+`
 
 type OAuthGrant = Pick<Credential['claudeAiOauth'], 'accessToken' | 'refreshToken' | 'expiresAt'>
 type KeychainStore = { kind: 'keychain'; key: string; service: string; account: string | undefined; writeAccount: string; pendingPath: string | undefined; cwd: string }
 type FileStore = { kind: 'file'; key: string; path: string; pendingPath: string; cwd: string; platform: HostPlatform }
 type Store = KeychainStore | FileStore
+// Never name an operation `inspect` (or `debug`): Node runs a first program argument with that name as its debugger client, even after -e.
+type FileOperation = 'read' | 'examine' | 'write' | 'pending' | 'clearpending'
+type RunResult = Awaited<ReturnType<Io['run']>>
 
-/** Another writer saved a different grant; the caller adopts it. */
+/**
+ * A renewal not saved to the store yet. `base` is the refresh token the store
+ * held when the first unsaved renewal began; that renewal spent it, so it no
+ * longer works. It stays the same across further unsaved renewals while
+ * `credential` advances to the newest renewed login.
+ */
+export type PendingLogin = { base: string; credential: Credential }
+
+/**
+ * How a pending renewal relates to the stored login: `usable` while the store
+ * still holds its base, `redundant` once the store holds its refresh token
+ * (saved), `obsolete` when the store holds neither (it moved past the
+ * renewal, or was signed in again: the store is authoritative), `orphaned`
+ * when there is no stored login to compare with.
+ */
+export type PendingState = 'usable' | 'redundant' | 'obsolete' | 'orphaned'
+
+/** Where the login to use came from. */
+export type CandidateSource = 'store' | 'pending' | 'memory'
+
+/** The store, its pending renewal and the login to use by rule B, as read at one moment. */
+export type LoginState = {
+  /** The stored login; null when there is none, or it could not be read and memory answered. */
+  stored: Credential | null
+  pending: PendingLogin | null
+  /** The login to use: the stored one, or it with a usable renewal's grant. */
+  login: Credential | null
+  source: CandidateSource
+  /** The usable renewal `login` came from, when it did not come from the store. */
+  candidate: PendingLogin | null
+  /** The refresh token the store holds: what a store write must find (compare-and-swap). */
+  onDisk: string | undefined
+  /** Spent refresh tokens `login` is known to descend from (from this process's memory). */
+  spent: readonly string[]
+}
+
+/** The store's login changed while it was renewed: another sign-in or another writer. */
 class LoginChangedError extends Error {}
+
+/** The store holds no login any more: a renewal cannot be saved there, nor used without one. */
+class StoreGoneError extends Error {}
 
 /** A renewal the server granted that could not be saved; the message says where it was kept. */
 export class LoginNotSavedError extends Error {}
 
-function credential(text: string): Credential | null {
-  try {
-    const document: unknown = JSON.parse(text)
-    if (document === null || typeof document !== 'object' || Array.isArray(document)) throw new Error('invalid document')
-    const oauth = (document as { claudeAiOauth?: unknown }).claudeAiOauth
-    if (oauth === undefined || oauth === null) return null
-    const value = parseCredential(text)
-    if (!Number.isFinite(value.claudeAiOauth.expiresAt)) throw new Error('missing expiry')
-    return value
-  } catch {
-    throw new Error('The credential store contains no valid Claude OAuth login. Run account setup again.')
-  }
+function invalidStore(): Error {
+  return new Error('The credential store contains no valid Claude OAuth login. Run account setup again.')
 }
 
 function grantOf(value: unknown): OAuthGrant | null {
@@ -317,18 +396,95 @@ function grantOf(value: unknown): OAuthGrant | null {
     : null
 }
 
-function isNewer(candidate: OAuthGrant, current: OAuthGrant): boolean {
-  return candidate.expiresAt > current.expiresAt && candidate.refreshToken !== current.refreshToken
+/** A stored credential document: null when it is valid but holds no OAuth login. */
+function documentOf(value: unknown): Credential | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalidStore()
+  const oauth = (value as { claudeAiOauth?: unknown }).claudeAiOauth
+  if (oauth === undefined || oauth === null) return null
+  if (grantOf(value) === null) throw invalidStore()
+
+  return value as Credential
+}
+
+function credential(text: string): Credential | null {
+  let value: unknown
+  try { value = JSON.parse(text) } catch { throw invalidStore() }
+
+  return documentOf(value)
+}
+
+function pendingOf(value: unknown): PendingLogin | null {
+  const fields = value as { base?: unknown; credential?: unknown } | null
+  if (fields === null || typeof fields !== 'object' || Array.isArray(fields) || typeof fields.base !== 'string' || fields.base === '') return null
+  const oauth = grantOf(fields.credential)
+
+  return oauth === null ? null : { base: fields.base, credential: { claudeAiOauth: oauth } }
+}
+
+/** A pending file's text as a renewal; null for any other version, a malformed file or one without a grant. */
+export function parsePendingLogin(text: string): PendingLogin | null {
+  let value: unknown
+  try { value = JSON.parse(text) } catch { return null }
+  if ((value as { version?: unknown } | null)?.version !== PENDING_VERSION) return null
+
+  return pendingOf(value)
+}
+
+/**
+ * Rule B, shared by the file and keychain stores: lineage is decided by the
+ * refresh tokens, never by expiry times (a salvaged login has `expiresAt` 0
+ * and is still the newest one).
+ */
+export function pendingState(stored: Credential | null, pending: PendingLogin): PendingState {
+  if (stored === null) return 'orphaned'
+  const held = stored.claudeAiOauth.refreshToken
+  if (held === pending.base) return 'usable'
+  if (held === pending.credential.claudeAiOauth.refreshToken) return 'redundant'
+
+  return 'obsolete'
 }
 
 function merged(document: Credential, oauth: OAuthGrant): Credential {
   return { ...document, claudeAiOauth: { ...document.claudeAiOauth, accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt } }
 }
 
+function grantOnly(oauth: OAuthGrant): OAuthGrant {
+  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+}
+
+/** Whether a usable pending renewal is later than a usable memory one: memory does not descend from it. */
+function pendingIsLater(memory: PendingLogin & { spent?: readonly string[] }, pending: PendingLogin): boolean {
+  const held = pending.credential.claudeAiOauth.refreshToken
+  return held !== memory.credential.claudeAiOauth.refreshToken && !(memory.spent ?? []).includes(held)
+}
+
+/**
+ * The login to use (rule B): the best usable candidate, the in-memory renewal
+ * `memory` before the pending file, else the store. Usable candidates share
+ * the store's refresh token as their base, so they lie on one chain of
+ * renewals; the later one is the one whose credential is not an ancestor of
+ * the other. Memory knows the spent tokens it descends from, so the pending
+ * renewal wins only when memory does not descend from it (another session
+ * renewed further). The login keeps the stored document's other fields.
+ */
+export function bestLogin(stored: Credential | null, pending: PendingLogin | null, memory?: (PendingLogin & { spent?: readonly string[] }) | null): { login: Credential | null; source: CandidateSource; candidate: PendingLogin | null } {
+  const fromMemory = memory && pendingState(stored, memory) === 'usable' ? memory : null
+  const fromPending = pending && pendingState(stored, pending) === 'usable' ? pending : null
+  const candidate = fromMemory && fromPending ? (pendingIsLater(fromMemory, fromPending) ? fromPending : fromMemory) : fromMemory ?? fromPending
+  if (candidate === null || stored === null) return { login: stored, source: 'store', candidate: null }
+
+  return { login: merged(stored, candidate.credential.claudeAiOauth), source: candidate === fromMemory ? 'memory' : 'pending', candidate }
+}
+
 async function fileStoreAvailable(io: Io, platform: HostPlatform): Promise<void> {
   if (platform !== 'win32') return
   const forced = await io.env('FORCE_WINDOWS_CREDMAN')
   if (forced && !/^(?:0|false|no|off)$/i.test(forced)) throw new Error('The optional FORCE_WINDOWS_CREDMAN native browser store is not supported by Rice Accounts. Start this session without that override, or use a claudeai-token account in Windows Credential Manager.')
+}
+
+/** Windows paths name one file whatever their case or separators. */
+function fileKey(path: string, platform: HostPlatform): string {
+  return `file\0${platform === 'win32' ? path.replace(/\\/g, '/').toLowerCase() : path}`
 }
 
 async function storeOf(io: Io, location: LoginLocation): Promise<Store> {
@@ -348,15 +504,24 @@ async function storeOf(io: Io, location: LoginLocation): Promise<Store> {
   // there it is the Claude config folder, which only this user writes.
   const cwd = platform === 'win32' ? location.defaultConfigDir : '/'
 
-  return { kind: 'file', key: `file\0${path}`, path, pendingPath: `${path}${PENDING_SUFFIX}`, cwd, platform }
+  return { kind: 'file', key: fileKey(path, platform), path, pendingPath: `${path}${PENDING_SUFFIX}`, cwd, platform }
 }
 
-function nodeStartProblem(failure: RunFailure, store: FileStore, operation: string): string {
-  const doing = operation === 'read' ? 'reading' : 'writing'
+async function isFolder(io: Io, path: string): Promise<boolean> {
+  const stat = await io.stat(path).catch(() => null)
+  return stat !== null && stat.kind === 'dir'
+}
+
+async function nodeStartProblem(io: Io, failure: RunFailure, store: FileStore, operation: FileOperation): Promise<string> {
+  const doing = operation === 'read' || operation === 'examine' ? 'reading' : 'writing'
   switch (failure) {
     case 'timeout':
       return `Node.js did not finish ${doing} the native Claude credential file at ${store.path} within 15 seconds; another program (for example antivirus or a search indexer) may be holding it. Retry in a moment.`
     case 'missing':
+      // Windows starts Node in the Claude config folder: a missing folder fails the start with ENOENT too.
+      if (store.platform === 'win32' && !(await isFolder(io, store.cwd))) {
+        return `The Claude configuration folder ${store.cwd} does not exist, so Node.js could not be started there for native file account storage. Start Claude Code once so it creates that folder (or check CLAUDE_CONFIG_DIR), then retry.`
+      }
       return `Native file account storage needs Node.js 22 or later, and no node program could be started from PATH${store.platform === 'win32' ? ` (working folder ${store.cwd})` : ''}. Install Node.js 22 or later, then run account setup again.`
     case 'denied':
       return 'The node program on PATH could not be executed for native file account storage. Check that Node.js 22 or later is installed and executable, then run account setup again.'
@@ -365,39 +530,93 @@ function nodeStartProblem(failure: RunFailure, store: FileStore, operation: stri
   }
 }
 
-function nodeExitProblem(code: number, store: FileStore, operation: string): string {
-  const verb = operation === 'read' ? 'read' : 'write'
+function nodeExitProblem(code: number, store: FileStore, operation: FileOperation): string {
+  const reading = operation === 'read' || operation === 'examine'
+  const target = operation === 'pending' || operation === 'clearpending' ? `the pending copy ${store.pendingPath}` : `the native Claude credential file at ${store.path}`
+  const verb = reading ? 'read' : operation === 'clearpending' ? 'remove' : 'write'
   switch (code) {
+    case FILE_EXIT.noOAuth:
+      return `The native Claude credential file at ${store.path} no longer holds a Claude OAuth login: it was signed out or replaced while the login was renewed.`
     case FILE_EXIT.missing:
-      return 'The native credential file disappeared during renewal. Run account setup again.'
+      return operation === 'pending'
+        ? `Cannot keep the renewed login in ${store.pendingPath}: the login folder does not exist.`
+        : `The native Claude credential file at ${store.path} disappeared while the login was renewed.`
     case FILE_EXIT.link:
       return 'Refused a symbolic link at the native credential file. Run account setup with its own login directory.'
     case FILE_EXIT.invalid:
-      return `Cannot ${verb} the native Claude credential file at ${store.path}: it is unreadable, malformed or not permitted. Check its permissions and run account setup again.`
+      return reading
+        ? `Cannot read the native Claude credential file at ${store.path}: it is unreadable, malformed or not permitted. Check its permissions and run account setup again.`
+        : `Cannot ${verb} ${target}: permission was denied, or the file is unreadable or malformed. Check the permissions of the file and its folder.`
     case FILE_EXIT.busy:
-      return `Another program (for example antivirus or a search indexer) kept the native credential file at ${store.path} open, so it could not be replaced after retrying for 3 seconds.`
+      return `Another program (for example antivirus or a search indexer) kept ${target} open, so it could not be replaced after retrying for 3 seconds.`
     case FILE_EXIT.full:
-      return `Cannot write the native credential file at ${store.path}: no space is left on its disk, or the file system is read-only.`
+      return `Cannot write ${target}: no space is left on its disk, or the file system is read-only.`
     case FILE_EXIT.oldNode:
       return 'Native file account storage requires Node.js 22 or later on PATH; the node program found there is older. Install Node.js 22 or later, then run account setup again.'
     case FILE_EXIT.windowsNode:
       return 'This WSL session found a Windows node.exe through Windows interop. Install Linux Node.js 22 or later inside WSL so node on PATH is the Linux build, then run account setup again.'
     default:
-      return `Cannot ${verb} the native Claude credential file at ${store.path}: Node.js exited with code ${code}. Check its permissions and run account setup again.`
+      return `Cannot ${verb} ${target}: Node.js exited with code ${code}.${reading ? ' Check its permissions and run account setup again.' : ''}`
   }
 }
 
-async function nativeFile(io: Io, store: FileStore, operation: 'read' | 'write' | 'pending', stdin?: string): Promise<Credential | null> {
+async function runFile(io: Io, store: FileStore, operation: FileOperation, stdin?: string): Promise<RunResult> {
   const init = trustedRun(store.cwd, stdin === undefined ? { timeoutMs: 15_000 } : { stdin, timeoutMs: 15_000 })
-  const result = await io.run(['node', '-e', NATIVE_FILE, operation, store.path], init)
-    .catch((error: unknown) => { throw new Error(nodeStartProblem(runFailure(error), store, operation)) })
-  if (operation === 'read' && (result.exitCode === FILE_EXIT.noOAuth || result.exitCode === FILE_EXIT.missing)) return null
-  if (operation === 'write' && result.exitCode === FILE_EXIT.changed) throw new LoginChangedError('The login changed while it was renewed. Retry the account switch to read the newer login.')
-  if (result.exitCode !== 0) throw new Error(nodeExitProblem(result.exitCode, store, operation))
-  if (operation === 'pending') return null
-  if (result.isStdoutTruncated) throw new Error(nodeExitProblem(FILE_EXIT.invalid, store, operation))
+  try {
+    return await io.run(['node', '-e', NATIVE_FILE, operation, store.path], init)
+  } catch (error) {
+    throw new Error(await nodeStartProblem(io, runFailure(error), store, operation))
+  }
+}
+
+/** The program's `read`: the store, or the store with a usable pending grant. Nothing is written. */
+async function fileRead(io: Io, store: FileStore): Promise<Credential | null> {
+  const result = await runFile(io, store, 'read')
+  if (result.exitCode === FILE_EXIT.noOAuth || result.exitCode === FILE_EXIT.missing) return null
+  if (result.exitCode !== 0) throw new Error(nodeExitProblem(result.exitCode, store, 'read'))
+  if (result.isStdoutTruncated) throw new Error(nodeExitProblem(FILE_EXIT.invalid, store, 'read'))
 
   return credential(result.stdout)
+}
+
+type StoreView = { stored: Credential | null; pending: PendingLogin | null }
+
+/**
+ * The program's `examine`: the store and its pending renewal as they are.
+ * Nothing is written. `examine` reports a missing store as null, so its exit
+ * 44 means a program runner that knows only `read` (a host or test fixture of
+ * an earlier version): the store is read with `read`, and no pending renewal
+ * is known; a store write still compares against what the store holds.
+ */
+async function fileInspect(io: Io, store: FileStore): Promise<StoreView> {
+  const result = await runFile(io, store, 'examine')
+  if (result.exitCode === FILE_EXIT.noOAuth) return { stored: null, pending: null }
+  if (result.exitCode === FILE_EXIT.missing) return { stored: await fileRead(io, store), pending: null }
+  if (result.exitCode !== 0) throw new Error(nodeExitProblem(result.exitCode, store, 'examine'))
+  if (result.isStdoutTruncated) throw new Error(nodeExitProblem(FILE_EXIT.invalid, store, 'examine'))
+  let value: { stored?: unknown; pending?: unknown } | null
+  try { value = JSON.parse(result.stdout) as { stored?: unknown; pending?: unknown } | null } catch { throw invalidStore() }
+  if (value === null || typeof value !== 'object') throw invalidStore()
+  const stored = value.stored === null || value.stored === undefined ? null : documentOf(value.stored)
+
+  return { stored, pending: pendingOf(value.pending) }
+}
+
+async function fileWrite(io: Io, store: FileStore, fresh: Credential, expected: string): Promise<Credential> {
+  const result = await runFile(io, store, 'write', JSON.stringify({ expectedRefreshToken: expected, oauth: grantOnly(fresh.claudeAiOauth) }))
+  if (result.exitCode === FILE_EXIT.changed) throw new LoginChangedError('The login changed while it was renewed.')
+  if (result.exitCode === FILE_EXIT.noOAuth || result.exitCode === FILE_EXIT.missing) throw new StoreGoneError(nodeExitProblem(result.exitCode, store, 'write'))
+  if (result.exitCode !== 0) throw new Error(nodeExitProblem(result.exitCode, store, 'write'))
+  if (result.isStdoutTruncated) throw new Error(nodeExitProblem(FILE_EXIT.invalid, store, 'write'))
+  const saved = credential(result.stdout)
+  if (saved === null) throw new StoreGoneError(nodeExitProblem(FILE_EXIT.noOAuth, store, 'write'))
+
+  return saved
+}
+
+async function fileChange(io: Io, store: FileStore, operation: 'pending' | 'clearpending', stdin: string): Promise<void> {
+  const result = await runFile(io, store, operation, stdin)
+  if (result.exitCode !== 0) throw new Error(nodeExitProblem(result.exitCode, store, operation))
 }
 
 /** Remove files by absolute path; only POSIX (darwin) needs this, the Node program removes its own. */
@@ -408,35 +627,38 @@ async function removeFiles(io: Io, cwd: string, files: string[]): Promise<void> 
     .catch((error: unknown) => io.log(`could not remove ${files.join(', ')}: ${message(error)}`))
 }
 
-type Leftover = { path: string; oauth: OAuthGrant | null }
+type PendingFile = { pending: PendingLogin | null; regular: boolean; mtimeMs: number }
 
-/** The darwin pending copy and a leftover temporary copy of it older than five minutes. */
-async function keychainLeftovers(io: Io, store: KeychainStore): Promise<Leftover[]> {
-  if (store.pendingPath === undefined) return []
-  const found: Leftover[] = []
-  for (const [path, stale] of [[store.pendingPath, false], [`${store.pendingPath}.tmp`, true]] as const) {
-    const stat = await io.stat(path).catch(() => null)
-    if (stat === null || stat.isLink || stat.kind !== 'file' || stat.size > 64 * 1024) continue
-    if (stale) {
-      const now = await io.now().catch(() => undefined)
-      if (now === undefined || now - stat.mtimeMs < STALE_COPY_MS) continue
-    }
-    const oauth = await io.read(path).then(text => {
-      try { return grantOf(JSON.parse(text)) } catch { return null }
-    }, () => null)
-    // An unreadable pending copy is kept for inspection; a stale temporary copy is removed either way.
-    if (oauth !== null || stale) found.push({ path, oauth })
-  }
+/** The darwin pending file through Io, never following a symbolic link; null when there is none. */
+async function readPendingFile(io: Io, path: string): Promise<PendingFile | null> {
+  const stat = await io.stat(path).catch(() => null)
+  if (stat === null) return null
+  const regular = stat.kind === 'file' && !stat.isLink
+  if (!regular || stat.size > PENDING_LIMIT) return { pending: null, regular, mtimeMs: stat.mtimeMs }
+  const text = await io.read(path).catch(() => null)
 
-  return found
+  return { pending: text === null ? null : parsePendingLogin(text), regular, mtimeMs: stat.mtimeMs }
 }
 
-/** Store a login in the keychain within the line limit and read it back. */
+/**
+ * The keychain item and the pending file. Reads, the compare before a write
+ * and the read-back after it all address the same item: the account when it
+ * is known, else none.
+ */
+async function keychainView(io: Io, store: KeychainStore): Promise<StoreView> {
+  const text = await readItem(io, store.service, store.account)
+  const stored = text === null ? null : credential(text)
+  if (stored === null || store.pendingPath === undefined) return { stored, pending: null }
+
+  return { stored, pending: (await readPendingFile(io, store.pendingPath))?.pending ?? null }
+}
+
+/** Store a login in the keychain within the line limit and read the same item back. */
 async function writeKeychain(io: Io, store: KeychainStore, document: Credential): Promise<Credential> {
   const { text, dropped } = fitCredential(document, store.service, store.writeAccount)
   if (dropped.length > 0) io.log(`the macOS keychain line limit left ${dropped.join(', ')} out of the stored login "${store.service}"; the OAuth login was kept whole`)
   await writeItem(io, store.service, store.writeAccount, text)
-  const check = await readItem(io, store.service, store.writeAccount)
+  const check = await readItem(io, store.service, store.account)
   const written = check === null ? null : credential(check)
   if (written === null || written.claudeAiOauth.refreshToken !== document.claudeAiOauth.refreshToken || written.claudeAiOauth.accessToken !== document.claudeAiOauth.accessToken) {
     throw new KeychainError(`the keychain item "${store.service}" did not read back as written`)
@@ -445,150 +667,261 @@ async function writeKeychain(io: Io, store: KeychainStore, document: Credential)
   return written
 }
 
-async function readKeychainLogin(io: Io, store: KeychainStore): Promise<Credential | null> {
-  const text = await readItem(io, store.service, store.account)
-  const stored = text === null ? null : credential(text)
-  if (stored === null) return null
-  const found = await keychainLeftovers(io, store).catch(() => [])
-  if (found.length === 0) return stored
-  let best: OAuthGrant | null = null
-  for (const { oauth } of found) {
-    if (oauth && isNewer(oauth, stored.claudeAiOauth) && (best === null || oauth.expiresAt > best.expiresAt)) best = oauth
-  }
-  let result = stored
-  if (best !== null) {
-    const next = merged(stored, best)
-    try {
-      result = await writeKeychain(io, store, next)
-      io.log(`saved the renewed login kept in ${store.pendingPath ?? 'the pending file'} to the keychain`)
-    } catch (error) {
-      io.log(`the renewed login kept in ${store.pendingPath ?? 'the pending file'} is still unsaved: ${message(error)}`)
-      return next
-    }
-  }
-  await removeFiles(io, store.cwd, found.map(each => each.path))
-
-  return result
-}
-
-async function readStored(io: Io, store: Store): Promise<Credential | null> {
-  return store.kind === 'keychain' ? readKeychainLogin(io, store) : nativeFile(io, store, 'read')
+async function viewOf(io: Io, store: Store): Promise<StoreView> {
+  return store.kind === 'file' ? fileInspect(io, store) : keychainView(io, store)
 }
 
 /**
- * Renewals the server granted that are not saved yet, by store: the fresh
- * login and the refresh token the store still holds (spent by that renewal).
+ * Renewals the server granted that are not saved yet, by store: the store's
+ * refresh token when the first of them began, the newest renewed login, and
+ * the spent refresh tokens it descends from.
  */
-const unsaved = new Map<string, { fresh: Credential; spent: string }>()
+const unsaved = new Map<string, PendingLogin & { spent: readonly string[] }>()
 
 /** Forget unsaved renewals; for tests. */
 export function forgetUnsavedLogins(): void {
   unsaved.clear()
 }
 
-function preferUnsaved(key: string, stored: Credential | null): Credential | null {
+/** Rule B over a view and this process's memory; memory that is no longer usable, or older than the pending renewal, is forgotten. */
+function choose(key: string, view: StoreView): LoginState {
   const entry = unsaved.get(key)
-  if (!entry || stored === null) return stored
-  const held = stored.claudeAiOauth.refreshToken
-  if (held === entry.fresh.claudeAiOauth.refreshToken) { unsaved.delete(key); return stored }
-  // The store still holds the refresh token the renewal spent: only the fresh login works.
-  if (held === entry.spent) return entry.fresh
-  // Another writer saved a different grant since; it wins.
-  unsaved.delete(key)
-  return stored
+  const picked = bestLogin(view.stored, view.pending, entry)
+  if (entry && view.stored !== null && picked.source !== 'memory') unsaved.delete(key)
+
+  return {
+    stored: view.stored,
+    pending: view.pending,
+    login: picked.login,
+    source: picked.source,
+    candidate: picked.candidate,
+    onDisk: view.stored?.claudeAiOauth.refreshToken,
+    spent: picked.source === 'memory' && entry ? entry.spent : [],
+  }
 }
 
-/**
- * The login at `location`, adopting a renewal written ahead of the store, and
- * preferring a renewal this process could not save over a store that still
- * holds the refresh token that renewal spent.
- */
-export async function readLogin(io: Io, location: LoginLocation): Promise<Credential | null> {
-  const store = await storeOf(io, location)
-  let stored: Credential | null
+/** The state of `store`; when it cannot be read, a renewal kept in memory answers (with its base as the store's token). */
+async function stateOf(io: Io, store: Store): Promise<LoginState> {
+  let view: StoreView
   try {
-    stored = await readStored(io, store)
+    view = await viewOf(io, store)
   } catch (error) {
     const entry = unsaved.get(store.key)
     if (!entry) throw error
     io.log(`the credential store is unreadable (${message(error)}); using the renewed login kept in memory`)
-    return entry.fresh
+    return { stored: null, pending: null, login: entry.credential, source: 'memory', candidate: entry, onDisk: entry.base, spent: entry.spent }
   }
 
-  return preferUnsaved(store.key, stored)
+  return choose(store.key, view)
 }
 
-async function writePending(io: Io, store: Store, fresh: Credential): Promise<string> {
-  const document = JSON.stringify({ claudeAiOauth: { accessToken: fresh.claudeAiOauth.accessToken, refreshToken: fresh.claudeAiOauth.refreshToken, expiresAt: fresh.claudeAiOauth.expiresAt } })
+/**
+ * The login at `location`: the stored one, or a renewal not saved yet that
+ * is usable against it (rule B). A plain read: it never writes or removes
+ * anything, whatever it finds.
+ */
+export async function readLogin(io: Io, location: LoginLocation): Promise<Credential | null> {
+  const store = await storeOf(io, location)
+  if (store.kind === 'file' && !unsaved.has(store.key)) return fileRead(io, store)
+
+  return (await stateOf(io, store)).login
+}
+
+/**
+ * The store, its pending renewal and the login to use, for a renewal under
+ * the renewal lock. It reads only; `onDisk` is what the next store write must
+ * find there.
+ */
+export async function inspectLogin(io: Io, location: LoginLocation): Promise<LoginState> {
+  return stateOf(io, await storeOf(io, location))
+}
+
+async function writePending(io: Io, store: Store, renewal: PendingLogin): Promise<string> {
+  const content = { base: renewal.base, credential: { claudeAiOauth: grantOnly(renewal.credential.claudeAiOauth) } }
   if (store.kind === 'file') {
-    await nativeFile(io, store, 'pending', document)
+    await fileChange(io, store, 'pending', JSON.stringify(content))
     return store.pendingPath
   }
   if (store.pendingPath === undefined) throw new Error('the login has no folder to keep a pending copy in')
-  const ran = await io.run(['/bin/sh', '-c', PENDING_SH, store.pendingPath], trustedRun(store.cwd, { stdin: document, timeoutMs: 15_000 }))
-  if (ran.exitCode !== 0) throw new Error(`the pending copy could not be written (exit ${ran.exitCode})`)
+  const ran = await io.run(['/bin/sh', '-c', PENDING_SH, store.pendingPath], trustedRun(store.cwd, { stdin: JSON.stringify({ version: PENDING_VERSION, ...content }), timeoutMs: 15_000 }))
+  if (ran.exitCode !== 0) throw new Error(`the pending copy ${store.pendingPath} could not be written (sh exit ${ran.exitCode})`)
+
   return store.pendingPath
 }
 
-/** Save `fresh` when the store still holds `expected`; adopt another writer's different grant instead of overwriting it. */
-async function saveToStore(io: Io, store: Store, fresh: Credential, expected: string): Promise<{ saved: Credential; adopted: boolean }> {
-  if (store.kind === 'file') {
-    try {
-      const saved = await nativeFile(io, store, 'write', JSON.stringify({
-        expectedRefreshToken: expected,
-        oauth: {
-          accessToken: fresh.claudeAiOauth.accessToken,
-          refreshToken: fresh.claudeAiOauth.refreshToken,
-          expiresAt: fresh.claudeAiOauth.expiresAt,
-        },
-      }))
-      if (saved === null) throw new Error('The native credential file disappeared during renewal. Run account setup again.')
-      return { saved, adopted: false }
-    } catch (error) {
-      if (!(error instanceof LoginChangedError)) throw error
-      const current = await nativeFile(io, store, 'read')
-      if (current === null) throw new Error('The native credential file disappeared during renewal. Run account setup again.')
-      return { saved: current, adopted: current.claudeAiOauth.refreshToken !== fresh.claudeAiOauth.refreshToken }
+/**
+ * Remove the pending file when its base is `base`, or when it is not a
+ * version 2 file and older than five minutes. Failures are logged: a pending
+ * file left behind is redundant or obsolete by rule B and never used.
+ */
+async function clearPending(io: Io, store: Store, base: string): Promise<void> {
+  try {
+    if (store.kind === 'file') {
+      await fileChange(io, store, 'clearpending', JSON.stringify({ base }))
+      return
     }
+    if (store.pendingPath === undefined) return
+    const found = await readPendingFile(io, store.pendingPath)
+    if (found === null) return
+    const now = await io.now().catch(() => undefined)
+    const stale = found.regular && now !== undefined && now - found.mtimeMs >= STALE_COPY_MS
+    if (found.pending !== null ? found.pending.base === base : stale) await removeFiles(io, store.cwd, [store.pendingPath])
+  } catch (error) {
+    io.log(`could not remove the pending copy of a saved login: ${message(error)}`)
   }
-  // The keychain has no compare-and-swap: read the item again immediately before writing.
+}
+
+/** Save `fresh` when the store still holds `expected` (compare-and-swap); `LoginChangedError` when it holds another login. */
+async function saveToStore(io: Io, store: Store, fresh: Credential, expected: string): Promise<Credential> {
+  if (store.kind === 'file') return fileWrite(io, store, fresh, expected)
+  // The keychain has no compare-and-swap: read the same item again immediately before writing.
   const text = await readItem(io, store.service, store.account)
   const stored = text === null ? null : credential(text)
-  if (stored === null) throw new Error(`The keychain login "${store.service}" disappeared during renewal. Run account setup again.`)
-  if (stored.claudeAiOauth.refreshToken === fresh.claudeAiOauth.refreshToken) return { saved: stored, adopted: false }
-  if (stored.claudeAiOauth.refreshToken !== expected) return { saved: stored, adopted: true }
+  if (stored === null) throw new StoreGoneError(`The keychain login "${store.service}" disappeared while the login was renewed.`)
+  const held = stored.claudeAiOauth.refreshToken
+  if (held !== expected) {
+    if (held === fresh.claudeAiOauth.refreshToken) return stored
+    throw new LoginChangedError('The login changed while it was renewed.')
+  }
 
-  return { saved: await writeKeychain(io, store, merged(stored, fresh.claudeAiOauth)), adopted: false }
+  return writeKeychain(io, store, merged(stored, fresh.claudeAiOauth))
+}
+
+function notSaved(error: unknown, kept: string | undefined): LoginNotSavedError {
+  const where = kept === undefined ? 'in this session\'s memory only' : `in ${kept} (owner-only) and in this session's memory`
+  const text = message(error).replace(/\.?$/, '.')
+  if (error instanceof StoreGoneError) return new LoginNotSavedError(`${text} The renewed login was kept ${where}, but it cannot be used without a stored login: sign this account in again with account setup.`)
+
+  return new LoginNotSavedError(`${text} The renewed login was kept ${where}; it is saved automatically the next time this account is used.`)
+}
+
+/**
+ * The store changed under the lock (an interactive sign-in, or a session
+ * without the lock). When it holds `fresh` it was saved; otherwise the store
+ * is authoritative: its login (with a renewal usable against it) is used,
+ * this process's renewal is forgotten, and a pending file is removed only
+ * when it is obsolete against the new store.
+ */
+async function settleChanged(io: Io, store: Store, fresh: Credential, onDisk: string, kept: string | undefined): Promise<Credential> {
+  let view: StoreView
+  try {
+    view = await viewOf(io, store)
+  } catch (error) {
+    throw notSaved(error, kept)
+  }
+  if (view.stored === null) throw notSaved(new StoreGoneError('The stored login disappeared while it was renewed.'), kept)
+  unsaved.delete(store.key)
+  if (view.stored.claudeAiOauth.refreshToken === fresh.claudeAiOauth.refreshToken) {
+    await clearPending(io, store, onDisk)
+    return view.stored
+  }
+  if (view.pending !== null && pendingState(view.stored, view.pending) === 'obsolete') await clearPending(io, store, view.pending.base)
+  io.log('another session or sign-in saved a different login while this one renewed; kept that login')
+
+  return bestLogin(view.stored, view.pending).login ?? view.stored
+}
+
+/**
+ * Persist a renewal: kept in memory, then written ahead to the owner-only
+ * pending file as `{base: onDisk, credential: fresh}`, then saved to the store
+ * only if it still holds `onDisk`, and the pending file cleared. A failed
+ * store write keeps both and throws `LoginNotSavedError` naming where.
+ */
+async function persist(io: Io, store: Store, fresh: Credential, onDisk: string, spent: readonly string[]): Promise<Credential> {
+  const renewal: PendingLogin = { base: onDisk, credential: fresh }
+  unsaved.set(store.key, { ...renewal, spent })
+  let kept: string | undefined
+  try {
+    kept = await writePending(io, store, renewal)
+  } catch (error) {
+    io.log(`could not keep the renewed login in a pending file: ${message(error)}`)
+  }
+  let saved: Credential
+  try {
+    saved = await saveToStore(io, store, fresh, onDisk)
+  } catch (error) {
+    if (error instanceof LoginChangedError) return settleChanged(io, store, fresh, onDisk, kept)
+    throw notSaved(error, kept)
+  }
+  unsaved.delete(store.key)
+  await clearPending(io, store, onDisk)
+
+  return saved
+}
+
+/** The spent tokens a renewal of `renewed` into `fresh` descends from. */
+function descent(spent: readonly string[], renewed: string, fresh: Credential): string[] {
+  const all = renewed === fresh.claudeAiOauth.refreshToken || spent.includes(renewed) ? [...spent] : [...spent, renewed]
+  return all.slice(-SPENT_KEPT)
+}
+
+/**
+ * Persist a rotated grant renewed from `from.login` (read with
+ * `inspectLogin`), comparing the store against `from.onDisk`. The server
+ * already spent the previous refresh token, so the renewal is kept in memory
+ * and written ahead to the pending file before the store write; a failed
+ * store write throws `LoginNotSavedError`, and the renewal stays usable.
+ */
+export async function saveRenewal(io: Io, location: LoginLocation, fresh: Credential, from: LoginState): Promise<Credential> {
+  const store = await storeOf(io, location)
+  const renewed = from.login?.claudeAiOauth.refreshToken
+  const onDisk = from.onDisk ?? renewed
+  if (renewed === undefined || onDisk === undefined) throw new Error('There is no stored login to save this renewal over. Run account setup again.')
+
+  return persist(io, store, fresh, onDisk, descent(from.spent, renewed, fresh))
 }
 
 /**
  * Persist a rotated grant without replacing unrelated native credential
- * fields. The server already spent the previous refresh token, so the fresh
- * login is kept in memory and written ahead to an owner-only pending file
- * before the store write; a failed store write throws `LoginNotSavedError`
- * naming where it was kept, and the next read saves it.
+ * fields; `previous` is the login that was renewed. The store write compares
+ * against the refresh token the store held when `previous`'s lineage began.
  */
 export async function writeLogin(io: Io, location: LoginLocation, fresh: Credential, previous: Credential): Promise<Credential> {
   const store = await storeOf(io, location)
-  const earlier = unsaved.get(store.key)
-  // Renewing an unsaved login: the store still holds the token spent before it.
-  const expected = earlier && earlier.fresh.claudeAiOauth.refreshToken === previous.claudeAiOauth.refreshToken ? earlier.spent : previous.claudeAiOauth.refreshToken
-  unsaved.set(store.key, { fresh, spent: expected })
-  let kept: string | undefined
+  const renewed = previous.claudeAiOauth.refreshToken
+  const entry = unsaved.get(store.key)
+  const remembered = entry?.credential.claudeAiOauth.refreshToken === renewed ? entry : undefined
+  let onDisk = remembered?.base ?? renewed
+  let spent: readonly string[] = remembered?.spent ?? []
   try {
-    kept = await writePending(io, store, fresh)
-  } catch (error) {
-    io.log(`could not keep the renewed login in a pending file: ${message(error)}`)
+    const state = await stateOf(io, store)
+    if (state.stored?.claudeAiOauth.refreshToken === renewed) {
+      onDisk = renewed
+      spent = []
+    } else if (state.candidate !== null && state.login?.claudeAiOauth.refreshToken === renewed && state.onDisk !== undefined) {
+      onDisk = state.onDisk
+      spent = state.spent
+    }
+  } catch {
+    // Unreadable now: the store write below reports it, and the renewal is still kept.
   }
+
+  return persist(io, store, fresh, onDisk, descent(spent, renewed, fresh))
+}
+
+/**
+ * Save a usable renewal that `state` found unsaved (opportunistically, under
+ * the renewal lock). Resolves the login to use: the saved one, the store's
+ * when it changed meanwhile, or the renewal itself when the store still
+ * refuses it (logged only: the renewal works).
+ */
+export async function promoteLogin(io: Io, location: LoginLocation, state: LoginState): Promise<Credential | null> {
+  if (state.source === 'store' || state.login === null || state.stored === null) return state.login
+  const store = await storeOf(io, location)
+  const login = state.login
+  const onDisk = state.stored.claudeAiOauth.refreshToken
   try {
-    const { saved, adopted } = await saveToStore(io, store, fresh, expected)
+    const saved = await saveToStore(io, store, login, onDisk)
     unsaved.delete(store.key)
-    if (adopted) io.log('another session saved a different login while this one renewed; kept that login')
-    if (store.kind === 'keychain' && kept !== undefined) await removeFiles(io, store.cwd, [kept])
+    await clearPending(io, store, onDisk)
+    io.log('saved a renewed login that had been kept unsaved')
     return saved
   } catch (error) {
-    const where = kept === undefined ? 'in this session\'s memory only' : `in ${kept} (owner-only) and in this session's memory`
-    throw new LoginNotSavedError(`${message(error).replace(/\.?$/, '.')} The renewed login was kept ${where}; it is saved automatically the next time this account is used.`)
+    if (error instanceof LoginChangedError) {
+      try { return await settleChanged(io, store, login, onDisk, undefined) } catch { return login }
+    }
+    io.log(`a renewed login is still unsaved and is used as it is: ${message(error)}`)
+    return login
   }
 }
 
@@ -600,35 +933,14 @@ export async function hasUnsavedLogin(io: Io, location: LoginLocation): Promise<
 
 /**
  * Try again to save a renewal this process holds for `location`. Resolves the
- * login to use: the saved one, another writer's newer one, or the unsaved
- * fresh one when the store still refuses (logged, not thrown: the fresh login
- * works). Null when there is none, or the store no longer has a login.
+ * login to use, as `promoteLogin` does; null when there is none.
  */
 export async function saveUnsavedLogin(io: Io, location: LoginLocation): Promise<Credential | null> {
   const store = await storeOf(io, location)
-  const entry = unsaved.get(store.key)
-  if (!entry) return null
-  let stored: Credential | null
-  try {
-    stored = await readStored(io, store)
-  } catch (error) {
-    io.log(`the renewed login is still unsaved: ${message(error)}`)
-    return entry.fresh
-  }
-  if (stored === null) return null
-  if (stored.claudeAiOauth.refreshToken !== entry.spent) {
-    unsaved.delete(store.key)
-    return stored
-  }
-  try {
-    const { saved } = await saveToStore(io, store, entry.fresh, entry.spent)
-    unsaved.delete(store.key)
-    if (store.kind === 'keychain' && store.pendingPath !== undefined) await removeFiles(io, store.cwd, [store.pendingPath])
-    return saved
-  } catch (error) {
-    io.log(`the renewed login is still unsaved: ${message(error)}`)
-    return entry.fresh
-  }
+  if (!unsaved.has(store.key)) return null
+  const state = await stateOf(io, store)
+
+  return promoteLogin(io, location, state)
 }
 
 /** Placeholder growth for a token whose renewed length is not known yet. */

@@ -3,13 +3,14 @@
 // Anywhere else it prints "skipped" and exits 0 before touching any keychain.
 // On the runner it creates a temporary keychain, makes it the default and first
 // in the user search list, proves the round trip with synthetic fixture
-// credentials (a near-limit login, a reduced login and a refused over-limit
-// login), and always restores the default keychain and search list and deletes
-// the temporary keychain. No real credential is read or printed.
+// credentials (a near-limit login, a reduced login, a refused over-limit
+// login kept in a version 2 pending file, and a read that uses that file
+// without writing), and always restores the default keychain and search list
+// and deletes the temporary keychain. No real credential is read or printed.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, promises as fsp, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, promises as fsp, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { register } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -134,7 +135,8 @@ try {
   assert.deepEqual(reduced, reducedItem)
   emit({ phase: 'reduced-login', dropped: ['nearLimit'], oauthKeptWhole: true })
 
-  // 4. An OAuth login too large on its own is refused: the item is unchanged and the renewal is kept in an owner-only pending file.
+  // 4. An OAuth login too large on its own is refused: the item is unchanged and the renewal is kept in an
+  //    owner-only version 2 pending file whose base is the refresh token the item still holds.
   const before = await readItem(io, service, account)
   const huge = rotate(reducedItem, 'huge', 3000)
   let refusal = ''
@@ -143,10 +145,22 @@ try {
   assert.match(refusal, /kept in .*\.rice-pending/)
   assert.equal(await readItem(io, service, account), before, 'a refused write leaves the keychain item exactly as it was')
   assert.equal(statSync(pending).mode & 0o777, 0o600)
-  assert.equal(JSON.parse(readFileSync(pending, 'utf8')).claudeAiOauth.refreshToken, huge.claudeAiOauth.refreshToken)
+  const kept = JSON.parse(readFileSync(pending, 'utf8'))
+  assert.equal(kept.version, 2)
+  assert.equal(kept.base, reducedItem.claudeAiOauth.refreshToken)
+  assert.equal(kept.credential.claudeAiOauth.refreshToken, huge.claudeAiOauth.refreshToken)
+  const leftovers = readdirSync(loginDir).filter(name => name.startsWith('.credentials.json.rice-pending.tmp'))
+  assert.deepEqual(leftovers, [], 'the pending writer leaves no temporary copy')
+  emit({ phase: 'refused-over-limit', itemUnchanged: true, pendingOwnerOnly: true, pendingVersion: 2 })
+
+  // 5. A plain read in a new process uses the pending renewal (its base is what the item holds) and writes nothing.
   forgetUnsavedLogins()
+  const pendingBefore = readFileSync(pending, 'utf8')
+  assert.equal((await readLogin(io, location)).claudeAiOauth.refreshToken, huge.claudeAiOauth.refreshToken)
+  assert.equal(await readItem(io, service, account), before, 'a read never writes the keychain item')
+  assert.equal(readFileSync(pending, 'utf8'), pendingBefore, 'a read never rewrites or removes the pending file')
   rmSync(pending)
-  emit({ phase: 'refused-over-limit', itemUnchanged: true, pendingOwnerOnly: true })
+  emit({ phase: 'read-without-writes', itemUnchanged: true, pendingKept: true })
 
   assert.equal(security('delete-generic-password', '-s', service, '-a', account, keychain).status, 0)
   emit({ macosKeychainProof: 'pass' })

@@ -72,8 +72,11 @@ export function keychainAccountName(user: string | undefined): string {
  * The keychain account as Claude Code computes it: USER when set, else the
  * login name (`id -un`, what `os.userInfo().username` reads), each passed
  * through `keychainAccountName`. Undefined when the login name cannot be
- * found; reads then omit `-a` and writes use `claude-code-user`, Claude Code's
- * own fallback when `os.userInfo()` throws.
+ * found; every read of the item (a plain read, the compare before a write and
+ * the read-back after it) then omits `-a`, so they all address one item, and
+ * writes use `claude-code-user`, Claude Code's own fallback when
+ * `os.userInfo()` throws. A write that lands on another item fails its
+ * read-back instead of being taken as saved.
  */
 export async function resolveKeychainAccount(io: Io, user: string | undefined): Promise<string | undefined> {
   if (user) return keychainAccountName(user)
