@@ -664,9 +664,21 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   if (local.committedSelection !== sequence) return 'A newer account choice superseded this selection. The newer account was kept.'
   const reported = local.accountReport?.name === name && local.accountReport.email !== 'Unknown' ? local.accountReport.email : undefined
   const email = reported ?? await loginEmail(machineIo($), account.loginDir).catch(() => undefined)
+  const gateway = await foreignGateway($)
+  const notice = gateway ? ` This session sends its requests to ${gateway}, not api.anthropic.com, so that host receives the account's token.` : ''
   return name === LOGIN_NAME
     ? `This session is back on this machine's /login. Other sessions were not touched.`
-    : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
+    : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.${notice}`
+}
+
+/** The host this session sends requests to when it is not Anthropic's own API (a gateway), else undefined. */
+async function foreignGateway($: EngineInterface): Promise<string | undefined> {
+  const base = await $.env.get('ANTHROPIC_BASE_URL')
+  if (!base) return undefined
+  try {
+    const host = new URL(base).host
+    return host && host !== 'api.anthropic.com' ? host : undefined
+  } catch { return 'an address Claude could not parse' }
 }
 
 /**

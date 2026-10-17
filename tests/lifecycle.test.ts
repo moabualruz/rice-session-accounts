@@ -375,3 +375,20 @@ test('usage after a turn: main loop only, at most once a minute, never while non
   expect(shown).toContain('usage not refreshed (HTTP 500)')
   expect((await probe($, 'usage')).value).toEqual(B_LIMITS)
 })
+
+test('a switch says when the session talks to a gateway, naming only its host', async ($, on) => {
+  const world = fixture(on)
+  world.environment.set('ANTHROPIC_BASE_URL', 'https://user:secret@gateway.example.test:8443/v1')
+  await $.session.start(START)
+  const text = (await $.command.run(command('account-b'))).text ?? ''
+  expect(text).toContain('gateway.example.test:8443')
+  expect(text).toContain('receives the account')
+  expect(text).not.toContain('secret')
+  expect(text).not.toContain('user:')
+})
+
+test('a switch on the default endpoint adds no gateway notice', async ($, on) => {
+  fixture(on)
+  await $.session.start(START)
+  expect((await $.command.run(command('account-b'))).text ?? '').not.toContain('receives the account')
+})

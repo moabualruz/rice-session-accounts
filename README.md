@@ -1,316 +1,226 @@
-# rice-session-accounts
+# Rice Accounts
 
-Manage saved Anthropic OAuth accounts in Claude Code.
-`/rice-account` opens an account picker showing each saved name, email and plan.
+Rice Accounts lets you switch between saved Anthropic (Claude.ai) OAuth accounts
+**inside one Claude Code session**. Run `/rice-account`, pick an account by name,
+email and plan, and that session (its subagents, compaction and any `claude -p`
+it starts) uses it from the next request. Other sessions keep their own account,
+and your machine login is never changed.
 
-**0.4.1:** this version switches accounts through the public
-plugin API inside ordinary, unmodified `claude`. It sets authentication only in
-the invoking process, replaces `/usage` and interactive `/status` with selected-account reports, and
-shows the selected name, email, plan and usage in the plugin's status entry.
-0.4.1 fixes token renewal on native Windows, keeps `/usage` and `/status`
-on the selected account when its report fails, and refuses to overwrite an
-`accounts.json` that does not parse. The earlier **0.3.0** release contains the
-withdrawn native-bridge guard.
-No replacement launcher, preload, gateway
-or proxy is part of this flow.
+It is a plugin ("mod") for ordinary, unmodified `claude`. It installs no
+launcher, alias, preload, proxy or gateway. "Rice" is just the name of the
+marketplace it ships in ([rice-mods](https://github.com/moabualruz/rice-mods)).
+Model and provider setup (Codex, OpenRouter, local models) belongs to
+[rice-multi-models](https://github.com/moabualruz/rice-multi-models).
 
-The ordinary-Claude native SDK proof is qualified against Claude Code
-**2.1.301**. The 2.1.296, 2.1.299 and 2.1.302 cohorts check plugin and storage
-compatibility, rather than the complete current account-switching proof.
-Native panels outside the replaced `/usage` and `/status` commands can still display cached
-machine-account metadata. The plugin does not claim to rewrite those internal
-panels or the native credential cache.
+## Requirements
 
-The supported account kinds are the built-in `login`, separate `claudeai`
-browser sign-ins, and `claudeai-token` setup tokens. Model and provider
-configuration belongs to [rice-multi-models](https://github.com/moabualruz/rice-multi-models).
+- Claude Code 2.1.296 or newer. Tested with 2.1.296, 2.1.299, 2.1.301 and
+  2.1.302; the real-binary account-switching proofs run on 2.1.301 and 2.1.302.
+- Node.js 22 or newer on the `PATH` of the environment where Claude runs, and in
+  the terminal where you run the setup helper. WSL needs its own Linux Node.js.
+- `claude` available in that terminal for setup (set `RICE_ACCOUNTS_CLAUDE` to an
+  absolute path if it is not on `PATH`).
+- A Claude plan for each account you add (Pro, Max, Team or Enterprise).
+- macOS, Linux, WSL or native Windows.
 
-The plugin is named **rice-session-accounts**. Its command is **`/rice-account`**.
-Account setup and credential storage support macOS, Linux (including WSL), and
-native Windows. Install Node.js 22 or newer and make
-`node` available in the environment where Claude runs. The setup helper and
-credential-file backend use it.
-
-See the [0.4.0 verification details](docs/verification/0.4.0.md).
-The [0.3.0 verification details](docs/verification/0.3.0.md) are historical.
-Current acceptance uses the public-API production proof described under
-[Development checks](#development-checks).
-
-## Install
-
-Run this command in your terminal:
+## Install, update, remove
 
 ```sh
 claude plugin install rice-session-accounts --marketplace moabualruz/rice-mods
 ```
 
-This adds the Rice marketplace if necessary and installs the plugin. Start a new
-Claude Code session and approve its requested capabilities when prompted.
+Start a new Claude Code session and approve the capabilities it asks for.
+Installing does not sign you into anything.
 
-Use the machine's ordinary `claude` command. To inspect saved accounts, enter:
-
-```text
-/rice-account
-```
-
-You should see the built-in `login` account and any saved accounts. Select a row
-to use that account for this session, or press Escape to close the picker.
-Installing the plugin does not sign you into another account.
-
-The picker shows the selected account, its cached email and its subscription
-tier, such as Pro, Max (5x), Team or Enterprise. Opening the picker reads local
-metadata without making an Anthropic request. `Unknown` means the metadata is
-unavailable. `Not signed in` means no saved native login was found. Run
-`/rice-account check <name>` to verify a credential with Anthropic. Accounts
-added with a setup token may not have local email or plan metadata.
-
-In a headless session, `/rice-account` returns a text list. Use
-`/rice-account list` whenever you want the text version explicitly.
-
-If you already have the plugin, update it instead:
+Update (then `/reload-plugins` or restart Claude Code):
 
 ```sh
 claude plugin marketplace update rice-mods
 claude plugin update rice-session-accounts@rice-mods
 ```
 
-Restart ordinary Claude Code after an update. No alternate command or startup
-integration is needed.
+Remove: `claude plugin uninstall rice-session-accounts@rice-mods`. This leaves your
+saved accounts in place; see [Uninstall and cleanup](#uninstall-and-cleanup).
 
-## Add your personal Claude account
+## First use
 
-1. In Claude Code, save the account name:
+```text
+/rice-account
+```
+
+shows the built-in `login` account (this machine's normal Claude login) and every
+saved account, each with its cached email and plan. Pick one with the arrow keys
+and Enter; Escape closes the list. Without a graphical surface the same list is
+printed as text. `Unknown` means no local metadata was found, `Not signed in`
+means no login exists yet. Opening the list makes no network request; run
+`/rice-account check <name>` to verify a login with Anthropic.
+
+### Add another account
+
+1. In Claude Code:
 
    ```text
-   /rice-account add personal-live
+   /rice-account add personal
    ```
 
-   The omitted kind defaults to `claudeai`, a separate claude.ai sign-in. The
-   command prints one terminal command with this installation's exact paths.
+   This saves the name (kind `claudeai`, a separate claude.ai sign-in) and prints
+   one terminal command containing this installation's exact paths.
 
-2. Copy that generated command into a terminal on the same machine. For WSL,
-   use a terminal inside the same WSL distribution. When different browsers
-   hold different accounts, append `--manual --email you@example.com`, replacing
-   the email with the account you want. The helper prints a sign-in URL without
-   opening the default browser. Open it in the browser already signed into the
-   intended account, authorize, then paste the returned code into the terminal.
-   The helper verifies the resulting native account email before declaring it
-   ready. `--email` alone is a login hint; it cannot select an account already
-   signed into another browser.
-   If the saved account is already signed in, the helper checks its local login
-   status and skips the browser login. The check in the next step contacts
-   Anthropic.
+2. Paste that command into a terminal on the same machine (inside the same WSL
+   distribution for WSL). The helper checks prerequisites, opens the browser
+   login and verifies the account. Useful flags, appended to the command:
 
-3. When setup succeeds, return to Claude Code:
+   | Flag | Use |
+   | --- | --- |
+   | `--manual --email you@example.com` | Print a sign-in URL instead of opening the default browser, so you can open it in the browser that holds the right account. |
+   | `--browser <executable>` | Have Claude open a specific browser (not combinable with `--manual`). |
+   | `--login` | Sign in again even if a valid login is found. |
+
+3. Back in Claude Code, check it and switch:
 
    ```text
-   /rice-account check personal-live
+   /rice-account check personal
+   /rice-account personal
    ```
 
-   The check reports the signed-in account. Then select it in `/rice-account`
-   or enter `/rice-account personal-live`. Its next request uses that account.
-   `/usage` reports the selected account's current usage when its grant permits
-   the usage endpoint. In an interactive terminal, `/status` shows the selected
-   email and plan, plus Claude's version, current model and working directory.
+If setup stops halfway, `/rice-account setup personal` prints the command again.
 
-Browser sign-in is the only interactive part of a normal `claudeai` setup. The
-helper chooses the credential backend for your operating system. You do not need
-to construct `CLAUDE_CONFIG_DIR` paths or run macOS keychain commands yourself.
-
-If you stopped partway through, resume without removing the saved account:
+For a long-lived setup token instead of a browser login:
 
 ```text
-/rice-account setup personal-live
+/rice-account add ci-token claudeai-token
 ```
 
-This prints the terminal setup command again. Repeating
-`/rice-account add personal-live` also resumes setup for the saved account. To
-sign in again even when the helper finds a valid login, append `--login` to the
-generated terminal command.
+The helper runs `claude setup-token` and asks you to paste the token into a hidden
+prompt in the terminal. Never type a token into Claude Code itself.
 
-To have native Claude open a specific browser instead, append
-`--browser <browser-executable>` to the generated command. Quote paths with
-spaces. Use the browser's executable, not a shell command with arguments.
-`--manual` and `--browser` are mutually exclusive and affect this helper's child
-process only; neither changes the machine's default browser.
+### Account names
 
-## Account kinds
+1 to 40 characters from `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
+Names must be unique ignoring case, must not end with a dot, must not be a
+Windows device name (`con`, `nul`, `com1`, ...), and must not be a command word
+(`list`, `use`, `setup`, ...) or an object key such as `toString`. An account that
+already had a now-reserved name keeps working: reach it with
+`/rice-account use <name>`.
 
-For another browser sign-in, use the `claudeai` flow above. To use a setup token,
-add a `claudeai-token` account and run the terminal command it prints:
-
-```text
-/rice-account add personal-token claudeai-token
-```
-
-The helper runs `claude setup-token`, then asks you to copy the generated token
-into a hidden prompt. Enter the token in that terminal prompt.
-
-| Kind | Example in Claude Code | Terminal setup |
-| --- | --- | --- |
-| `login` | `/rice-account login` | Built in. Restore the credentials this session started with. |
-| `claudeai` | `/rice-account add personal-live` | A separate claude.ai browser sign-in. The mod renews its expiring login. |
-| `claudeai-token` | `/rice-account add personal-token claudeai-token` | Generate a setup token and store it through the helper's hidden prompt. |
-
-Account names may contain letters, digits, dots, underscores and hyphens, up to
-40 characters. Start the name with a letter or digit. `login` is reserved for
-the built-in account that restores this process's starting credentials.
-
-The full add syntax is:
-
-```text
-/rice-account add <name> [kind] [key=value ...]
-```
-
-Use `label=` for an account label. A `claudeai-token` account also accepts
-`service=` to choose its OS keyring service name. Enter actual setup tokens only
-at the terminal helper's hidden prompt.
-For an existing account, use `/rice-account setup <name>` to repeat its setup.
-Use another name when adding an account with a different kind or configuration.
-
-## Daily commands
+## Commands
 
 | Command | Result |
 | --- | --- |
-| `/rice-account` | Open the account picker with saved names, emails, plans and this session's selection. Return a text list when a picker cannot be displayed. |
-| `/rice-account list` | Show the text list of saved accounts and their cached identity metadata. |
-| `/rice-account <name>` | Use a saved OAuth account for this session's next request and future descendants. |
-| `/rice-account login` | Restore the credential environment this session started with. |
-| `/rice-account check [name]` | Check the named sign-in or setup token, or the current account when omitted. Saved OAuth tokens use Anthropic's profile endpoint when their permissions allow it. |
-| `/rice-account usage` | Query the selected account's five-hour and weekly usage windows when permitted. |
-| `/usage` | After an account selection, show the selected account's fresh usage through the normal command. |
-| `/rice-account setup <name>` | Print the terminal command to complete or repeat an account's setup. |
-| `/rice-account remove <name>` | Remove a saved account's configuration. The command explains any remaining credential cleanup. |
+| `/rice-account` | Open the account list (text list where no list can be shown). |
+| `/rice-account <name>`, `/rice-account use <name>` | Switch this session. `login` is the machine login. `use` also reaches an account named like a command. |
+| `/rice-account list` | Text list of saved accounts with email and plan. |
+| `/rice-account usage` | The session account's usage limits. |
+| `/rice-account check [name]` | Verify a login with Anthropic (default: the session account). |
+| `/rice-account add <name> [kind] [label=...] [service=...]` | Save an account and print its setup command. Kinds: `claudeai` (default), `claudeai-token`. |
+| `/rice-account setup <name>` | Print a saved account's setup command again. |
+| `/rice-account remove <name>` | Remove it from `accounts.json`. Its login is kept; sessions already using it keep it until they switch. |
+| `/rice-account default`, `set-default <name>` | Switch to, or change, the saved default. New sessions still start on the machine login. |
+| `/rice-account setup-native` | Withdrawn. Prints how to delete 0.3.0 launcher files by hand. |
+| `/rice-account help` | Every subcommand. |
 
-Independent sessions started with ordinary `claude` keep their normal machine
-login. `/rice-account login` restores this process's starting credential
-environment; it remains available for recovery in an existing session.
+`/usage` and interactive `/status` report the session account once you have
+selected one. The status entry shows its name, email, plan and usage windows.
 
-The selected account applies to an existing subagent's next request, new
-subagents, and `claude -p` children started through the supported process APIs.
-Other running sessions and fresh independent sessions keep their normal login.
-Returning to `login` restores this process's original credential environment.
-Normal tool permissions still apply to child commands.
+## What the selected account does
 
-The original machine credential source remains available to Claude's own
-renewal flow. Returning to `login` uses that source's current grant, including a
-normal renewal made while another account was selected. The plugin renews the
-additional browser accounts in their separate native stores.
+- **Requests.** The session's model requests use the account's bearer token. It
+  is carried in `ANTHROPIC_CUSTOM_HEADERS`, the supported request-header
+  override, set only in the running Claude process.
+- **Children.** Anything the session starts (Bash commands, hooks, MCP servers,
+  `claude -p`) inherits that variable like any other `ANTHROPIC_*` setting, so a
+  `claude` started from Bash uses the selected account. **Any process in the
+  session can therefore read the token.** There is no separate relay variable and
+  no file.
+- **Commands run exactly as you typed them.** Rice Accounts does not rewrite Bash
+  commands or child environments, so your permission rules match as usual.
+- **Other plugins.** A plugin that asks for the session's authorization gets an
+  opaque handle, usable only for `https://api.anthropic.com` and only by that same
+  plugin, never while nonessential network traffic is disabled.
+- **Gateways.** If the session was started with a custom `ANTHROPIC_BASE_URL`,
+  requests (and the account's token) go to that host; switching tells you so.
+- **Not confirmed means locked.** If a switch cannot be verified or undone, the
+  status line shows "account not confirmed" and model requests, compaction,
+  subagents, web tools and child `claude` runs are refused until you run
+  `/rice-account login` or select an account again. The lockout survives a plugin
+  reload and `/clear`.
+- **Renewals.** Expiring browser logins are renewed automatically in the
+  background (and before a turn that starts after expiry), with backoff after a
+  failure. A running session keeps working if you remove its account elsewhere.
+- **A new session** always starts on your machine login; select an account
+  explicitly in each session.
 
-Selected-account reporting comes from that account's OAuth usage endpoint.
-When the lookup is unavailable, the plugin says so and exposes no stale account
-windows. Delayed responses for the old account cannot overwrite the plugin's
-selected-account report. Cooperating plugins' public authorization handles
-follow this session's current account when their next request starts. Handles
-observed before selection are updated too; unknown native handles remain with
-Claude. A request already dispatched for A keeps A. Native panels that read internal cached metadata
-directly remain a separate limitation, as described above.
+Native panels that read Claude's internal cached identity directly (outside
+`/usage`, interactive `/status` and the status entry) can still show the machine
+account.
 
-## Credentials on each operating system
+## Credentials on each system
 
-- A `claudeai` account uses Claude Code's own isolated login folder. On Linux,
-  WSL and native Windows, Claude stores that login in the folder's native
-  `.credentials.json` file. On macOS, Claude uses the keychain item associated
-  with that folder. Rice preserves the native file's permissions on refresh;
-  Windows files use a private owner-only ACL and reject reparse points.
-- Setup tokens entered into this plugin's helper use the macOS Keychain
-  or Linux Secret Service through `secret-tool`. On native Windows, they use
-  Windows Credential Manager. The plugin does not create a separate plaintext
-  token store.
-- Linux `claudeai` browser login does not require `secret-tool`. Setup-token
-  accounts do require `secret-tool`, a running Secret Service implementation and
-  access to an unlocked collection in the same user session. Installing the
-  executable alone does not provide a working keyring.
-- Native Windows setup prints a command quoted for PowerShell. Browser login
-  uses the ordinary native credential file. An explicitly requested optional
-  `FORCE_WINDOWS_CREDMAN` browser store is refused with instructions rather than
-  silently reading another store; this restriction does not affect setup-token
-  accounts, which use the plugin's own Credential Manager entries.
+| System | Where a `claudeai` login lives |
+| --- | --- |
+| macOS | Login keychain item `Claude Code-credentials-<8 hex of the login folder>`, account `$USER` (or `claude-code-user`). |
+| Linux, WSL, Windows | `<config>/rice-session-accounts/logins/<name>/.credentials.json`, owner-only (0600; owner-only ACL on Windows). |
+| Setup tokens | macOS Keychain, Linux Secret Service (`secret-tool`, needs a running keyring) or Windows Credential Manager. |
 
-If a Linux setup-token account reports that `secret-tool` is missing, install the
-package that provides it for your distribution. Debian and Ubuntu use
-`libsecret-tools`:
+`<config>` is `~/.claude`, or `CLAUDE_CONFIG_DIR` when set. The isolated login
+folders hold only the extra logins; your settings, plugins, skills, hooks and MCP
+servers are untouched.
 
-```sh
-sudo apt-get install libsecret-tools
-```
+**A renewed login is never lost.** The server rotates the refresh token on every
+renewal, so the new login is first written to a private `.credentials.json.rice-pending`
+file (and kept in memory), then saved; if saving fails (antivirus holding the
+file, full disk, locked keychain) it is kept and saved on the next use. On macOS
+a login too large for the keychain's line limit is stored without optional keys
+such as `mcpOAuth`; it is never truncated.
 
-In a headless WSL environment, use the `claudeai` browser login, or configure a
-working user D-Bus and Secret Service before adding setup-token accounts. The
-helper reports missing prerequisites before prompting for a token.
+On WSL a config folder under `/mnt/c/...` cannot be made private (Windows drives
+ignore Unix modes); setup warns and recommends a Linux-side folder.
+
+## Network and privacy
+
+Rice Accounts contacts only Anthropic: `https://api.anthropic.com` (usage and
+profile lookups) and `https://platform.claude.com` (token renewal). It sends no
+analytics. Secrets never appear in command lines, logs or toasts, and the helper
+reads tokens only from hidden prompts or stdin.
 
 ## Troubleshooting
 
 | Symptom | What to do |
 | --- | --- |
-| `/rice-account` is unknown | Confirm `rice-session-accounts@rice-mods` is installed and enabled, then restart Claude Code. |
-| `/rice-account add personal-live` asks for a kind, or repeating it says to remove the account first | The session has an older plugin version. Update the plugin and restart Claude Code, then run `/rice-account setup personal-live`. Keep the saved account. |
-| `/usr/bin/security` fails with `ENOENT` on WSL or Linux | The session has the macOS-only credential code from an older version. Update and restart, then repeat setup or check. Linux uses its native credential file or Secret Service. |
-| The account is saved but not signed in | Run `/rice-account setup <name>`, execute its generated command in a terminal on that machine, then check the account. |
-| Browser login used the wrong account, or a login can no longer renew | Run `/rice-account setup <name>` again. Append `--login --manual --email intended@example.com` to its command. This prevents a different default browser from completing login before your intended browser. |
-| A copied setup command no longer exists after a plugin update | Run `/rice-account setup <name>` again to get the current installed path. |
-| `node` is missing or too old | Install Node.js 22 or newer on the machine running the helper, then rerun its command. WSL needs its own Linux Node installation. |
-| A switch says the native account cache bridge is required | You still have 0.3.0 or its loaded hooks. Update to 0.4.0 and restart ordinary Claude. Do not follow historical launcher instructions. |
-| A native account panel shows the machine account after switching | Use the selected-account status entry, `/usage` or interactive `/status`. The plugin does not rewrite every native panel's internal cached identity. |
-| `/status` says it is unavailable in a print session | Claude rejects that command before plugin dispatch in print mode. Use `/usage` there; `/status` is supported in an interactive terminal. |
-| A failed switch says its rollback could not restore the session | Requests are blocked while the account is unconfirmed. Run `/rice-account login` or select an account again; only a verified complete switch restores dispatch. |
-| An older provider account is missing from the picker | This mod's account scope is Anthropic OAuth only. Legacy provider entries are retained in configuration but cannot be selected here. Configure providers in rice-multi-models. |
+| `/rice-account` is unknown | Confirm the plugin is installed and enabled, then restart Claude Code. |
+| Setup says `claude` or Node is missing | Install Node.js 22+ and make `claude` available in that terminal, or set `RICE_ACCOUNTS_CLAUDE` to its absolute path. On WSL use a Linux Node. |
+| "account not confirmed" | Run `/rice-account login`, or select a saved account again. |
+| The account is saved but not signed in | Run `/rice-account setup <name>` and execute the printed command. |
+| Browser login used the wrong account | Re-run setup with `--login --manual --email intended@example.com` and open the URL in the intended browser. |
+| A copied setup command stopped working after an update | The command embeds the installed plugin path; run `/rice-account setup <name>` again. |
+| A native panel shows the machine account | Use the status entry, `/usage` or interactive `/status`. |
+| `/status` is unavailable in print mode | Claude rejects it before plugins run in print mode; use `/usage`. |
+| A Linux setup-token account says `secret-tool` is missing | `sudo apt-get install libsecret-tools` (Debian/Ubuntu) and a running Secret Service; or use a `claudeai` browser account. |
+| Windows: ConstrainedLanguage or path-length errors | The helper names the cause; use a shorter profile path or a full-language PowerShell. |
 
-## Files and session behavior
+## Uninstall and cleanup
 
-The default config directory is `~/.claude`. When Claude Code starts with
-`CLAUDE_CONFIG_DIR`, paths below are relative to that directory instead.
+`claude plugin uninstall rice-session-accounts@rice-mods` removes the plugin only.
+To remove saved data as well, in `<config>/rice-session-accounts/`: delete
+`accounts.json` and `logins/` (sign each login out first with the command
+`/rice-account remove <name>` prints), and remove any `rice-session-accounts`
+entries from your OS credential manager. If you used 0.3.0, run
+`/rice-account setup-native` for the launcher files to delete by hand.
 
-- `rice-session-accounts/accounts.json` contains account names, kinds and
-  credential references.
-- `rice-session-accounts/logins/<name>/` is each `claudeai` account's isolated
-  native Claude config directory.
-- The `rice-session-accounts` Keychain or Secret Service service stores named
-  setup tokens by account name, unless the account specifies `service=`.
-  Windows Credential Manager uses plugin-owned entries derived from that
-  service and account reference.
+## Files
 
-The isolated folders hold only the additional account logins. Setup and account
-management preserve the machine's shared Claude login and its settings, plugins,
-skills, hooks, MCP servers and project files. Legacy provider entries in
-`accounts.json` are preserved when saving supported accounts. The isolated
-folders select credentials only. They do not replace the machine's settings,
-plugins, skills, hooks, MCP servers or project files.
+- `rice-session-accounts/accounts.json` - account names, kinds and credential references.
+- `rice-session-accounts/logins/<name>/` - each browser account's isolated login folder.
+- `rice-session-accounts/locks/` - renewal locks shared by sessions.
 
-## Development checks
+## Contributing
 
-Run these from the repository root. The terminal helper tests use Node's built-in
-test runner; plugin tests use Claude Code's native mod test runner.
-
-```sh
-npm run check
-```
-
-The full check requires ordinary Claude Code 2.1.301 on PATH. It runs Node tests,
-native plugin tests, strict validation and `scripts/proof-public-auth.mjs`.
-The latter copies the production hooks into an isolated HOME and drives the
-real native SDK against local synthetic HTTP. It checks exhausted A to B,
-an already-running agent's next request, both process APIs starting `claude -p`,
-delayed A responses, the actual user-entered `/usage` command, cached public
-authorization handles across selection and login restoration,
-and a fresh independent session's original account. Machine settings and account
-configuration must remain unchanged. Both an original environment token and a
-native browser-login store are exercised. The storage case simulates an
-external vendor renewal and requires restoration to use the renewed grant.
-No real grant, provider inference,
-installation, permission override, preload or launcher is used.
-
-`npm run check:compat` runs the Node, plugin and validation checks without
-claiming the current301 native SDK proof on an older engine. CI runs that
-compatibility cohort on 2.1.296 and 2.1.299, and the full public proof on
-2.1.301, with Linux and native Windows jobs. Historical native adapter unit
-tests remain separately available in a Git checkout as `npm run test:legacy`; they are excluded
-from ordinary-Claude activation acceptance.
-
-Adapted from [simplecore-inc/claude-mods](https://github.com/simplecore-inc/claude-mods)
-(MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Adapted from
+[simplecore-inc/claude-mods](https://github.com/simplecore-inc/claude-mods) (MIT);
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Release history is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The adapted simplecore-inc/claude-mods code keeps its
-own MIT notice in [LICENSES/](LICENSES/).
+MIT, see [LICENSE](LICENSE). The adapted code keeps its own MIT notice in
+[LICENSES/](LICENSES/).
