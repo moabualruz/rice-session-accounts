@@ -1,134 +1,140 @@
 import type { CommandRunInput, On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-import { headerToken, oauthHeaders } from '../hooks/env'
+import { argvInvokesClaude, commandInvokesClaude } from '../hooks/descendants'
+import { oauthHeaders } from '../hooks/env'
 
-function environment(on: On, values: Record<string, string>): Map<string, string> {
+const PROBLEM = 'The session account is not confirmed. Run /rice-account login or select a saved account again before continuing.'
+
+function fixtureCommand(args = ''): CommandRunInput {
+  return { command: 'descendant-fixture', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } }
+}
+
+/** A selected account's environment: the bearer rides only the supported header override. */
+function environment(on: On, values: Record<string, string>): { variables: Map<string, string>; writes: string[] } {
   const variables = new Map(Object.entries(values))
+  const writes: string[] = []
   on('env.get', (_host, input) => ({ value: variables.get(input.name) }))
   on('env.set', (_host, input) => {
+    writes.push(input.name)
     if (input.value === undefined) variables.delete(input.name)
     else variables.set(input.name, input.value)
     return { value: undefined }
   })
-  return variables
+  return { variables, writes }
 }
 
-function fixtureCommand(args = ''): CommandRunInput {
-  return { command: 'descendant-fixture', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } }
+/** The unconfirmed-account problem as a previous load of the module left it in `$.state`. */
+function lockedOut(on: On): void {
+  on('state.get', { plugin: 'rice-session-accounts', key: 'problem' }, () => ({ value: { value: PROBLEM, version: 1 } }))
+}
+
+function result(exitCode = 0) {
+  return { value: { exitCode, stdout: 'fixture', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
 }
 
 // The test Engine exposes events. This owned inline plugin supplies the real
 // operation nouns, with its static calls scanned as native modules are.
 const driver = { plugins: [{ name: 'descendant-driver', register(on: On) {
   on('command.run', { command: 'descendant-fixture' }, async ($, e) => {
-    if (e.args === 'read-error') {
-      try { await $.process.run(['fixture-program']); return { text: 'unexpected child execution' } }
-      catch (error) { return { text: error instanceof Error ? error.message : 'operation failed' } }
+    const outcome = async (run: () => Promise<unknown>) => {
+      try { await run(); return 'started' } catch (error) { return error instanceof Error ? error.message : String(error) }
     }
-    if (e.args === 'explicit-api') await $.process.run(['fixture-program'], { env: { ANTHROPIC_API_KEY: 'fixture-api-choice' } })
-    else if (e.args === 'explicit') await $.process.run(['fixture-program'], { env: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-child-choice' } })
-    else if (e.args === 'empty') await $.process.run(['fixture-program'], { env: { KEEP: 'yes' } })
-    else if (e.args === 'spawn') {
-      const output: string[] = []
-      for await (const chunk of $.process.spawn({ argv: ['fixture-program'], cwd: '/fixture', input: 'input', env: { KEEP: 'yes' } })) output.push(chunk.text)
-      return { text: JSON.stringify(output) }
-    } else await $.process.run(['fixture-program', 'argument'], { cwd: '/fixture', stdin: 'input', timeoutMs: 1234, env: { KEEP: 'yes' } })
-    return { text: 'done' }
+    if (e.args === 'claude-run') return { text: await outcome(() => $.process.run(['claude', '-p', 'owned'])) }
+    if (e.args === 'claude-shell') return { text: await outcome(() => $.process.run(['/bin/sh', '-c', 'cd /fixture && claude -p owned'])) }
+    if (e.args === 'claude-spawn') return { text: await outcome(async () => { for await (const _chunk of $.process.spawn({ argv: ['/opt/tools/claude', '-p', 'owned'] })) {} }) }
+    if (e.args === 'plain-spawn') return { text: await outcome(async () => { for await (const _chunk of $.process.spawn({ argv: ['fixture-program'], env: { KEEP: 'yes' } })) {} }) }
+    if (e.args === 'plain-run') return { text: await outcome(() => $.process.run(['fixture-program', 'argument'], { cwd: '/fixture', stdin: 'input', timeoutMs: 1234, env: { KEEP: 'yes' } })) }
+    return { text: 'unknown fixture' }
   })
 } }] }
 
-test('process.run inherits selected OAuth after native filtering and preserves explicit caller options', driver, async ($, on) => {
-  environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' })
-  const inputs: unknown[] = []
-  on('process.run', (_host, input) => {
-    inputs.push(input)
-    return { value: { exitCode: 0, stdout: 'fixture', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
-  await $.command.run(fixtureCommand())
-  expect(inputs).toEqual([{ argv: ['fixture-program', 'argument'], init: { cwd: '/fixture', stdin: 'input', timeoutMs: 1234, env: { KEEP: 'yes', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' } } }])
+test('shell command lines that run claude are recognized wherever it is a command word', async () => {
+  for (const command of [
+    'claude -p hi', '/usr/local/bin/claude -p hi', '"claude" --version', 'cd /tmp && claude -p x', 'printf x | claude -p',
+    'FOO=1 claude', 'env -u CLAUDECODE claude -p', 'timeout 10 claude', 'sudo -n claude', 'nice -n 5 claude', 'echo $(claude -p x)',
+    'echo `claude -p x`', '(claude -p x)', 'true; claude', 'npx claude', 'C:\\Tools\\claude.exe -p', 'claude.cmd -p', 'x || claude', 'exec claude',
+    'printf a\nclaude -p b',
+  ]) expect(commandInvokesClaude(command), command).toBe(true)
+  for (const command of ['printf claude', 'echo claude is here', 'git commit -m claude', 'claudette', 'ls ~/.claude', 'cat claude.md', 'grep -r claude .', 'which claude-code', '']) {
+    expect(commandInvokesClaude(command), command).toBe(false)
+  }
 })
 
-test('a failed authentication read refuses the child before its executable is reached', driver, async ($, on) => {
-  let executions = 0
-  on('env.get', () => { throw new Error('injected environment read failure') })
-  on('process.run', () => {
-    executions += 1
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
-  const returned = await $.command.run(fixtureCommand('read-error'))
-  expect(returned.text ?? '').toContain('Account authentication could not be prepared')
-  expect(executions).toBe(0)
+test('argument vectors that start claude are recognized directly, through wrappers and through a shell', async () => {
+  for (const argv of [
+    ['claude', '-p', 'x'], ['/opt/bin/claude'], ['C:\\bin\\claude.exe', '-p'], ['claude.cmd'], ['env', '-u', 'CLAUDECODE', 'claude'],
+    ['/bin/sh', '-c', 'claude -p x'], ['bash', '-lc', 'cd x && claude'], ['cmd.exe', '/c', 'claude', '-p'], ['pwsh', '-Command', 'claude -p'],
+  ]) expect(argvInvokesClaude(argv), argv.join(' ')).toBe(true)
+  for (const argv of [
+    [], ['node', '-e', 'console.log("claude")'], ['/usr/bin/security', 'find-generic-password', '-s', 'Claude Code-credentials'],
+    ['/bin/sh', '-c', 'mkdir -p "$(dirname "$0")" && mkdir "$0"', '/fixture/locks/claude.lock'], ['git', 'log'], ['/usr/bin/uname', '-s'],
+  ]) expect(argvInvokesClaude(argv), argv.join(' ')).toBe(false)
 })
 
-test('an explicit child OAuth override takes precedence over its parent session', driver, async ($, on) => {
-  environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' })
-  let env: unknown
-  on('process.run', (_host, input) => {
-    env = input.init?.env
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+test('Bash keeps the exact command text and never receives a credential relay', async ($, on) => {
+  const env = environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-launch-oauth', ANTHROPIC_CUSTOM_HEADERS: oauthHeaders(undefined, 'fixture-selected-oauth') })
+  const commands: string[] = []
+  on('tool.call', { tool: 'Bash' }, (_host, input) => {
+    commands.push(input.command)
+    return { result: { stdout: 'fixture', stderr: '', interrupted: false, isImage: false } }
   })
-  await $.command.run(fixtureCommand('explicit'))
-  expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'fixture-child-choice' })
+  for (const command of ['printf fixture; exit 7', 'claude -p owned', 'printf "${HOME}"']) await $.tool.call({ tool: 'Bash', command })
+  expect(commands).toEqual(['printf fixture; exit 7', 'claude -p owned', 'printf "${HOME}"'])
+  expect(commands.some(command => command.includes('fixture-selected-oauth') || command.includes('RICE_SESSION_ACCOUNTS'))).toBe(false)
+  expect(env.writes).toEqual([])
+  expect(env.variables.has('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')).toBe(false)
 })
 
-test('selected headers follow explicit child authentication without inheriting the parent account', driver, async ($, on) => {
-  environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-native-baseline', RICE_SESSION_ACCOUNTS_OAUTH_RELAY: 'fixture-selected', ANTHROPIC_CUSTOM_HEADERS: oauthHeaders('X-Trace: retained', 'fixture-selected') })
-  const seen: (Record<string, string> | undefined)[] = []
-  on('process.run', (_host, input) => {
-    seen.push(input.init?.env)
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
-  await $.command.run(fixtureCommand('explicit'))
-  await $.command.run(fixtureCommand('explicit-api'))
-  expect(seen[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-child-choice')
-  expect(headerToken(seen[0]?.ANTHROPIC_CUSTOM_HEADERS)).toBe('fixture-child-choice')
-  expect(seen[1]?.ANTHROPIC_API_KEY).toBe('fixture-api-choice')
-  expect(seen[1]?.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
-  expect(headerToken(seen[1]?.ANTHROPIC_CUSTOM_HEADERS)).toBe(undefined)
-  expect(seen[1]?.ANTHROPIC_CUSTOM_HEADERS).toContain('X-Trace: retained')
-})
-
-test('streamed children inherit selected OAuth and keep their input and environment', driver, async ($, on) => {
-  environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' })
-  let seen: unknown
+test('process children keep their caller options and environment unchanged', driver, async ($, on) => {
+  const env = environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-launch-oauth', ANTHROPIC_CUSTOM_HEADERS: oauthHeaders(undefined, 'fixture-selected-oauth') })
+  const runs: unknown[] = [], spawns: unknown[] = []
+  on('process.run', (_host, input) => { runs.push(input); return result() })
   on('process.spawn', async function* (_host, input) {
-    seen = input
+    spawns.push(input)
     yield { stream: 'stdout', text: 'fixture-stream' }
     return { value: { code: 0, signal: null } }
   })
-  const returned = await $.command.run(fixtureCommand('spawn'))
-  expect(JSON.parse(returned.text ?? '[]')).toEqual(['fixture-stream'])
-  expect(seen).toEqual({ argv: ['fixture-program'], cwd: '/fixture', input: 'input', env: { KEEP: 'yes', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' } })
+  expect((await $.command.run(fixtureCommand('plain-run'))).text).toBe('started')
+  expect((await $.command.run(fixtureCommand('plain-spawn'))).text).toBe('started')
+  expect((await $.command.run(fixtureCommand('claude-run'))).text).toBe('started')
+  expect(runs[0]).toEqual({ argv: ['fixture-program', 'argument'], init: { cwd: '/fixture', stdin: 'input', timeoutMs: 1234, env: { KEEP: 'yes' } } })
+  expect((runs[1] as { argv: readonly string[]; init?: { env?: Record<string, string> } }).argv).toEqual(['claude', '-p', 'owned'])
+  expect((runs[1] as { init?: { env?: Record<string, string> } }).init?.env).toBe(undefined)
+  expect((spawns[0] as { argv: readonly string[]; env?: Record<string, string> }).argv).toEqual(['fixture-program'])
+  expect((spawns[0] as { env?: Record<string, string> }).env).toEqual({ KEEP: 'yes' })
+  expect(env.writes).toEqual([])
 })
 
-test('Bash receives only a static environment reference and keeps the original command intact', async ($, on) => {
-  const env = environment(on, { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-selected-oauth' })
-  let command = ''
+test('while the account is unconfirmed, a child claude is refused and nothing else is', driver, async ($, on) => {
+  lockedOut(on)
+  environment(on, { ANTHROPIC_CUSTOM_HEADERS: oauthHeaders(undefined, 'fixture-unconfirmed') })
+  let runs = 0, spawns = 0
+  const commands: string[] = []
+  on('process.run', () => { runs += 1; return result() })
+  on('process.spawn', async function* () { spawns += 1; return { value: { code: 0, signal: null } } })
   on('tool.call', { tool: 'Bash' }, (_host, input) => {
-    command = input.command
+    commands.push(input.command)
     return { result: { stdout: 'fixture', stderr: '', interrupted: false, isImage: false } }
   })
-  await $.tool.call({ tool: 'Bash', command: 'printf fixture; exit 7' })
-  expect(command).toBe('export CLAUDE_CODE_OAUTH_TOKEN="${RICE_SESSION_ACCOUNTS_OAUTH_RELAY-}"; unset RICE_SESSION_ACCOUNTS_OAUTH_RELAY;\nprintf fixture; exit 7')
-  expect(command.includes('fixture-selected-oauth')).toBe(false)
-  expect(env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')).toBe('fixture-selected-oauth')
+  for (const probe of ['claude-run', 'claude-shell', 'claude-spawn']) expect((await $.command.run(fixtureCommand(probe))).text ?? '', probe).toContain('session account is not confirmed')
+  expect([runs, spawns]).toEqual([0, 0])
+  expect((await $.command.run(fixtureCommand('plain-run'))).text).toBe('started')
+  expect((await $.command.run(fixtureCommand('plain-spawn'))).text).toBe('started')
+  expect([runs, spawns]).toEqual([1, 1])
+  const refused = await $.tool.call({ tool: 'Bash', command: 'cd /fixture && claude -p owned' })
+  expect(JSON.stringify(refused)).toContain('session account is not confirmed')
+  await $.tool.call({ tool: 'Bash', command: 'printf allowed' })
+  expect(commands).toEqual(['printf allowed'])
 })
 
-test('returning to an account without an environment OAuth token leaves child inputs unchanged', driver, async ($, on) => {
+test('a damaged stored lockout refuses a child claude and passes other children', driver, async ($, on) => {
+  on('state.get', { plugin: 'rice-session-accounts', key: 'problem' }, () => ({ value: { value: 42, version: 1 } }))
   environment(on, {})
-  let init: unknown
-  let command = ''
-  on('process.run', (_host, input) => {
-    init = input.init
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
-  on('tool.call', { tool: 'Bash' }, (_host, input) => {
-    command = input.command
-    return { result: { stdout: '', stderr: '', interrupted: false, isImage: false } }
-  })
-  await $.command.run(fixtureCommand('empty'))
-  await $.tool.call({ tool: 'Bash', command: 'printf baseline' })
-  expect(init).toEqual({ env: { KEEP: 'yes' } })
-  expect(command).toBe('printf baseline')
+  let runs = 0
+  on('process.run', () => { runs += 1; return result() })
+  expect((await $.command.run(fixtureCommand('claude-run'))).text ?? '').toContain('not confirmed')
+  expect(runs).toBe(0)
+  expect((await $.command.run(fixtureCommand('plain-run'))).text).toBe('started')
+  expect(runs).toBe(1)
 })

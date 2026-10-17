@@ -1,60 +1,86 @@
-import type { EngineInterface, On } from 'claude-code'
+/**
+ * Children keep native behavior: Bash and `$.process.*` children inherit the
+ * session's `ANTHROPIC_CUSTOM_HEADERS` (the selected bearer) the way Claude
+ * passes its environment on, and no command text or child environment is
+ * rewritten. The one thing added here is a lockout: while the session account
+ * is unconfirmed, a child `claude` is refused so it cannot start on an account
+ * nobody confirmed.
+ */
 
-import { headerToken, oauthHeaders, withoutAuthHeaders } from './env'
+const CLAUDE_PROGRAMS = new Set(['claude', 'claude.exe', 'claude.cmd'])
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'sh.exe', 'bash.exe', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'])
+/** Programs that run the command after their own options, assignments or a duration. */
+const WRAPPERS = new Set(['env', 'exec', 'command', 'builtin', 'nohup', 'time', 'sudo', 'doas', 'nice', 'timeout', 'xargs', 'stdbuf', 'setsid', 'caffeinate', 'npx', 'bunx', 'pnpx'])
+/** Wrapper options whose value is the next word, so that word is not the command. */
+const OPTION_VALUES = new Set(['-u', '-g', '-C', '-S', '-n', '-s', '-k', '-P', '-I', '-L', '--user', '--group', '--chdir', '--signal', '--kill-after', '--package'])
 
-/** Native child-environment filtering removes CLAUDE_CODE_OAUTH_TOKEN. */
-const BASH_AUTH = 'export CLAUDE_CODE_OAUTH_TOKEN="${RICE_SESSION_ACCOUNTS_OAUTH_RELAY-}"; unset RICE_SESSION_ACCOUNTS_OAUTH_RELAY;\n'
+export const GUARD_FAILED = 'Rice Accounts could not confirm the session account before starting claude, so it was not started. Run /rice-account login or select a saved account again, then retry.'
 
-/** Derived process state only. No credential bytes enter commands or files. */
-export async function syncDescendantAuth($: EngineInterface): Promise<void> {
-  const token = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') || await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-  const current = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
-  if (current !== (token || undefined)) await $.env.set('RICE_SESSION_ACCOUNTS_OAUTH_RELAY', token || undefined)
+function word(text: string): string {
+  return text.replace(/^\\/, '').replace(/["']/g, '')
 }
 
-/** The caller's explicit environment has precedence over the inherited token. */
-async function childEnvironment($: EngineInterface, explicit: Record<string, string> | undefined): Promise<Record<string, string> | undefined> {
-  const token = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') || await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-  if (!token) return explicit
-  const selectedHeaders = await $.env.get('ANTHROPIC_CUSTOM_HEADERS')
-  const env = { CLAUDE_CODE_OAUTH_TOKEN: token, ...explicit }
-  if (headerToken(selectedHeaders) === token && explicit && !Object.hasOwn(explicit, 'ANTHROPIC_CUSTOM_HEADERS')) {
-    if (explicit.CLAUDE_CODE_OAUTH_TOKEN) return { ...env, ANTHROPIC_CUSTOM_HEADERS: oauthHeaders(selectedHeaders, explicit.CLAUDE_CODE_OAUTH_TOKEN) }
-    if (Object.keys(explicit).some(name => name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN' || name.startsWith('CLAUDE_CODE_USE_'))) {
-      return { ...env, CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_CUSTOM_HEADERS: withoutAuthHeaders(selectedHeaders) ?? '' }
+function basename(text: string): string {
+  return (word(text).split(/[\\/]/).pop() ?? '').toLowerCase()
+}
+
+function isClaude(text: string): boolean {
+  return CLAUDE_PROGRAMS.has(basename(text))
+}
+
+/** The index of the command a wrapper at `index` runs: past its options, their values, assignments and a duration. */
+function afterWrappers(words: readonly string[], start: number): number {
+  let index = start
+  while (index < words.length) {
+    const current = word(words[index] ?? '')
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(current)) { index += 1; continue }
+    if (!WRAPPERS.has(basename(current))) return index
+    index += 1
+    while (index < words.length) {
+      const option = word(words[index] ?? '')
+      if (option === '--') { index += 1; break }
+      // `sudo -n claude` and `nice -n 5 claude` differ only by meaning: a claude value is taken as the command.
+      if (OPTION_VALUES.has(option)) {
+        if (isClaude(words[index + 1] ?? '')) return index + 1
+        index += 2
+        continue
+      }
+      if (option.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(option) || /^\d+(?:\.\d+)?[smhd]?$/.test(option)) { index += 1; continue }
+      break
     }
   }
-  return env
+  return index
 }
 
 /**
- * Keep native child filtering intact, then restore the selected session token
- * through each supported child surface. No listener or transport is involved.
+ * Whether a shell command line runs `claude` as a command word: in any list,
+ * pipeline, group or substitution, after assignments and wrapper programs.
+ * Words inside quotes that hold separators may be over-matched; a refusal
+ * then names the lockout rather than starting an unconfirmed account.
  */
-export function registerDescendantAuth(on: On, blocked: () => string | undefined = () => undefined): void {
-  on('process.run', async ($, e, next) => {
-    const problem = blocked()
-    if (problem && next.origin.plugin !== 'rice-session-accounts') return { deny: problem }
-    const env = await childEnvironment($, e.init?.env)
-    return next(env === e.init?.env ? e : { ...e, init: { ...e.init, env } })
-  }).catch((_host, e, next) => next.called ? next(e) : { deny: 'Account authentication could not be prepared for the child process. Retry the account switch.' })
+export function commandInvokesClaude(command: string): boolean {
+  for (const segment of command.split(/\|\||&&|\$\(|[;&|\n\r(){}`]/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean)
+    const index = afterWrappers(words, 0)
+    const program = words[index]
+    if (program !== undefined && isClaude(program)) return true
+  }
+  return false
+}
 
-  on('process.spawn', async function* ($, e, next) {
-    const problem = blocked()
-    if (problem && next.origin.plugin !== 'rice-session-accounts') return { deny: problem }
-    const env = await childEnvironment($, e.env)
-    return yield* next(env === e.env ? e : { ...e, env })
-  }).catch(async function* (_host, e, next) {
-    if (next.called) return yield* next(e)
-    return { deny: 'Account authentication could not be prepared for the streamed child process. Retry the account switch.' }
-  })
-
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const problem = blocked()
-    if (problem) return { deny: problem }
-    const token = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') || await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-    if (!token) return next(e)
-    await syncDescendantAuth($)
-    return next({ ...e, command: BASH_AUTH + e.command })
-  }).catch((_host, e, next) => next.called ? next(e) : { deny: 'Account authentication could not be prepared for Bash. Retry the account switch.' })
+/** Whether an argument vector starts `claude`, directly, through a wrapper, or as a shell's `-c` command. */
+export function argvInvokesClaude(argv: readonly string[]): boolean {
+  const index = afterWrappers(argv, 0)
+  const program = argv[index]
+  if (program === undefined) return false
+  if (isClaude(program)) return true
+  if (!SHELLS.has(basename(program))) return false
+  for (let at = index + 1; at < argv.length; at += 1) {
+    const option = argv[at] ?? ''
+    // cmd /c and PowerShell -Command run the rest of the line; a POSIX -c runs
+    // its next argument, the ones after it being positional parameters.
+    if (/^\/c$/i.test(option) || /^-command$/i.test(option)) return commandInvokesClaude(argv.slice(at + 1).join(' '))
+    if (/^-[A-Za-z]*c$/.test(option)) return commandInvokesClaude(argv[at + 1] ?? '')
+  }
+  return false
 }

@@ -2,7 +2,7 @@ import type { CommandRunInput, On, PaneOpenArgs } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { fixturePath } from './fixture-path'
-import type { MountTarget } from 'claude-code/testing'
+import type { Mounted, MountTarget } from 'claude-code/testing'
 
 import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 import { headerToken } from '../hooks/env'
@@ -26,10 +26,22 @@ function pane(): MountTarget<'terminal', 'Pane'> {
   }
 }
 
-function fixture(on: On, isPlaced = true) {
+/** A surface without a Select: there each account is a Button. */
+function mobilePane(): MountTarget<'mobile', 'Pane'> {
+  return { ...pane(), surface: 'mobile' }
+}
+
+type Option = { value: string; label: string }
+
+async function options(ui: Mounted<'terminal', 'Pane'>): Promise<Option[]> {
+  return ((await ui.find({ type: 'Select', key: 'account-picker-select' }))?.props.options ?? []) as Option[]
+}
+
+function fixture(on: On, isPlaced = true, launchToken?: string) {
   const environment = new Map<string, string>([
-    ['HOME', home], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', configDir], ['CLAUDE_CODE_OAUTH_TOKEN', 'fixture-machine-launch'],
+    ['HOME', home], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', configDir],
   ])
+  if (launchToken) environment.set('CLAUDE_CODE_OAUTH_TOKEN', launchToken)
   const accounts: Record<string, AccountConfig> = { ...defaultConfig().accounts }
   const documents = new Map<string, string>()
   function identity(folder: string, name: string, subscriptionType: string) {
@@ -94,29 +106,47 @@ function fixture(on: On, isPlaced = true) {
   return { environment, documents, originalDocuments, writes, envWrites, opened, closed, notices }
 }
 
-test('the native account picker shows every saved account email and tier before changing anything', async ($, on) => {
+test('the native account picker shows every saved account email and tier once, before changing anything', async ($, on) => {
   const world = fixture(on)
   await $.command.run(command())
   const ui = await $.ui.mount(pane())
   expect(world.opened[0]).toEqual({ id: PANE, title: 'Choose account', focus: true, closeOnEscape: true })
-  expect((await ui.findAll({ type: 'Button' })).length).toBe(14)
-  expect((await ui.find({ key: 'account:login' }))?.text).toContain('machine@example.test')
-  expect((await ui.find({ key: 'account:login' }))?.text).toContain('Max (20x)')
-  expect((await ui.find({ key: 'account:login' }))?.text).toContain('current session')
-  expect((await ui.find({ key: 'account:extra-1' }))?.text).toContain('extra-1@example.test')
-  expect((await ui.find({ key: 'account:extra-1' }))?.text).toContain('Pro')
-  expect((await ui.find({ key: 'account:extra-2' }))?.text).toContain('Team')
-  expect((await ui.find({ key: 'account:extra-12' }))?.text).toContain('extra-12@example.test')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-machine-launch')
+  const rows = await options(ui)
+  expect(rows.length).toBe(13)
+  expect(new Set(rows.map(row => row.value)).size).toBe(13)
+  // The Select is the list; the only Button is Cancel, so no account row is drawn twice.
+  expect((await ui.findAll({ type: 'Button' })).map(button => button.key)).toEqual(['account-picker-close'])
+  const label = (name: string) => rows.find(row => row.value === name)?.label ?? ''
+  expect(label('login')).toContain('machine@example.test')
+  expect(label('login')).toContain('Max (20x)')
+  expect(label('login')).toContain('current session')
+  expect(label('extra-1')).toContain('extra-1@example.test')
+  expect(label('extra-1')).toContain('Pro')
+  expect(label('extra-2')).toContain('Team')
+  expect(label('extra-12')).toContain('extra-12@example.test')
+  expect((await ui.find({ type: 'Select', key: 'account-picker-select' }))?.props.value).toBe('login')
   expect(world.envWrites).toEqual([])
   expect(world.writes).toEqual([])
   expect([...world.documents.entries()]).toEqual(world.originalDocuments)
   await ui.unmount()
 })
 
-test('pressing an account row switches that exact account and closes the picker', async ($, on) => {
-  const world = fixture(on)
+test('a machine login launched with CLAUDE_CODE_OAUTH_TOKEN is not shown as the stored login', async ($, on) => {
+  const world = fixture(on, true, 'fixture-machine-launch')
   const ui = await $.ui.mount(pane())
+  const login = (await options(ui)).find(row => row.value === 'login')?.label ?? ''
+  expect(login).toContain('Set by CLAUDE_CODE_OAUTH_TOKEN')
+  expect(login).not.toContain('machine@example.test')
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-machine-launch')
+  expect(world.envWrites).toEqual([])
+  await ui.unmount()
+})
+
+test('on a surface without a Select each account is one Button, and pressing it switches that exact account', async ($, on) => {
+  const world = fixture(on)
+  const ui = await $.ui.mount(mobilePane())
+  expect((await ui.findAll({ type: 'Button' })).length).toBe(14)
+  expect((await ui.find({ key: 'account:extra-12' }))?.text).toContain('extra-12@example.test')
   await ui.press({ key: 'account:extra-2' })
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-extra-2')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(undefined)
@@ -143,9 +173,9 @@ test('a failed account selection keeps its error visible and leaves the session 
   const world = fixture(on)
   const ui = await $.ui.mount(pane())
   world.documents.delete(`${paths.loginDir('extra-2')}/.credentials.json`)
-  await ui.press({ key: 'account:extra-2' })
+  await ui.select({ key: 'account-picker-select', value: 'extra-2' })
   expect((await ui.find({ type: 'Text', text: '/rice-account setup extra-2' }))?.text).toContain('not signed in yet')
-  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-machine-launch')
+  expect(world.environment.get('ANTHROPIC_CUSTOM_HEADERS')).toBe(undefined)
   expect(world.envWrites).toEqual([])
   expect(world.closed).toEqual([])
   expect(world.writes).toEqual([])

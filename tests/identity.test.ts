@@ -1,7 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Machine } from '../hooks/accounts'
+import { MANAGED } from '../hooks/env'
+import type { Originals } from '../hooks/env'
 import { accountIdentity } from '../hooks/identity'
+import { loginSourceOf } from '../hooks/login'
 import type { Io } from '../hooks/io'
 import type { Credential } from '../hooks/keychain'
 
@@ -160,6 +163,30 @@ test('macOS machine login reads its normal keychain and HOME metadata without ex
   expect(world.commands[1]).toEqual(['/usr/bin/security', 'find-generic-password', '-s', 'Claude Code-credentials', '-a', 'me', '-w'])
   expect(JSON.stringify(identity).includes('fixture-access')).toBe(false)
   expect(JSON.stringify(identity).includes('fixture-refresh')).toBe(false)
+})
+
+test('a machine login launched with CLAUDE_CODE_OAUTH_TOKEN or an API key never shows the stored login', async () => {
+  const world = fixture({ '/home/me/.claude/.credentials.json': credential('max', 'default_claude_max_20x') }, {
+    '/home/me/.claude.json': metadata('stored@example.test'),
+  })
+  expect(await accountIdentity(world.io, { kind: 'login' }, machine, { kind: 'launch-token', token: 'fixture-launch' })).toEqual({ email: 'Set by CLAUDE_CODE_OAUTH_TOKEN', tier: 'Unknown' })
+  expect(await accountIdentity(world.io, { kind: 'login' }, machine, { kind: 'not-oauth' })).toEqual({ email: 'Not available', tier: 'API or provider' })
+  expect(world.commands).toEqual([])
+  expect(world.reads).toEqual([])
+  // A saved isolated account is its own login whatever the machine launched with.
+  const isolated = fixture({ '/isolated/.credentials.json': credential('pro') }, { '/isolated/.claude.json': metadata('isolated@example.test') })
+  expect(await accountIdentity(isolated.io, { kind: 'claudeai', loginDir: '/isolated' }, machine, { kind: 'launch-token', token: 'fixture-launch' })).toEqual({ email: 'isolated@example.test', tier: 'Pro' })
+})
+
+test('the login source follows native precedence: provider or API key, then the launch token, then the stored login', async () => {
+  const none = Object.fromEntries(MANAGED.map(name => [name, null])) as Originals
+  expect(loginSourceOf(none)).toEqual({ kind: 'stored' })
+  expect(loginSourceOf({ ...none, CLAUDE_CODE_OAUTH_TOKEN: 'fixture-launch' })).toEqual({ kind: 'launch-token', token: 'fixture-launch' })
+  for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_GATEWAY'] as const) {
+    const originals: Originals = { ...none, CLAUDE_CODE_OAUTH_TOKEN: 'fixture-launch' }
+    originals[name] = 'fixture-value'
+    expect(loginSourceOf(originals)).toEqual({ kind: 'not-oauth' })
+  }
 })
 
 test('API, cloud and setup-token rows never manufacture an email or read a token for display', async () => {

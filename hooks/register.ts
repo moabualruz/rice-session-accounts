@@ -1,66 +1,100 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, HookFailure, Register, Timer, On } from 'claude-code'
 
-import type { ActiveAccount, EnvSnapshot } from '../types'
+import type { AccountSnapshot, ActiveAccount, EnvSnapshot } from '../types'
 import { loginEmail, materialFor } from './accounts'
 import type { Machine } from './accounts'
+import { ARGUMENT_HINT, completions, helpText, parseCommand } from './command-line'
 import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_NAME, parseConfig, pathsFor, removeAccount, serializeConfig, UNPARSED_CONFIG } from './config'
 import type { AccountConfig, Config, Kind } from './config'
+import { readLogin } from './credentials'
+import { argvInvokesClaude, commandInvokesClaude, GUARD_FAILED } from './descendants'
 import { headerToken, MANAGED, planEnv } from './env'
 import type { Managed, Originals } from './env'
+import { accountIdentity } from './identity'
 import type { EnvName, Io } from './io'
 import { message } from './io'
-import { readLogin } from './credentials'
-import { setupText, shellQuote } from './setup'
-import { accountIdentity } from './identity'
+import { withLock } from './lock'
+import { loginSourceOf, NOT_OAUTH_LOGIN } from './login'
+import type { LoginSource } from './login'
+import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, USAGE_URL } from './oauth'
 import { ACCOUNT_PICKER_ID, openAccountPicker, renderAccountPicker } from './picker'
 import type { AccountRow } from './picker'
-import { registerDescendantAuth } from './descendants'
-import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, USAGE_URL } from './oauth'
-import { SessionAuthorizations } from './session-auth'
+import { refusalText, SessionAuthorizations, UNKNOWN_HANDLE } from './session-auth'
+import { legacyCleanupText, setupText, signOutHint } from './setup'
 
 const PLUGIN = 'rice-session-accounts'
 const activeAtom = atom({ plugin: 'rice-session-accounts', key: 'active' } as const, null)
 const originalsAtom = atom({ plugin: 'rice-session-accounts', key: 'originals' } as const, null)
+const problemAtom = atom({ plugin: 'rice-session-accounts', key: 'problem' } as const, null)
+const authorizationsAtom = atom({ plugin: 'rice-session-accounts', key: 'authorizations' } as const, null)
+
+const ACCOUNT_RECOVERY = 'The session account is not confirmed. Run /rice-account login or select a saved account again before continuing.'
+const ACCOUNT_CHANGING = 'The session account is changing. Retry when the selection completes.'
+const ACCOUNT_CHANGED = 'The session account changed while this request was prepared. Retry the request.'
+const LOCKOUT_STATUS = 'account not confirmed | run /rice-account login or select an account'
+/** At most one usage lookup per this long after a turn, and after /usage. */
+const USAGE_REFRESH_MS = 60_000
+/** A failed renewal waits this long, doubling per failure up to the maximum, before it is tried again. */
+const RENEWAL_BACKOFF_MS = 30_000
+const RENEWAL_BACKOFF_MAX_MS = 600_000
+const LOADING_USAGE = 'loading usage'
+
+type ReportedLimit = { kind: string; percentUsed: number; resetsAt?: string }
+type AccountReport = { name: string; generation: number; email: string; tier: string; rateLimits: ReportedLimit[]; problem?: string; isStale?: boolean }
 
 /**
- * The module's copy of the session state. `$.state` survives a reload and a
- * module variable survives a /clear (which empties the state while this
- * process keeps the account it switched to); each puts the other back.
+ * Everything this module holds in memory. `$.state` and the process
+ * environment outlive a reload of this module, and the module outlives a
+ * /clear (which empties the state while this process keeps the account it
+ * switched to): each puts the other back. A fresh load of the module (first
+ * start, reload, worker respawn, enable) is the only time `session.start`
+ * reaches it, so that hook starts from `freshModule()` and then restores the
+ * safety state from `$.state`.
  */
-let mirror: { active: ActiveAccount | null; originals: EnvSnapshot | null } = { active: null, originals: null }
-let renewal: Timer | undefined
-let expiresAt: number | undefined
-let knownNames: string[] = [LOGIN_NAME]
-let transitionGeneration = 0
-let commitTail: Promise<void> = Promise.resolve()
-type ReportedLimit = { kind: string; percentUsed: number; resetsAt?: string }
-type AccountReport = { name: string; generation: number; email: string; tier: string; rateLimits: ReportedLimit[]; problem?: string }
-let accountReport: AccountReport | undefined
-const sessionAuthorizations = new SessionAuthorizations()
-let committingAccount = false
-let transitionProblem: string | undefined
-const ACCOUNT_RECOVERY = 'The session account is not confirmed. Run /rice-account login or select a saved account again before continuing.'
-const ACCOUNT_AUTH_RETRY = 'Session account authentication could not be prepared. Retry the request after the account selection completes, or use /rice-account login to recover.'
+function freshModule() {
+  return {
+    isStarted: false,
+    mirror: { active: null as ActiveAccount | null, originals: null as EnvSnapshot | null },
+    renewal: undefined as Timer | undefined,
+    expiresAt: undefined as number | undefined,
+    knownNames: [LOGIN_NAME] as string[],
+    /** Explicit selections in the order they began, and the newest one committed. */
+    selections: 0,
+    committedSelection: 0,
+    /** Advanced by each committed switch; reports of an older generation are discarded. */
+    transitionGeneration: 0,
+    /** Advanced by each attempt to change the environment, committed or rolled back. */
+    commitAttempts: 0,
+    commitTail: Promise.resolve() as Promise<void>,
+    committingAccount: false,
+    accountReport: undefined as AccountReport | undefined,
+    transitionProblem: undefined as string | undefined,
+    usageCheckedAt: undefined as number | undefined,
+    renewalFailures: new Map<string, { streak: number; retryAt: number }>(),
+    authorizations: new SessionAuthorizations(),
+  }
+}
+
+let local = freshModule()
 
 // Claude 2.1.296 follows `$` only into helpers declared in this module.
-async function syncDescendantAuth($: EngineInterface): Promise<void> {
-  const token = await currentAccessToken($)
-  await setDescendantAuth($, token || undefined)
+
+/**
+ * The selected account. Before `session.start` reached a freshly loaded
+ * module (a reload's first moments), the one a previous load kept in
+ * `$.state` counts, since the environment still carries its header.
+ */
+async function activeAccount($: EngineInterface): Promise<ActiveAccount | null> {
+  if (local.mirror.active || local.isStarted) return local.mirror.active
+  return (await read($, activeAtom)) ?? null
 }
 
-async function currentAccessToken($: EngineInterface): Promise<string | undefined> {
-  return mirror.active ? headerToken(await $.env.get('ANTHROPIC_CUSTOM_HEADERS')) : $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-}
-
-function refusedEnvironment(outcome: unknown): boolean {
-  return typeof outcome === 'object' && outcome !== null && 'deny' in outcome && typeof outcome.deny === 'string'
-}
-
-async function setDescendantAuth($: EngineInterface, token: string | undefined): Promise<void> {
-  if (await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') === token) return
-  const outcome: unknown = await $.env.set('RICE_SESSION_ACCOUNTS_OAUTH_RELAY', token)
-  if (refusedEnvironment(outcome) || await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY') !== token) throw new Error('Claude refused the session descendant credential change. The account was not switched.')
+/** The bearer requests on this session carry: the selected header's, or the machine login's. */
+async function currentAccessToken($: EngineInterface, active: ActiveAccount | null): Promise<string | undefined> {
+  if (active) return headerToken(await $.env.get('ANTHROPIC_CUSTOM_HEADERS'))
+  const login = await loginToken($)
+  return 'token' in login ? login.token : undefined
 }
 
 async function variable($: EngineInterface, name: EnvName): Promise<string | undefined> {
@@ -151,7 +185,7 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
   }
 }
 
-async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<unknown> {
+async function setManaged($: EngineInterface, name: Managed, value: string | undefined): Promise<void> {
   switch (name) {
     case 'ANTHROPIC_API_KEY':
       return $.env.set('ANTHROPIC_API_KEY', value)
@@ -214,6 +248,15 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
   }
 }
 
+/** Sets one managed variable and reads it back; a refusal or a value that did not stick throws. */
+async function setManagedChecked($: EngineInterface, name: Managed, value: string | undefined): Promise<void> {
+  let refusal: string | undefined
+  try { await setManaged($, name, value) } catch (error) { refusal = message(error) }
+  if (refusal !== undefined || (await getManaged($, name)) !== value) {
+    throw new Error(`Claude refused the session environment change for ${name}${refusal ? ` (${refusal.replace(/\.$/, '')})` : ''}. The account was not switched.`)
+  }
+}
+
 function machineIo($: EngineInterface): Io {
   return {
     run: (argv, init) => $.process.run(argv, init),
@@ -225,15 +268,18 @@ function machineIo($: EngineInterface): Io {
     now: () => $.clock.now(),
     sleep: ms => $.clock.sleep(ms),
     fetch: (url, init) => $.http.fetch(url, init),
-    log: text => $.ui.log(`${PLUGIN}: ${text}`, { to: 'debug' }),
+    log: text => $.ui.log(text, { to: 'debug' }),
   }
 }
 
 async function machineOf($: EngineInterface): Promise<Machine> {
   const configDir = await variable($, 'CLAUDE_CONFIG_DIR')
   const windows = await variable($, 'OS') === 'Windows_NT'
-  const home = (windows ? await variable($, 'USERPROFILE') : undefined) ?? (await variable($, 'HOME')) ?? ''
-  const originals = (await read($, originalsAtom)) ?? mirror.originals
+  const home = (windows ? await variable($, 'USERPROFILE') : undefined) || await variable($, 'HOME')
+  if (!configDir && !home) {
+    throw new Error(`Rice Accounts cannot find the Claude configuration folder: ${windows ? 'USERPROFILE' : 'HOME'} and CLAUDE_CONFIG_DIR are both unset. Start Claude with one of them set.`)
+  }
+  const originals = (await read($, originalsAtom)) ?? local.mirror.originals
 
   return {
     claudeDir: configDir || `${home}/.claude`,
@@ -242,11 +288,18 @@ async function machineOf($: EngineInterface): Promise<Machine> {
   }
 }
 
+function oauthNames(config: Config): string[] {
+  return Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(([name]) => name)
+}
+
 async function loadConfig($: EngineInterface): Promise<{ config: Config; problems: string[] }> {
   const paths = pathsFor((await machineOf($)).claudeDir)
-  if (!(await $.fs.exists(paths.config))) return { config: defaultConfig(), problems: [] }
+  if (!(await $.fs.exists(paths.config))) {
+    local.knownNames = [LOGIN_NAME]
+    return { config: defaultConfig(), problems: [] }
+  }
   const loaded = parseConfig(await $.fs.read(paths.config))
-  knownNames = Object.entries(loaded.config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(([name]) => name)
+  local.knownNames = oauthNames(loaded.config)
 
   return loaded
 }
@@ -259,31 +312,134 @@ async function writableConfig($: EngineInterface): Promise<Config> {
   return config
 }
 
-async function saveConfig($: EngineInterface, config: Config): Promise<void> {
-  const paths = pathsFor((await machineOf($)).claudeDir)
-  await $.fs.write(paths.config, serializeConfig(config))
-  knownNames = Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(([name]) => name)
+/**
+ * Reads, changes and writes accounts.json under a lock beside it, so two
+ * sessions editing at once cannot lose each other's change. The file is read
+ * again inside the lock; `edit` decides from that copy.
+ */
+async function editConfig<T>($: EngineInterface, edit: (config: Config) => { config?: Config; result: T }): Promise<T> {
+  const machine = await machineOf($)
+  const paths = pathsFor(machine.claudeDir)
+  // A file that does not parse is refused before any lock is taken.
+  await writableConfig($)
+  return withLock(machineIo($), `${paths.config}.lock`, { staleMs: 30_000, tries: 20 }, async () => {
+    const config = await writableConfig($)
+    const edited = edit(config)
+    if (edited.config && edited.config !== config) {
+      await $.fs.write(paths.config, serializeConfig(edited.config))
+      local.knownNames = oauthNames(edited.config)
+    }
+    return edited.result
+  })
 }
 
 /** The managed variables as this process started, taken once and kept across reloads and /clear. */
 async function originalsOf($: EngineInterface): Promise<Originals> {
-  const kept = (await read($, originalsAtom)) ?? mirror.originals
+  const kept = (await read($, originalsAtom)) ?? local.mirror.originals
   if (kept) {
+    if (!local.mirror.originals) local.mirror = { ...local.mirror, originals: kept }
     if (!(await read($, originalsAtom))) await update($, originalsAtom, () => kept)
 
     return kept as Originals
   }
   const taken = {} as Originals
   for (const name of MANAGED) taken[name] = (await getManaged($, name)) ?? null
-  mirror = { ...mirror, originals: taken }
+  local.mirror = { ...local.mirror, originals: taken }
   await update($, originalsAtom, () => taken)
 
   return taken
 }
 
+/**
+ * The machine login's OAuth token for usage and profile lookups, or why there
+ * is none: one rule for every caller, in native precedence (an API key or a
+ * provider has no subscription usage; a launch CLAUDE_CODE_OAUTH_TOKEN comes
+ * before the stored /login, which is read only when nothing else was given).
+ */
+async function loginToken($: EngineInterface): Promise<{ token: string } | { problem: string }> {
+  const source = await loginSource($)
+  if (source.kind === 'not-oauth') return { problem: NOT_OAUTH_LOGIN }
+  if (source.kind === 'launch-token') return { token: source.token }
+  const machine = await machineOf($)
+  const stored = await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
+  return stored ? { token: stored.claudeAiOauth.accessToken } : { problem: 'This machine has no saved Claude OAuth login. Run claude auth login in a terminal.' }
+}
+
+/**
+ * How the machine login authenticates, from the launch values. Read-only, so
+ * a render hook (the account picker) may ask: until the launch values are
+ * kept, nothing has changed the environment, which then still holds them.
+ */
+async function loginSource($: EngineInterface): Promise<LoginSource> {
+  const kept = (await read($, originalsAtom)) ?? local.mirror.originals
+  if (kept) return loginSourceOf(kept as Originals)
+  const current = {} as Originals
+  for (const name of MANAGED) current[name] = (await getManaged($, name)) ?? null
+  return loginSourceOf(current)
+}
+
+function snapshotOf(account: AccountConfig): AccountSnapshot | undefined {
+  if (account.kind !== 'claudeai' && account.kind !== 'claudeai-token') return undefined
+  return {
+    kind: account.kind,
+    ...(account.loginDir ? { loginDir: account.loginDir } : {}),
+    ...(account.secret ? { secret: { service: account.secret.service, account: account.secret.account } } : {}),
+    ...(account.label ? { label: account.label } : {}),
+  }
+}
+
+/** The kept account of a switch, when the state holds a usable one (state written by 0.4.1 holds none). */
+function keptAccount(active: ActiveAccount | null | undefined): AccountConfig | undefined {
+  const kept = active?.account
+  if (!kept || kept.kind !== 'claudeai' && kept.kind !== 'claudeai-token') return undefined
+  if (kept.kind === 'claudeai' && typeof kept.loginDir !== 'string') return undefined
+  if (kept.kind === 'claudeai-token' && (typeof kept.secret?.service !== 'string' || typeof kept.secret.account !== 'string')) return undefined
+  return { kind: kept.kind, loginDir: kept.loginDir, secret: kept.secret, label: kept.label }
+}
+
+/** The session account's configuration: the copy taken when it was selected, else the machine login. */
+function sessionAccount(): { name: string; account: AccountConfig | undefined } {
+  const active = local.mirror.active
+  if (!active) return { name: LOGIN_NAME, account: { kind: 'login' } }
+  return { name: active.name, account: keptAccount(active) }
+}
+
+/**
+ * The unconfirmed-account problem: this module's, or, until `session.start`
+ * has taken the kept state back, one a previous load left in `$.state`.
+ */
+async function lockoutProblem($: EngineInterface): Promise<string | undefined> {
+  if (local.transitionProblem || local.isStarted) return local.transitionProblem
+  const kept: unknown = await read($, problemAtom)
+  if (kept === null || kept === undefined) return undefined
+  // A stored lockout that is not text is damaged state: stay locked rather than guess.
+  return typeof kept === 'string' && kept !== '' ? kept : ACCOUNT_RECOVERY
+}
+
+/** Locks the session account out until a verified selection: kept in `$.state` so a reload keeps it. */
+async function enterLockout($: EngineInterface, problem: string): Promise<void> {
+  local.transitionProblem = problem
+  local.accountReport = undefined
+  local.renewal?.cancel()
+  local.renewal = undefined
+  $.ui.status(LOCKOUT_STATUS)
+  try { await update($, problemAtom, () => problem) } catch (error) { $.ui.log(`The account lockout could not be kept for a reload: ${message(error)}`, { to: 'debug' }) }
+}
+
+async function leaveLockout($: EngineInterface): Promise<void> {
+  local.transitionProblem = undefined
+  try {
+    if (await read($, problemAtom)) await update($, problemAtom, () => null)
+  } catch (error) { $.ui.log(`The cleared account lockout could not be kept for a reload: ${message(error)}`, { to: 'debug' }) }
+}
+
+async function keepAuthorizations($: EngineInterface): Promise<void> {
+  try { await update($, authorizationsAtom, () => local.authorizations.snapshot()) } catch (error) { $.ui.log(`The authorization table could not be kept for a reload: ${message(error)}`, { to: 'debug' }) }
+}
+
 function reportStatus(report: AccountReport): string {
   const limits = report.rateLimits.map(limit => `${limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'wk' : limit.kind} ${Math.round(limit.percentUsed)}%`).join(', ')
-  return `account ${report.name} | ${report.email} | ${report.tier}${limits ? ` | ${limits}` : ''}${report.problem ? ` | ${report.problem}` : ''}`
+  return `account ${report.name} | ${report.email} | ${report.tier}${limits ? ` | ${limits}${report.isStale ? ' (stale)' : ''}` : ''}${report.problem ? ` | ${report.problem}` : ''}`
 }
 
 function withReportedLimits<T>(result: T, rateLimits: ReportedLimit[]): T {
@@ -291,63 +447,135 @@ function withReportedLimits<T>(result: T, rateLimits: ReportedLimit[]): T {
   return { ...result, value: { ...result.value, rateLimits } }
 }
 
-async function refreshReport($: EngineInterface, name: string, account: AccountConfig, machine: Machine, generation: number, secret?: string): Promise<void> {
-  const identity = await accountIdentity(machineIo($), account, machine)
-  let token = secret
-  if (account.kind === 'login') {
-    token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-    if (!token && !(await $.env.get('ANTHROPIC_API_KEY')) && !(await $.env.get('ANTHROPIC_AUTH_TOKEN'))) {
-      token = (await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken
-    }
-  }
-  let rateLimits: ReportedLimit[] = [], problem: string | undefined
-  try {
-    if (!token) problem = 'usage unavailable'
-    else {
-      const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
-      if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
-      else rateLimits = parseUsage(JSON.parse(response.text)).map(limit => ({
-        kind: limit.label === '5h' ? 'five_hour' : limit.label === 'wk' ? 'seven_day' : limit.label,
-        percentUsed: limit.percent,
-        ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
-      }))
-    }
-  } catch { problem = 'usage unavailable' }
-  // A request begun for A can complete after B has been selected. Native
-  // response headers have the same race, so selected-account reports use the
-  // selected account's usage endpoint and discard superseded results.
-  if (generation !== transitionGeneration || name !== (mirror.active?.name ?? LOGIN_NAME)) return
-  accountReport = { name, generation, ...identity, rateLimits, problem }
-  $.ui.status(reportStatus(accountReport))
+function reportedLimits(text: string): ReportedLimit[] {
+  return parseUsage(JSON.parse(text)).map(limit => ({
+    kind: limit.label === '5h' ? 'five_hour' : limit.label === 'wk' ? 'seven_day' : limit.label,
+    percentUsed: limit.percent,
+    ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
+  }))
 }
 
-function scheduleRenewal($: EngineInterface, name: string, now: number): void {
-  renewal?.cancel()
-  renewal = undefined
-  if (expiresAt === undefined) return
-  const wait = Math.max(30_000, expiresAt - EXPIRY_MARGIN_MS - now)
-  renewal = $.clock.after(wait, () => {
+/** Which selection a piece of report work belongs to; it is applied only while that selection still stands. */
+type Selection = { name: string; generation: number; attempt: number }
+
+function selection(): Selection {
+  return { name: local.mirror.active?.name ?? LOGIN_NAME, generation: local.transitionGeneration, attempt: local.commitAttempts }
+}
+
+function isCurrent(taken: Selection): boolean {
+  return !local.committingAccount && taken.generation === local.transitionGeneration && taken.attempt === local.commitAttempts && taken.name === (local.mirror.active?.name ?? LOGIN_NAME)
+}
+
+/**
+ * Looks up the selected account's identity and usage for the status line and
+ * `session.usage`. Never rejects: every failure becomes the report's problem.
+ * A lookup begun for A can finish after B was selected, so the result is
+ * applied only while the selection it was begun for still stands.
+ */
+async function refreshReport($: EngineInterface, taken: Selection, account: AccountConfig, secret?: string): Promise<void> {
+  const previous = local.accountReport?.name === taken.name ? local.accountReport : undefined
+  let identity = { email: previous?.email ?? 'Unknown', tier: previous?.tier ?? 'Unknown' }
+  let rateLimits: ReportedLimit[] = [], problem: string | undefined
+  try {
+    const machine = await machineOf($)
+    identity = await accountIdentity(machineIo($), account, machine, account.kind === 'login' ? await loginSource($) : undefined)
+    let token = secret
+    if (account.kind === 'login') {
+      const login = await loginToken($)
+      if ('problem' in login) problem = 'usage unavailable for this login'
+      else token = login.token
+    }
+    if (!problem) {
+      if (!token) problem = 'usage unavailable'
+      else {
+        local.usageCheckedAt = await $.clock.now()
+        const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
+        if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
+        else {
+          try { rateLimits = reportedLimits(response.text) } catch { problem = 'usage unavailable (the usage response did not parse)' }
+        }
+      }
+    }
+  } catch (error) {
+    problem = `usage unavailable (${message(error).replace(/\.$/, '')})`
+  }
+  if (!isCurrent(taken)) return
+  // A failed lookup keeps the limits already shown, marked stale, rather than blanking them.
+  local.accountReport = problem !== undefined && previous && previous.rateLimits.length > 0
+    ? { ...previous, generation: taken.generation, ...identity, isStale: true, problem: problem.replace(/^usage unavailable/, 'usage not refreshed') }
+    : { name: taken.name, generation: taken.generation, ...identity, rateLimits, problem }
+  $.ui.status(reportStatus(local.accountReport))
+}
+
+/** After a main-loop turn: at most one usage lookup a minute, none while nonessential traffic is off. */
+async function refreshAfterTurn($: EngineInterface): Promise<void> {
+  const report = local.accountReport
+  if (!report || local.transitionProblem || local.committingAccount) return
+  const now = await $.clock.now()
+  const isLoading = report.problem === LOADING_USAGE
+  if (!isLoading && local.usageCheckedAt !== undefined && now - local.usageCheckedAt < USAGE_REFRESH_MS) return
+  if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) return
+  const taken = selection()
+  const { account } = sessionAccount()
+  if (!account) return
+  const token = account.kind === 'login' ? undefined : await currentAccessToken($, local.mirror.active)
+  if (!isCurrent(taken)) return
+  local.usageCheckedAt = now
+  await refreshReport($, taken, account, token)
+}
+
+function scheduleRenewal($: EngineInterface, name: string, wait: number): void {
+  local.renewal?.cancel()
+  local.renewal = $.clock.after(Math.max(1_000, wait), () => {
     void renewIfActive($, name)
   })
 }
 
-async function renewIfActive($: EngineInterface, name: string): Promise<void> {
-  if (transitionProblem || mirror.active?.name !== name) return
-  await switchTo($, name, true).catch((error: unknown) => {
-    $.ui.log(`${PLUGIN}: could not renew ${name}: ${message(error)}`, { to: 'debug' })
-    $.ui.toast(`${PLUGIN}: could not renew ${name}: ${message(error)}`)
-  })
+function scheduleExpiry($: EngineInterface, name: string, now: number): void {
+  local.renewal?.cancel()
+  local.renewal = undefined
+  if (local.expiresAt === undefined) return
+  scheduleRenewal($, name, Math.max(30_000, local.expiresAt - EXPIRY_MARGIN_MS - now))
 }
 
-/** Puts this process on an account: its secret read, the managed variables set, the state and status updated. */
-async function switchTo($: EngineInterface, name: string, isQuiet = false): Promise<string> {
-  const generation = isQuiet ? transitionGeneration : ++transitionGeneration
-  const { config, problems } = await loadConfig($)
-  const account = config.accounts[name]
-  if (!account) {
-    const extra = problems.length > 0 ? ` (accounts.json: ${problems.join('; ')})` : ''
+/**
+ * Renews the session account's credential before it expires. A failure backs
+ * off per account (30 s doubling to 10 minutes, reset by a success) and tells
+ * the person once per run of failures.
+ */
+async function renewIfActive($: EngineInterface, name: string): Promise<void> {
+  if (local.transitionProblem || local.mirror.active?.name !== name) return
+  const now = await $.clock.now()
+  const failure = local.renewalFailures.get(name)
+  if (failure && now < failure.retryAt) return
+  try {
+    await switchTo($, name, true)
+    local.renewalFailures.delete(name)
+  } catch (error) {
+    const streak = (failure?.streak ?? 0) + 1
+    const wait = Math.min(RENEWAL_BACKOFF_MAX_MS, RENEWAL_BACKOFF_MS * 2 ** (streak - 1))
+    local.renewalFailures.set(name, { streak, retryAt: now + wait })
+    $.ui.log(`Could not renew ${name}: ${message(error)} Next attempt in ${Math.round(wait / 1000)} s.`, { to: 'debug' })
+    if (streak === 1) $.ui.toast(`Rice Accounts could not renew ${name}: ${message(error).replace(/\.$/, '')}. It retries in the background.`)
+    if (local.mirror.active?.name === name && !local.transitionProblem) scheduleRenewal($, name, wait)
+  }
+}
 
-    throw new Error(`No account named ${name}. Saved: ${Object.keys(config.accounts).join(', ')}${extra}`)
+/**
+ * Puts this process on an account: its secret read, the managed variables
+ * set, the state and status updated. `isQuiet` renews or restores the
+ * account the session holds, from the copy taken when it was selected.
+ */
+async function switchTo($: EngineInterface, name: string, isQuiet = false): Promise<string> {
+  const sequence = isQuiet ? local.committedSelection : ++local.selections
+  let account = isQuiet && local.mirror.active?.name === name ? keptAccount(local.mirror.active) : undefined
+  if (!account) {
+    const { config, problems } = await loadConfig($)
+    account = config.accounts[name]
+    if (!account) {
+      const extra = problems.length > 0 ? ` (accounts.json: ${problems.join('; ')})` : ''
+      throw new Error(`No account named ${name}. Saved: ${oauthNames(config).join(', ')}${extra}.`)
+    }
   }
   if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
   const machine = await machineOf($)
@@ -355,104 +583,122 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false): Prom
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
   // Credential refresh may finish after the person selected another account.
   // Prepare in parallel, then serialize environment/state commits and reject old work.
-  const preceding = commitTail
+  const preceding = local.commitTail
   let releaseCommit = () => {}
-  commitTail = new Promise<void>(resolve => { releaseCommit = resolve })
+  local.commitTail = new Promise<void>(resolve => { releaseCommit = resolve })
   await preceding
+  let taken = selection()
+  let keepsReport = false
   try {
-    if (generation !== transitionGeneration || isQuiet && mirror.active?.name !== name) {
+    if (isQuiet ? local.committedSelection !== sequence || local.mirror.active?.name !== name : sequence < local.committedSelection) {
       if (isQuiet) return ''
       throw new Error('Another account choice superseded this switch. The newer selection was kept.')
     }
+    // A renewal keeps the account and its report; only a new selection reports afresh.
+    keepsReport = isQuiet && local.accountReport?.name === name && local.accountReport.problem !== LOADING_USAGE
     const plan = planEnv(account, material.secret, originals)
-    const previousMirror = mirror
-    const previousActive = (await read($, activeAtom)) ?? null
-    const previousExpiresAt = expiresAt
-    const previousReport = accountReport
-    const previousProblem = transitionProblem
-    const previousRelay = await $.env.get('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
-    committingAccount = true
+    const previous = {
+      mirror: local.mirror, active: (await read($, activeAtom)) ?? null, expiresAt: local.expiresAt,
+      report: local.accountReport, problem: local.transitionProblem,
+    }
+    local.committingAccount = true
+    local.commitAttempts += 1
     const precedingValues = new Map<Managed, string | undefined>()
-    let stateAttempted = false, timerChanged = false, now: number | undefined
+    let stateAttempted = false, timerChanged = false
     try {
       for (const variableName of MANAGED) {
-        const previous = await getManaged($, variableName)
-        if (previous === plan[variableName]) continue
-        precedingValues.set(variableName, previous)
-        const outcome = await setManaged($, variableName, plan[variableName])
-        if (refusedEnvironment(outcome) || (await getManaged($, variableName)) !== plan[variableName]) throw new Error(`Claude refused the session environment change for ${variableName}. The account was not switched.`)
+        const before = await getManaged($, variableName)
+        if (before === plan[variableName]) continue
+        precedingValues.set(variableName, before)
+        await setManagedChecked($, variableName, plan[variableName])
       }
-      await setDescendantAuth($, account.kind === 'login' ? plan.CLAUDE_CODE_OAUTH_TOKEN : material.secret)
-      now = await $.clock.now()
-      const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now }
+      const now = await $.clock.now()
+      const snapshot = snapshotOf(account)
+      const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now, ...(snapshot ? { account: snapshot } : {}) }
       stateAttempted = true
       await update($, activeAtom, () => active)
       const saved = await read($, activeAtom)
       if ((saved?.name ?? null) !== (active?.name ?? null) || saved?.switchedAt !== active?.switchedAt) throw new Error('Claude refused the session account state change. The account was not switched.')
-      mirror = { ...mirror, active }
-      expiresAt = material.expiresAt
+      local.mirror = { ...local.mirror, active }
+      local.expiresAt = material.expiresAt
       timerChanged = true
-      scheduleRenewal($, name, now)
-      accountReport = { name, generation, email: 'Loading account', tier: 'Unknown', rateLimits: [], problem: 'loading usage' }
-      $.ui.status(reportStatus(accountReport))
-      transitionProblem = undefined
+      scheduleExpiry($, name, now)
     } catch (error) {
       const rollbackProblems: string[] = []
-      mirror = previousMirror
-      expiresAt = previousExpiresAt
-      accountReport = previousReport
-      transitionProblem = previousProblem
+      local.mirror = previous.mirror
+      local.expiresAt = previous.expiresAt
+      local.accountReport = previous.report
+      local.transitionProblem = previous.problem
       if (stateAttempted) {
         try {
-          await update($, activeAtom, () => previousActive)
+          await update($, activeAtom, () => previous.active)
           const saved = await read($, activeAtom)
-          if ((saved?.name ?? null) !== (previousActive?.name ?? null) || saved?.switchedAt !== previousActive?.switchedAt) rollbackProblems.push('account state')
+          if ((saved?.name ?? null) !== (previous.active?.name ?? null) || saved?.switchedAt !== previous.active?.switchedAt) rollbackProblems.push('account state')
         } catch { rollbackProblems.push('account state') }
       }
-      for (const [variableName, previous] of [...precedingValues.entries()].reverse()) {
-        try {
-          const outcome = await setManaged($, variableName, previous)
-          if (refusedEnvironment(outcome) || await getManaged($, variableName) !== previous) rollbackProblems.push(variableName)
-        } catch { rollbackProblems.push(variableName) }
+      for (const [variableName, before] of [...precedingValues.entries()].reverse()) {
+        try { await setManagedChecked($, variableName, before) } catch { rollbackProblems.push(variableName) }
       }
-      try { await setDescendantAuth($, previousRelay) } catch { rollbackProblems.push('descendant credentials') }
       if (timerChanged) {
-        try { scheduleRenewal($, previousMirror.active?.name ?? LOGIN_NAME, now ?? await $.clock.now()) } catch { rollbackProblems.push('renewal timer') }
+        try { scheduleExpiry($, previous.mirror.active?.name ?? LOGIN_NAME, await $.clock.now()) } catch { rollbackProblems.push('renewal timer') }
       }
       if (rollbackProblems.length > 0) {
-        accountReport = undefined
-        transitionProblem = ACCOUNT_RECOVERY
-        $.ui.status('account switch incomplete | use /rice-account login to recover')
+        await enterLockout($, ACCOUNT_RECOVERY)
         throw new Error(`${message(error)} Rollback could not restore ${rollbackProblems.join(', ')}. ${ACCOUNT_RECOVERY}`)
       }
-      $.ui.status(previousReport ? reportStatus(previousReport) : undefined)
+      $.ui.status(previous.report ? reportStatus(previous.report) : undefined)
       throw error
     }
-  } finally { committingAccount = false; releaseCommit() }
-  await refreshReport($, name, account, machine, generation, material.secret)
+    // Committed: everything after this point reports, and never fails the switch.
+    local.transitionGeneration += 1
+    local.committedSelection = Math.max(local.committedSelection, sequence)
+    if (local.transitionProblem) await leaveLockout($)
+    taken = { name, generation: local.transitionGeneration, attempt: local.commitAttempts }
+    local.accountReport = keepsReport && local.accountReport
+      ? { ...local.accountReport, generation: taken.generation }
+      : { name, generation: taken.generation, email: 'Loading account', tier: 'Unknown', rateLimits: [], problem: LOADING_USAGE }
+    $.ui.status(reportStatus(local.accountReport))
+  } finally { local.committingAccount = false; releaseCommit() }
+  if (!keepsReport) await refreshReport($, taken, account, material.secret)
   if (isQuiet) return ''
-  if (generation !== transitionGeneration) return 'A newer account choice superseded this selection. The newer account was kept.'
-  const email = accountReport?.name === name ? accountReport.email : await loginEmail(machineIo($), account.loginDir)
+  if (local.committedSelection !== sequence) return 'A newer account choice superseded this selection. The newer account was kept.'
+  const reported = local.accountReport?.name === name && local.accountReport.email !== 'Unknown' ? local.accountReport.email : undefined
+  const email = reported ?? await loginEmail(machineIo($), account.loginDir).catch(() => undefined)
   return name === LOGIN_NAME
     ? `This session is back on this machine's /login. Other sessions were not touched.`
     : `This session now uses ${name} (${account.kind}${email ? `, ${email}` : ''}) from its next request, for its subagents and any claude -p it starts. Other sessions keep their own account.`
 }
 
-/** After a reload (state kept) or a /clear (module kept), the account this process holds is put back in both. */
+/**
+ * After a reload (state kept) or a /clear (module kept), the account this
+ * process holds is put back in both. Fail closed: when it cannot be put back,
+ * requests stay refused until a verified selection rather than leaving the
+ * environment on an account the reports do not show.
+ */
 async function restore($: EngineInterface): Promise<void> {
-  if (transitionProblem) return
-  await originalsOf($)
-  const kept = (await read($, activeAtom)) ?? mirror.active
-  if (!kept) return
-  if (!(await read($, activeAtom))) await update($, activeAtom, () => kept)
-  mirror = { ...mirror, active: kept }
-  await switchTo($, kept.name, true).catch((error: unknown) => {
-    $.ui.toast(`${PLUGIN}: could not keep ${kept.name}: ${message(error)}`)
-  })
+  if (await lockoutProblem($)) return
+  let kept: ActiveAccount | null = null
+  try {
+    const saved = await read($, activeAtom)
+    kept = saved ?? local.mirror.active
+    if (!kept) {
+      // The machine login: take the launch values now, before anything changes them.
+      await originalsOf($).catch(error => $.ui.log(`The launch environment was not recorded yet: ${message(error)}`, { to: 'debug' }))
+      return
+    }
+    await originalsOf($)
+    if (!saved) await update($, activeAtom, () => kept)
+    local.mirror = { ...local.mirror, active: kept }
+    await switchTo($, kept.name, true)
+  } catch (error) {
+    const problem = `The session account${kept ? ` ${kept.name}` : ''} could not be put back (${message(error).replace(/\.$/, '')}). ${ACCOUNT_RECOVERY}`
+    await enterLockout($, problem)
+    $.ui.toast(problem)
+  }
 }
 
 function formatLimits(limits: { label: string; percent: number; resetsAt?: string }[]): string {
-  if (limits.length === 0) return 'no usage windows reported'
+  if (limits.length === 0) return 'No usage windows were reported.'
 
   return limits
     .map(limit => {
@@ -465,92 +711,92 @@ function formatLimits(limits: { label: string; percent: number; resetsAt?: strin
 }
 
 async function usageText($: EngineInterface): Promise<string> {
-  if (transitionProblem) return transitionProblem
-  const name = mirror.active?.name ?? LOGIN_NAME
-  const { config } = await loadConfig($)
-  const account = config.accounts[name]
+  const problem = await lockoutProblem($)
+  if (problem) return problem
+  const taken = selection()
+  const { name, account: kept } = sessionAccount()
+  const account = kept ?? (await loadConfig($)).config.accounts[name]
   if (!account) return `No account named ${name}.`
   if (!(KINDS as readonly string[]).includes(account.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained for compatibility; use rice-multi-models for providers.'
-  let init
+  let token: string
   if (account.kind === 'login') {
-    const token = await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')
-    if (token) init = oauthInit({ token })
-    else {
-      const machine = await machineOf($)
-      const stored = await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
-      if (stored) init = oauthInit({ token: stored.claudeAiOauth.accessToken })
-      else {
-        const handle = (await $.session.authorize())?.handle
-        if (!handle) return 'This session has no Anthropic credential to look usage up with.'
-        init = oauthInit({ handle })
-      }
-    }
-  } else if (account.kind === 'claudeai' || account.kind === 'claudeai-token') {
+    const login = await loginToken($)
+    if ('problem' in login) return login.problem
+    token = login.token
+  } else {
     const machine = await machineOf($)
     const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
-    if (!material.secret) return `${name} has no token.`
-    init = oauthInit({ token: material.secret })
-  } else {
-    return `${name} is a ${account.kind} account: its limits are on the provider's own console.`
+    if (!material.secret) return `${name} has no token. Run /rice-account setup ${name}.`
+    token = material.secret
   }
-  const response = await $.http.fetch(USAGE_URL, init)
+  local.usageCheckedAt = await $.clock.now()
+  const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
   if (!response.ok) return `${name}: the usage lookup answered HTTP ${response.status}${account.kind === 'claudeai-token' ? ' (setup tokens may not reach it)' : ''}.`
+  const body: unknown = JSON.parse(response.text)
+  const report = local.accountReport
+  if (report && report.name === name && isCurrent(taken)) {
+    local.accountReport = { ...report, rateLimits: reportedLimits(response.text), isStale: false, problem: undefined }
+    $.ui.status(reportStatus(local.accountReport))
+  }
 
-  return `${name} usage:\n${formatLimits(parseUsage(JSON.parse(response.text)))}`
+  return `${name} usage:\n${formatLimits(parseUsage(body))}`
 }
 
 function selectedReportProblem(detail: string | undefined): string {
-  return transitionProblem ?? `The selected session account report is unavailable${detail ? ` (${detail.replace(/\.$/, '')})` : ''}. The machine login was not reported in its place. Retry, or run /rice-account check.`
+  return local.transitionProblem ?? `The selected session account report is unavailable${detail ? ` (${detail.replace(/\.$/, '')})` : ''}. The machine login was not reported in its place. Retry, or run /rice-account check.`
 }
 
 async function statusText($: EngineInterface): Promise<string> {
-  if (transitionProblem) return transitionProblem
+  const problem = await lockoutProblem($)
+  if (problem) return problem
   const [version, model, cwd] = await Promise.all([$.session.version(), $.session.model(), $.session.cwd()])
-  const report = accountReport
-  const selected = report ? `Session account: ${report.name}\nEmail: ${report.email}\nPlan: ${report.tier}` : 'Session account: machine login'
+  const report = local.accountReport
+  const name = local.mirror.active?.name ?? LOGIN_NAME
+  const selected = report && report.name === name
+    ? `Session account: ${report.name}\nEmail: ${report.email}\nPlan: ${report.tier}`
+    : name === LOGIN_NAME ? 'Session account: machine login' : `Session account: ${name}\nEmail: loading\nPlan: loading`
   return `${selected}\nClaude Code: ${version.version}\nModel: ${model}\nWorking directory: ${cwd}\n\n${await usageText($)}\n\nRice Accounts reports this session selection. The machine login is unchanged.`
 }
 
 async function checkText($: EngineInterface, name: string): Promise<string> {
   const { config } = await loadConfig($)
-  const account = config.accounts[name]
+  const current = sessionAccount()
+  const account = name === current.name && current.account ? current.account : config.accounts[name]
   if (!account) return `No account named ${name}.`
   if (!(KINDS as readonly string[]).includes(account.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
-  const machine = await machineOf($)
   if (account.kind === 'login') {
-    const stored = await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user })
-    if (!stored) return 'This machine has no saved Claude OAuth login. Run claude auth login in a terminal.'
-    const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: stored.claudeAiOauth.accessToken }))
+    const login = await loginToken($)
+    if ('problem' in login) return `login: ${login.problem}`
+    const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: login.token }))
     if (!response.ok) return `login: the profile lookup answered HTTP ${response.status}.`
     return `login: signed in as ${parseProfile(response.text).email}.`
   }
+  const machine = await machineOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
-  if (account.kind === 'claudeai' || account.kind === 'claudeai-token') {
-    const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: material.secret ?? '' }))
-    if (!response.ok) return `${name}: token found; the profile lookup answered HTTP ${response.status}.`
-    const owner = parseProfile(response.text)
+  const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: material.secret ?? '' }))
+  if (!response.ok) return `${name}: token found; the profile lookup answered HTTP ${response.status}.`
+  const owner = parseProfile(response.text)
 
-    return `${name}: signed in as ${owner.email}${owner.organizationName ? ` (${owner.organizationName})` : ''}.`
-  }
-  return `${name}: OAuth account is ready.`
+  return `${name}: signed in as ${owner.email}${owner.organizationName ? ` (${owner.organizationName})` : ''}.`
 }
 
 async function listText($: EngineInterface): Promise<string> {
   const { config, problems } = await loadConfig($)
   const rows = await accountRows($)
   const lines = rows.map(row => `${row.selected ? '*' : ' '} ${describeAccount(row.name, config.accounts[row.name]!)} | ${row.email} | ${row.tier}${row.selected ? ' [this session]' : ''}`)
-  const notes = problems.length > 0 ? `\nSkipped in accounts.json: ${problems.join('; ')}` : ''
+  const notes = problems.length > 0 ? `\nSkipped in accounts.json: ${problems.join('; ')}.` : ''
 
-  return `${lines.join('\n')}${notes}\n\n/rice-account <name> switches this session only. /rice-account add <name> [kind] saves another (default: claudeai). /rice-account setup <name> resumes setup.`
+  return `${lines.join('\n')}${notes}\n\n/rice-account <name> switches this session only. /rice-account add <name> [kind] saves another (default: claudeai). /rice-account help lists every subcommand.`
 }
 
 async function accountRows($: EngineInterface): Promise<AccountRow[]> {
   const { config } = await loadConfig($)
   const machine = await machineOf($)
   const io = machineIo($)
-  const current = mirror.active?.name ?? LOGIN_NAME
+  const source = await loginSource($)
+  const current = local.mirror.active?.name ?? LOGIN_NAME
   return Promise.all(Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(async ([name, account]) => ({
-    name, kind: account.kind, selected: name === current, ...await accountIdentity(io, account, machine),
+    name, kind: account.kind, selected: name === current, ...await accountIdentity(io, account, machine, source),
   })))
 }
 
@@ -560,110 +806,215 @@ function parseOptions(words: readonly string[]): Record<string, string> {
     const at = word.indexOf('=')
     if (at <= 0 || at === word.length - 1) throw new Error('Expected key=value for each option; credentials are entered in the terminal helper.')
     const key = word.slice(0, at)
-    if (!(ADD_OPTIONS as readonly string[]).includes(key)) throw new Error(`Unknown option: ${key}`)
-    if (options[key] !== undefined) throw new Error(`Repeated option: ${key}`)
+    if (!(ADD_OPTIONS as readonly string[]).includes(key)) throw new Error(`Unknown option: ${key}.`)
+    if (options[key] !== undefined) throw new Error(`Repeated option: ${key}.`)
     options[key] = word.slice(at + 1)
   }
 
   return options
 }
 
+const PROVIDER_ENTRY = 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
+
+function withPeriod(text: string): string {
+  return /[.!?:]$/.test(text.trimEnd()) || text.includes('\n') ? text : `${text.trimEnd()}.`
+}
+
+async function platformOf($: EngineInterface): Promise<'win32' | 'posix'> {
+  return (await variable($, 'OS')) === 'Windows_NT' ? 'win32' : 'posix'
+}
+
 async function runCommand($: EngineInterface, args: string): Promise<string> {
-  const words = args.trim().split(/\s+/).filter(Boolean)
-  const [first, ...rest] = words
+  const parsed = parseCommand(args)
   try {
-    if (!first) {
-      if (await openAccountPicker(() => $.ui.open({ id: ACCOUNT_PICKER_ID, title: 'Choose account', focus: true, closeOnEscape: true }))) return 'Choose an account in the account list. This changes only this session.'
-      return await listText($)
-    }
-    if (first === 'list') return await listText($)
-    if (first === 'usage') return await usageText($)
-    if (first === 'check') return await checkText($, rest[0] ?? mirror.active?.name ?? LOGIN_NAME)
-    if (first === 'default') return await switchTo($, (await loadConfig($)).config.default)
-    if (first === 'setup-native') {
-      return 'Use this plugin inside ordinary claude. The previous launcher installation path is withdrawn.'
-    }
-    if (first === 'setup') {
-      const name = rest[0]
-      const { config } = await loadConfig($)
-      if (!name || !config.accounts[name] || rest.length !== 1) return 'Usage: /rice-account setup <saved name>'
-      if (!(KINDS as readonly string[]).includes(config.accounts[name]!.kind)) return 'Rice Accounts supports Anthropic OAuth accounts only. This provider entry is retained; use rice-multi-models for providers.'
-      if (name === LOGIN_NAME) return 'The built-in login uses this machine\'s Claude Code authentication. Run claude auth login in a terminal.'
-      return setupText($.plugin.root, (await machineOf($)).claudeDir, name, false, (await variable($, 'OS')) === 'Windows_NT' ? 'win32' : 'posix')
-    }
-    if (first === 'add') {
-      const [name, word, ...tail] = rest
-      const config = await writableConfig($)
-      const kind = word && !word.includes('=') ? word : config.accounts[name ?? '']?.kind ?? 'claudeai'
-      const more = word?.includes('=') ? [word, ...tail] : tail
-      if (!name || kind === 'login' || !(KINDS as readonly string[]).includes(kind)) {
-        return `Usage: /rice-account add <name> [kind] [key=value ...]\nDefault kind: claudeai\nKinds: ${KINDS.filter(each => each !== 'login').join(', ')}\nOptions: label=, service= (setup tokens only). Configure provider accounts in rice-multi-models.`
+    switch (parsed.kind) {
+      case 'picker':
+        if (await openAccountPicker(() => $.ui.open({ id: ACCOUNT_PICKER_ID, title: 'Choose account', focus: true, closeOnEscape: true }))) return 'Choose an account in the account list. This changes only this session.'
+        return await listText($)
+      case 'help':
+        return helpText()
+      case 'refused':
+        return parsed.text
+      case 'list':
+        return await listText($)
+      case 'usage':
+        return await usageText($)
+      case 'check':
+        return await checkText($, parsed.name ?? local.mirror.active?.name ?? LOGIN_NAME)
+      case 'default':
+        return await switchTo($, (await loadConfig($)).config.default)
+      case 'setup-native':
+        return `Use this plugin inside ordinary claude: it installs no launcher. ${legacyCleanupText((await machineOf($)).claudeDir, await platformOf($))}`
+      case 'setup': {
+        const { config } = await loadConfig($)
+        const account = config.accounts[parsed.name]
+        if (!account) return `${parsed.name} is not saved. Run /rice-account add ${parsed.name} first.`
+        if (!(KINDS as readonly string[]).includes(account.kind)) return PROVIDER_ENTRY
+        if (parsed.name === LOGIN_NAME) return 'The built-in login uses this machine\'s Claude Code authentication. Run claude auth login in a terminal.'
+        return setupText($.plugin.root, (await machineOf($)).claudeDir, parsed.name, false, await platformOf($))
       }
-      const machine = await machineOf($)
-      const added = addAccount(config, name, kind as Kind, parseOptions(more), pathsFor(machine.claudeDir))
-      if (added.config !== config) await saveConfig($, added.config)
+      case 'add': {
+        const [word, ...tail] = parsed.rest
+        const kindWord = word !== undefined && !word.includes('=') ? word : undefined
+        const usage = `Usage: /rice-account add <name> [kind] [key=value ...]\nDefault kind: claudeai\nKinds: ${KINDS.filter(each => each !== 'login').join(', ')}\nOptions: label=, service= (setup tokens only). Configure provider accounts in rice-multi-models.`
+        if (kindWord !== undefined && (kindWord === 'login' || !(KINDS as readonly string[]).includes(kindWord))) return usage
+        // Options are checked before accounts.json is locked or read.
+        const options = parseOptions(kindWord !== undefined ? tail : parsed.rest)
+        const machine = await machineOf($)
+        const outcome = await editConfig($, config => {
+          const kind: string = kindWord ?? config.accounts[parsed.name]?.kind ?? 'claudeai'
+          if (kind === 'login' || !(KINDS as readonly string[]).includes(kind)) return { result: { usage: true, isNew: false } }
+          const added = addAccount(config, parsed.name, kind as Kind, options, pathsFor(machine.claudeDir))
+          return { config: added.config, result: { usage: false, isNew: !config.accounts[parsed.name] } }
+        })
+        if (outcome.usage) return usage
+        return setupText($.plugin.root, machine.claudeDir, parsed.name, outcome.isNew, await platformOf($))
+      }
+      case 'remove': {
+        const name = parsed.name
+        if (local.mirror.active?.name === name) return `${name} is this session's account. Switch to another account first, for example /rice-account login.`
+        const refusal = (config: Config): string | undefined => {
+          const account = config.accounts[name]
+          if (config.legacy && Object.hasOwn(config.legacy, name) || account && !(KINDS as readonly string[]).includes(account.kind)) return 'This provider entry is retained. Rice Accounts manages OAuth accounts only.'
+          if (name === LOGIN_NAME) return "This machine's login cannot be removed."
+          if (!account) return `No account named ${name}.`
+          return undefined
+        }
+        // Refused before any lock is taken; checked again inside it.
+        const early = refusal(await writableConfig($))
+        if (early) return early
+        const removed = await editConfig($, config => {
+          const refused = refusal(config)
+          return refused ? { result: { refused, account: undefined } } : { config: removeAccount(config, name), result: { refused, account: config.accounts[name] } }
+        })
+        if (removed.refused) return removed.refused
+        const account = removed.account
+        const cleanup =
+          account?.kind === 'claudeai'
+            ? `\nIts native login is retained. To sign it out in a terminal: ${signOutHint(account.loginDir ?? '', await platformOf($))}`
+            : account?.secret
+              ? '\nIts credential is retained in the OS keyring. Remove it with your OS credential manager when no account uses it.'
+              : ''
 
-      return setupText($.plugin.root, machine.claudeDir, name, !config.accounts[name], (await variable($, 'OS')) === 'Windows_NT' ? 'win32' : 'posix')
+        return `Removed ${name} from accounts.json. Sessions already using it keep it until they switch.${cleanup}`
+      }
+      case 'set-default': {
+        const name = parsed.name
+        const isUnsaved = (config: Config) => !config.accounts[name] || !(KINDS as readonly string[]).includes(config.accounts[name]!.kind)
+        const unsaved = `${name} is not a saved OAuth account. Run /rice-account list to see the saved accounts.`
+        if (isUnsaved(await writableConfig($))) return unsaved
+        const refused = await editConfig($, config => isUnsaved(config) ? { result: true } : { config: { ...config, default: name }, result: false })
+        if (refused) return unsaved
+        return `The saved default account is now ${name}. /rice-account default switches this session to it; new sessions still start on this machine's login.`
+      }
+      case 'switch':
+        return await switchTo($, parsed.name)
     }
-    if (first === 'remove') {
-      const name = rest[0]
-      if (!name) return 'Usage: /rice-account remove <name>'
-      if (mirror.active?.name === name) return `${name} is this session's account; /rice-account login first.`
-      const config = await writableConfig($)
-      const account = config.accounts[name]
-      if (config.legacy && Object.hasOwn(config.legacy, name) || account && !(KINDS as readonly string[]).includes(account.kind)) return 'This provider entry is retained. Rice Accounts manages OAuth accounts only.'
-      await saveConfig($, removeAccount(config, name))
-      const cleanup =
-        account?.kind === 'claudeai'
-          ? `\nIts native login is retained. To sign it out in a terminal: env -u CLAUDECODE CLAUDE_CONFIG_DIR=${shellQuote(account.loginDir ?? '')} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(account.loginDir ?? '')} claude auth logout`
-          : account?.secret
-            ? '\nIts credential is retained in the OS keyring. Remove it with your OS credential manager when no account uses it.'
-            : ''
-
-      return `Removed ${name} from accounts.json.${cleanup}`
-    }
-    if (first === 'set-default') {
-      const name = rest[0]
-      const config = await writableConfig($)
-      if (!name || !config.accounts[name] || !(KINDS as readonly string[]).includes(config.accounts[name]!.kind) || rest.length !== 1) return 'This legacy command expects a saved OAuth account name. Use /rice-account <name> to switch this session.'
-      await saveConfig($, { ...config, default: name })
-
-      return `The legacy /rice-account default target is ${name}. Use /rice-account ${name} to switch this session. New sessions still start on this machine's normal Claude login.`
-    }
-
-    if (rest.length > 0) return 'Usage: /rice-account <saved name> or /rice-account setup <saved name>'
-    return await switchTo($, first)
   } catch (error) {
-    return message(error).replace(/^(?:rice-session-accounts:\s*)+/, '')
+    return withPeriod(message(error).replace(/^(?:rice-session-accounts:\s*)+/, ''))
   }
 }
 
+/**
+ * What a failed account guard refuses with. A hook that threw or overran
+ * cannot say the account is confirmed, so it refuses; one asked in place of a
+ * re-entry was never run, and refuses only on a lockout this module holds.
+ */
+function whenFailed(failure: HookFailure): string | undefined {
+  return failure.kind === 're-entry' ? local.transitionProblem : local.transitionProblem ?? ACCOUNT_RECOVERY
+}
+
+/** Whether /usage and /status answer for the session selection rather than natively. */
+async function reportsSelection($: EngineInterface): Promise<boolean> {
+  return Boolean(local.accountReport || await lockoutProblem($) || await activeAccount($))
+}
+
+/**
+ * Refuses a child `claude` while the session account is unconfirmed. Everything else,
+ * and every child while the account is confirmed, passes through unchanged.
+ */
+function registerLockoutGuard(on: On): void {
+  on('process.run', async ($, e, next) => {
+    if (argvInvokesClaude(e.argv)) {
+      const problem = await lockoutProblem($)
+      if (problem) return { deny: problem }
+    }
+    return next(e)
+  }).catch((_host, e, next) => next.called || !argvInvokesClaude(e.argv) ? next(e) : { deny: GUARD_FAILED })
+
+  on('process.spawn', async function* ($, e, next) {
+    if (argvInvokesClaude(e.argv)) {
+      const problem = await lockoutProblem($)
+      if (problem) return { deny: problem }
+    }
+    return yield* next(e)
+  }).catch(async function* (_host, e, next) {
+    if (next.called || !argvInvokesClaude(e.argv)) return yield* next(e)
+    return { deny: GUARD_FAILED }
+  })
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (commandInvokesClaude(e.command)) {
+      const problem = await lockoutProblem($)
+      if (problem) return { deny: problem }
+    }
+    return next(e)
+  }).catch((_host, e, next) => next.called || !commandInvokesClaude(e.command) ? next(e) : { deny: GUARD_FAILED })
+}
+
 export const register: Register = on => {
-  registerDescendantAuth(on, () => transitionProblem)
+  registerLockoutGuard(on)
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== ACCOUNT_PICKER_ID) return next(e)
     return renderAccountPicker($.ui.resolve(e), () => accountRows($), name => switchTo($, name), {
       invalidate: () => $.ui.invalidate('ui.render'),
       log: text => $.ui.log(text),
       close: () => $.ui.close({ id: ACCOUNT_PICKER_ID }),
+      surface: e.surface,
     })
   })
+
   on('session.start', async ($, e, next) => {
+    // Reached only by a fresh load of this module (first start, reload,
+    // respawn, enable; never /clear): start from nothing held in memory, then
+    // take the safety state back from `$.state` before anything else runs.
+    local.renewal?.cancel()
+    local = freshModule()
+    let problem: string | null
+    try { problem = await read($, problemAtom) } catch (error) { problem = `The kept account state could not be read (${message(error).replace(/\.$/, '')}). ${ACCOUNT_RECOVERY}` }
+    local.authorizations.restore(await read($, authorizationsAtom).catch(() => null))
+    // A handle another plugin received while this load was starting is kept with the rest.
+    const table = local.authorizations.snapshot()
+    if (table.native.length > 0 || table.issued.length > 0) await keepAuthorizations($)
+    const active = await read($, activeAtom).catch(() => null)
+    if (active) local.mirror = { ...local.mirror, active }
+    if (problem) {
+      local.transitionProblem = problem
+      $.ui.status(LOCKOUT_STATUS)
+    }
+    local.isStarted = true
     const started = await next(e)
     await $.command.register({
       name: 'rice-account',
-      description: 'Choose a Claude OAuth account by email and tier, or add, set up and check accounts',
-      argumentHint: '[<name> | list | usage | setup <name> | check [name] | add <name> [kind] | remove <name>]',
+      description: 'Choose the Claude OAuth account for this session by email and plan, or add, set up and check accounts',
+      argumentHint: ARGUMENT_HINT,
     })
+    // Saved names for the typeahead from the start, not only after a first lookup.
+    await loadConfig($).catch(error => $.ui.log(`accounts.json was not read: ${message(error)}`, { to: 'debug' }))
     await restore($)
-    await syncDescendantAuth($)
 
     return started
   })
 
   on('turn.start', async ($, e, next) => {
-    if (mirror.active && !(await read($, activeAtom))) await restore($)
-    if (mirror.active && expiresAt !== undefined && expiresAt - EXPIRY_MARGIN_MS <= (await $.clock.now())) await renewIfActive($, mirror.active.name)
+    // /clear empties the state while this module keeps the account: put it
+    // back, and keep a lockout and the authorization table for a later reload.
+    if (local.mirror.active && !(await read($, activeAtom))) await restore($)
+    if (local.transitionProblem && !(await read($, problemAtom))) await enterLockout($, local.transitionProblem)
+    const table = local.authorizations.snapshot()
+    if ((table.native.length > 0 || table.issued.length > 0) && !(await read($, authorizationsAtom))) await keepAuthorizations($)
+    const active = local.mirror.active
+    if (active && !local.transitionProblem && local.expiresAt !== undefined && local.expiresAt - EXPIRY_MARGIN_MS <= (await $.clock.now())) await renewIfActive($, active.name)
 
     return next(e)
   })
@@ -671,73 +1022,138 @@ export const register: Register = on => {
   on('command.run', { command: 'rice-account' }, async ($, e) => ({ text: await runCommand($, e.args) }))
 
   on('session.authorize', async ($, e, next) => {
-    if (transitionProblem) return { value: null }
-    if (!mirror.active) {
+    const problem = await lockoutProblem($)
+    if (problem) return { deny: problem }
+    if (!(await activeAccount($))) {
       const result = await next(e)
-      if (result.value) sessionAuthorizations.trackNative(next.origin.plugin, result.value.handle)
+      if (result.value && local.authorizations.trackNative(next.origin.plugin, result.value.handle)) await keepAuthorizations($)
       return result
     }
-    if (committingAccount || !(await currentAccessToken($))) return { value: null }
-    if (transitionProblem || committingAccount || !mirror.active) return { value: null }
-    return { value: sessionAuthorizations.issue(next.origin.plugin) }
-  }).catch((_host, e, next) => next.called ? next(e) : { value: null })
+    if (local.committingAccount) return { deny: refusalText(ACCOUNT_CHANGING) }
+    const active = await activeAccount($)
+    if (!(await currentAccessToken($, active))) return { deny: refusalText('The selected session account has no OAuth credential.') }
+    if (local.transitionProblem) return { deny: local.transitionProblem }
+    if (local.committingAccount || !active) return { deny: refusalText(ACCOUNT_CHANGED) }
+    const { authorization, isNew } = local.authorizations.issue(next.origin.plugin)
+    if (isNew) await keepAuthorizations($)
+    return { value: authorization }
+  }).catch((_host, e, next) => next.called ? next(e) : { deny: refusalText(next.error.message) })
 
   on('http.fetch', async ($, e, next) => {
-    if (transitionProblem && next.origin.plugin !== PLUGIN) return { deny: transitionProblem }
-    if (!sessionAuthorizations.recognizes(e.init?.auth)) return next(e)
-    if (!mirror.active && !sessionAuthorizations.owns(e.init?.auth)) return next(e)
-    await commitTail
-    if (transitionProblem) return { deny: transitionProblem }
-    if (committingAccount) throw new Error('The session account is changing. Authorize it again when the selection completes.')
-    const name = mirror.active?.name
-    const generation = transitionGeneration
-    let token = await currentAccessToken($)
-    if (!name && !token) {
-      const machine = await machineOf($)
-      token = (await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken
+    const isOwn = next.origin.plugin === PLUGIN
+    const problem = await lockoutProblem($)
+    if (problem && !isOwn) return { deny: problem }
+    const auth = e.init?.auth
+    if (auth === undefined) return next(e)
+    const selected = await activeAccount($)
+    if (!local.authorizations.recognizes(auth)) {
+      // A handle Claude would fill with the machine credential must not reach
+      // the network while another account is selected.
+      if (selected) return { deny: refusalText(UNKNOWN_HANDLE) }
+      return next(e)
     }
-    const disabled = Boolean(await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))
-    if (transitionProblem) return { deny: transitionProblem }
-    if (committingAccount || generation !== transitionGeneration || name !== mirror.active?.name) throw new Error('The session account changed while preparing this request. Retry the request.')
-    const init = sessionAuthorizations.prepare(e.url, e.init, next.origin.plugin, token, disabled)
+    if (!selected && !local.authorizations.owns(auth)) return next(e)
+    await local.commitTail
+    if (local.transitionProblem && !isOwn) return { deny: local.transitionProblem }
+    if (local.committingAccount) throw new Error(ACCOUNT_CHANGING)
+    const taken = selection()
+    const token = await currentAccessToken($, await activeAccount($))
+    const isDisabled = Boolean(await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))
+    if (local.transitionProblem && !isOwn) return { deny: local.transitionProblem }
+    if (!isCurrent(taken)) throw new Error(ACCOUNT_CHANGED)
+    const init = local.authorizations.prepare(e.url, e.init, next.origin.plugin, token, isDisabled)
     return next({ ...e, init })
-  }).catch((_host, e, next) => next.called ? next(e) : { deny: ACCOUNT_AUTH_RETRY })
+  }).catch((_host, e, next) => next.called ? next(e) : { deny: refusalText(next.error.message) })
 
-  on('session.*', async (_$, e, next) => {
+  on('session.*', async ($, e, next) => {
     const result = await next(e)
-    if (String(next.event) === 'session.usage' && transitionProblem) return withReportedLimits(result, [])
-    if (String(next.event) !== 'session.usage' || !accountReport || accountReport.name !== (mirror.active?.name ?? LOGIN_NAME)) return result
-    return withReportedLimits(result, accountReport.rateLimits)
+    if (String(next.event) !== 'session.usage') return result
+    if (await lockoutProblem($)) return withReportedLimits(result, [])
+    const active = await activeAccount($)
+    const report = local.accountReport
+    if (!report && !active) return result
+    // Never the machine login's windows while another account is selected.
+    if (!report || report.name !== (active?.name ?? LOGIN_NAME)) return withReportedLimits(result, [])
+    return withReportedLimits(result, report.rateLimits)
+  }).catch(async (_host, e, next) => {
+    const result = await next(e)
+    return String(next.event) === 'session.usage' ? withReportedLimits(result, []) : result
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (accountReport && !transitionProblem) {
-      const name = mirror.active?.name ?? LOGIN_NAME
-      const { config } = await loadConfig($)
-      const account = config.accounts[name]
-      if (account) await refreshReport($, name, account, await machineOf($), transitionGeneration, await currentAccessToken($))
-    }
+    // Subagents' turns share the main loop's account: one lookup covers them.
+    if (e.agentId !== undefined) return result
+    await refreshAfterTurn($).catch(error => $.ui.log(`The usage refresh after a turn failed: ${message(error)}`, { to: 'debug' }))
     return result
   })
 
   // A failed hook is skipped, and the native command would then report the
   // machine account. Answer with the selected account's problem instead.
   on('command.run', { command: 'usage' }, async ($, e, next) => {
-    if (!accountReport && !transitionProblem) return next(e)
+    if (!(await reportsSelection($))) return next(e)
     return { text: await usageText($) }
   }).catch((_host, e, next) => next.called ? next(e) : { text: selectedReportProblem(next.error.message) })
 
   on('command.run', { command: 'status' }, async ($, e, next) => {
-    if (!accountReport && !transitionProblem) return next(e)
+    if (!(await reportsSelection($))) return next(e)
     return { text: await statusText($) }
   }).catch((_host, e, next) => next.called ? next(e) : { text: selectedReportProblem(next.error.message) })
 
-  on('model.*', (_$, e, next) => transitionProblem ? { deny: transitionProblem } : next(e))
+  // Every engine event that sends a model request on the session account, or
+  // spends it, is refused while the account is unconfirmed. turn.step answers
+  // in place of the request; the rest refuse or skip with the lockout text.
+  // A guard that fails refuses too (`whenFailed`).
+  on('model.*', async ($, e, next) => {
+    const problem = await lockoutProblem($)
+    return problem ? { deny: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called ? undefined : whenFailed(next.error)
+    return problem ? { deny: problem } : next(e)
+  })
 
-  on('turn.step', async function* (_$, e, next) {
-    if (!transitionProblem) return yield* next(e)
-    const answer = transitionProblem
+  on('session.compact', async ($, e, next) => {
+    const problem = await lockoutProblem($)
+    return problem ? { skip: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called ? undefined : whenFailed(next.error)
+    return problem ? { skip: problem } : next(e)
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const problem = await lockoutProblem($)
+    return problem ? { deny: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called ? undefined : whenFailed(next.error)
+    return problem ? { deny: problem } : next(e)
+  })
+
+  // WebFetch summarizes with a model request and WebSearch sends one of its own.
+  on('tool.call', { tool: 'WebFetch' }, async ($, e, next) => {
+    const problem = await lockoutProblem($)
+    return problem ? { deny: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called ? undefined : whenFailed(next.error)
+    return problem ? { deny: problem } : next(e)
+  })
+
+  on('tool.call', { tool: 'WebSearch' }, async ($, e, next) => {
+    const problem = await lockoutProblem($)
+    return problem ? { deny: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called ? undefined : whenFailed(next.error)
+    return problem ? { deny: problem } : next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    const answer = await lockoutProblem($)
+    if (!answer) return yield* next(e)
+    yield { kind: 'text', index: 0, text: answer }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
+  }).catch(async function* (_host, e, next) {
+    const answer = next.called ? undefined : whenFailed(next.error)
+    if (!answer) return yield* next(e)
     yield { kind: 'text', index: 0, text: answer }
     yield { kind: 'stop', stopReason: 'end_turn', usage: null }
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
@@ -745,11 +1161,7 @@ export const register: Register = on => {
 
   on('prompt.autocomplete', async ($, e, next) => {
     const found = await next(e)
-    if (!e.text.startsWith('/rice-account ') || e.start <= '/rice-account'.length) return found
-    const rows = knownNames
-      .filter(name => name.startsWith(e.token) && name !== e.token)
-      .map(name => ({ text: name, description: 'switch this session to it' }))
-
-    return { suggestions: [...found.suggestions, ...rows] }
+    const rows = completions(e.text, e.start, e.token, local.knownNames, KINDS.filter(kind => kind !== 'login'))
+    return rows.length > 0 ? { suggestions: [...found.suggestions, ...rows] } : found
   })
 }

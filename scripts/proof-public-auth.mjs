@@ -16,6 +16,8 @@ const root=fileURLToPath(new URL('../',import.meta.url))
 const fixture=mkdtempSync(join(tmpdir(),'rice-public-auth-'))
 const plugin=join(fixture,'plugin'), driver=join(fixture,'driver'), config=join(fixture,'.claude')
 const native=process.env.RICE_ACCOUNTS_PROOF_CLAUDE||'claude'
+// The qualified native cohorts this proof runs against; another release needs its own qualification.
+const allowedVersions=['2.1.301','2.1.302']
 const storageBaseline=process.argv.includes('--baseline-storage')
 const started=Date.now(), requests=[], results=[]
 const tokenA='owned-public-oauth-a', tokenB='owned-public-oauth-b'
@@ -175,11 +177,12 @@ export const register:Register=on=>{
   if(process.platform==='win32')Object.assign(env,{OS:'Windows_NT',USERNAME:'fixture',TEMP:join(fixture,'tmp'),TMP:join(fixture,'tmp')})
   const version=spawnSync(native,['--version'],{cwd:fixture,env,encoding:'utf8',timeout:10000})
   assert.equal(version.status,0,'ordinary Claude prerequisite must run')
-  assert.equal(version.stdout.trim(),'2.1.301 (Claude Code)','public auth proof requires the qualified current301 cohort; compatibility unit cohorts are separate')
+  const nativeVersion=/^(\S+) \(Claude Code\)$/.exec(version.stdout.trim())?.[1]
+  assert.ok(allowedVersions.includes(nativeVersion),`public auth proof requires a qualified native cohort (${allowedVersions.join(', ')}); found ${JSON.stringify(version.stdout.trim())}. Compatibility unit cohorts are separate.`)
   const validated=spawnSync(native,['plugin','validate',plugin],{cwd:fixture,env,encoding:'utf8',timeout:15000,maxBuffer:2*1024*1024})
   assert.equal(validated.status,0,validated.stdout||'owned production fixture validation failed')
   child=spawn(native,['-p','--input-format','stream-json','--output-format','stream-json','--verbose','--plugin-dir',plugin,'--plugin-dir',driver,'--setting-sources','user','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--tools','Agent,Read','--no-session-persistence'],{cwd:fixture,env,stdio:['pipe','pipe','pipe'],detached:process.platform!=='win32',windowsHide:true})
-  console.error(JSON.stringify({phase:'owned-native-started',pid:child.pid,platform:process.platform,nativeVersion:'2.1.301',preload:false,productionSourceSha256:createHash('sha256').update(production).digest('hex')}))
+  console.error(JSON.stringify({phase:'owned-native-started',pid:child.pid,platform:process.platform,nativeVersion,preload:false,productionSourceSha256:createHash('sha256').update(production).digest('hex')}))
   const send=text=>child.stdin.write(JSON.stringify({type:'user',message:{role:'user',content:text}})+'\n')
   let pending='',stderr=''
   child.stderr.on('data',bytes=>stderr+=bytes)

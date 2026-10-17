@@ -1,7 +1,7 @@
 import type { Elements, RenderElement, RenderSurface, UiOpenResult } from 'claude-code'
 
 export type AccountRow = { name: string; kind: string; email: string; tier: string; selected: boolean }
-export type PickerControls = { invalidate: () => void; log: (text: string) => void; close: () => Promise<void> }
+export type PickerControls = { invalidate: () => void; log: (text: string) => void; close: () => Promise<void>; surface?: string }
 
 export const ACCOUNT_PICKER_ID = 'rice-account-picker'
 let error: string | undefined
@@ -30,7 +30,8 @@ export async function renderAccountPicker(
   controls: PickerControls,
 ): Promise<RenderElement> {
   const { Box, Text, Button } = elements
-  const Select = 'Select' in elements ? elements.Select : undefined
+  // The mobile app draws no Select; the element table alone cannot be trusted to say so on every host.
+  const Select = controls.surface === 'mobile' ? undefined : 'Select' in elements ? elements.Select : undefined
   let accounts: AccountRow[] = []
   let loadError: string | undefined
   try {
@@ -56,6 +57,8 @@ export async function renderAccountPicker(
     }
   }
 
+  // One row per account: the keyboard Select where the surface has one, a
+  // Button per account only where it does not (each would repeat the list).
   return (
     <Box flexDirection="column">
       <Text>Choose an account for this session</Text>
@@ -70,7 +73,7 @@ export async function renderAccountPicker(
           onSelect={choose}
         />
       )}
-      {accounts.map(row => (
+      {!Select && accounts.map(row => (
         <Button key={`account:${row.name}`} plain label={label(row)} onPress={() => choose(row.name)} />
       ))}
       {accounts.length === 0 && !loadError && <Text>No saved accounts are available.</Text>}

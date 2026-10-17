@@ -11,7 +11,6 @@ const home = '/fixture/session-isolation'
 const configDir = `${home}/.claude`
 const paths = pathsFor(configDir)
 const now = 1_800_000_000_000
-const RELAY = 'RICE_SESSION_ACCOUNTS_OAUTH_RELAY'
 
 function command(args: string): CommandRunInput {
   return { command: 'rice-account', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } }
@@ -31,8 +30,6 @@ function fixture(on: On) {
   // Storage selectors are paths, rather than arbitrary fixture labels.
   environment.set('CLAUDE_SECURESTORAGE_CONFIG_DIR', configDir)
   environment.set('CLAUDE_CODE_OAUTH_TOKEN', 'fixture-launch-oauth')
-  const launchToken = environment.get('CLAUDE_CODE_OAUTH_TOKEN')
-  if (launchToken) environment.set(RELAY, launchToken)
   const launched = new Map(environment)
   const config = {
     ...defaultConfig(),
@@ -159,7 +156,8 @@ test('mid-session account A to B to login switches the process and restores ever
   expect(accountA.text ?? '').toContain('now uses account-a')
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-a')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
-  expect(world.environment.get(RELAY)).toBe('fixture-access-a')
+  // The launch token stays as the process started; children get the selected header only.
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-launch-oauth')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.environment.get('ANTHROPIC_API_KEY')).toBe(undefined)
   expect(world.environment.get('CLAUDE_CODE_USE_GATEWAY')).toBe(undefined)
@@ -169,27 +167,29 @@ test('mid-session account A to B to login switches the process and restores ever
   expect(accountB.text ?? '').toContain('now uses account-b')
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-b')
   expect(world.environment.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')).toBe(world.launched.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'))
-  expect(world.environment.get(RELAY)).toBe('fixture-access-b')
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-launch-oauth')
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
   expect(world.active()?.name).toBe('account-b')
+  // The session keeps where account-b's credential lives, not the credential.
+  expect(world.active()?.account).toEqual({ kind: 'claudeai', loginDir: paths.loginDir('account-b') })
 
   const login = await $.command.run(command('login'))
   expect(login.text ?? '').toContain("back on this machine's /login")
   expect(world.active()).toBe(null)
   expect(world.environment.get('CLAUDE_CONFIG_DIR')).toBe(configDir)
-  expect(world.environment.get(RELAY)).toBe(world.launched.get('CLAUDE_CODE_OAUTH_TOKEN'))
   expect([...world.environment.entries()].sort()).toEqual([...world.launched.entries()].sort())
   expect(world.envWrites).not.toContain('CLAUDE_CONFIG_DIR')
   expect(world.envWrites).not.toContain('CLAUDE_SECURESTORAGE_CONFIG_DIR')
   expect(world.envWrites).not.toContain('CLAUDE_CODE_OAUTH_TOKEN')
+  expect(world.envWrites).not.toContain('RICE_SESSION_ACCOUNTS_OAUTH_RELAY')
   expect(world.fileReads.some(path => path.startsWith(`${paths.base}/logins/`) && path.endsWith('/settings.json'))).toBe(false)
-  expect(world.envWrites.every(name => name === RELAY || MANAGED.some(managed => managed === name))).toBe(true)
+  expect(world.envWrites.every(name => MANAGED.some(managed => managed === name))).toBe(true)
+  // This session launched with an auth token, so the machine's stored login is never read for it.
   expect(world.processReads).toEqual([
     `${paths.loginDir('account-a')}/.credentials.json`,
     `${paths.loginDir('account-a')}/.credentials.json`,
     `${paths.loginDir('account-b')}/.credentials.json`,
     `${paths.loginDir('account-b')}/.credentials.json`,
-    `${configDir}/.credentials.json`,
   ])
   expect(world.writes).toEqual([])
   expect([...world.documents.entries()]).toEqual(world.originalDocuments)

@@ -17,29 +17,39 @@ function command(args: string): CommandRunInput {
 const safetyDriver = { plugins: [{ name: 'account-safety-observer', register(on: On) {
   let cachedReference: string | undefined
   on('command.run', { command: 'account-safety' }, async ($, e) => {
+    const reason = (error: unknown) => error instanceof Error ? error.message : String(error)
     if (e.args === 'cache-reference') { cachedReference = (await $.session.authorize())?.handle; return { text: 'cached' } }
-    if (e.args === 'authorize-only') return { text: (await $.session.authorize()) ? 'authorized' : 'no authorization' }
+    if (e.args === 'authorize-only') {
+      try { return { text: (await $.session.authorize()) ? 'authorized' : 'no authorization' } } catch (error) { return { text: `refused: ${reason(error)}` } }
+    }
     if (e.args === 'fetch-reference') {
       try { await $.http.fetch('https://api.anthropic.com/owned-cached-probe', { auth: cachedReference }); return { text: 'native dispatched' } }
-      catch { return { text: 'refused' } }
+      catch (error) { return { text: `refused: ${reason(error)}` } }
+    }
+    if (e.args === 'fetch-unknown') {
+      try { await $.http.fetch('https://api.anthropic.com/owned-cached-probe', { auth: 'owned-never-issued-handle' }); return { text: 'native dispatched' } }
+      catch (error) { return { text: `refused: ${reason(error)}` } }
     }
     if (e.args === 'recovered') {
       const authorization = await $.session.authorize()
-      const child = await $.process.run(['owned-child-probe'])
+      const child = await $.process.run(['claude', '-p', 'owned-recovered-probe'])
       return { text: JSON.stringify({ authorized: authorization !== null, exitCode: child.exitCode }) }
     }
     const failures: Record<string, string> = {}
     const capture = async (name: string, run: () => Promise<unknown>) => {
       try { await run(); failures[name] = 'unexpected dispatch' }
-      catch (error) { failures[name] = error instanceof Error ? error.message : String(error) }
+      catch (error) { failures[name] = reason(error) }
     }
-    const authorization = await $.session.authorize()
+    await capture('authorize', () => $.session.authorize())
     await capture('http', () => $.http.fetch('https://api.anthropic.com/owned-probe'))
     await capture('model', () => $.model.complete({ model: 'haiku', prompt: 'Owned synthetic blocked request', maxTokens: 1 }))
-    await capture('run', () => $.process.run(['owned-child-probe']))
-    await capture('spawn', async () => { for await (const _chunk of $.process.spawn({ argv: ['owned-child-probe'] })) {} })
-    const bash = await $.tool.call({ tool: 'Bash', command: 'printf owned-probe' })
-    return { text: JSON.stringify({ authorization, failures, bashDeny: bash.deny }) }
+    await capture('run', () => $.process.run(['claude', '-p', 'owned-blocked-probe']))
+    await capture('spawn', async () => { for await (const _chunk of $.process.spawn({ argv: ['/usr/local/bin/claude', '-p', 'owned-blocked-probe'] })) {} })
+    let plainExitCode: number | string
+    try { plainExitCode = (await $.process.run(['owned-child-probe'])).exitCode } catch (error) { plainExitCode = reason(error) }
+    const bash = await $.tool.call({ tool: 'Bash', command: 'claude -p owned-probe' })
+    const plainBash = await $.tool.call({ tool: 'Bash', command: 'printf owned-probe' })
+    return { text: JSON.stringify({ failures, plainExitCode, bashDeny: bash.deny, plainBashDeny: plainBash.deny ?? null }) }
   })
 } }] }
 
@@ -68,7 +78,7 @@ function fixture(on: On) {
   let refuseCachedProbe = false
   const cachedRequests: { auth: string | undefined; authorization: string | undefined }[] = []
   let refuseB = false
-  let failRelay = false, failState = false, refuseRollback = false
+  let failState = false, refuseRollback = false
   const activeWrites: (string | null)[] = []
   mock.clock(on, { now }); mock.store(on)
   on('env.get', async (_host, e) => {
@@ -77,12 +87,12 @@ function fixture(on: On) {
     if (e.name === 'ANTHROPIC_CUSTOM_HEADERS' && heldTokenRead) { const h = heldTokenRead; heldTokenRead = undefined; h.started(); await h.wait }
     return { value }
   })
+  // The SDK's own shapes: `{ deny }` refuses the write, `{ value: undefined }` made it.
   on('env.set', (_host, e) => {
-    if (failRelay && e.name === 'RICE_SESSION_ACCOUNTS_OAUTH_RELAY' && e.value === 'fixture-account-b') { failRelay = false; return { value: { deny: 'Owned post-env relay refusal' } } }
-    if (refuseRollback && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-a') return { value: { deny: 'Owned rollback refusal' } }
-    if (refuseB && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-b') return { value: { deny: 'Owned policy refusal' } }
+    if (refuseRollback && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-a') return { deny: 'Owned rollback refusal' }
+    if (refuseB && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-b') return { deny: 'Owned policy refusal' }
     if (e.value === undefined) environment.delete(e.name); else environment.set(e.name, e.value)
-    return { value: {} }
+    return { value: undefined }
   })
   on('state.set', { plugin: 'rice-session-accounts', key: 'active' }, (_host, e, next) => {
     activeWrites.push(e.value?.name ?? null)
@@ -123,7 +133,7 @@ function fixture(on: On) {
     const wait = new Promise<void>(resolve => { release = resolve })
     heldTokenRead = { started, wait }
     return { seen, release }
-  }, refuseB() { refuseB = true }, allowRecovery() { refuseRollback = false }, failRelay(denyRollback = false) { failRelay = true; refuseRollback = denyRollback }, failState() { failState = true }, holdA() {
+  }, refuseB() { refuseB = true }, allowRecovery() { refuseRollback = false }, failState(denyRollback = false) { failState = true; refuseRollback = denyRollback }, holdA() {
     let started = () => {}, release = () => {}
     const seen = new Promise<void>(resolve => { started = resolve })
     const wait = new Promise<void>(resolve => { release = resolve })
@@ -168,7 +178,11 @@ test('a cached native A authorization cannot fall through when B supersedes its 
   await hold.seen
   await $.command.run(command('account-b'))
   hold.release()
-  expect((await pending).text).toBe('refused')
+  const refused = (await pending).text ?? ''
+  expect(refused).toContain('refused: ')
+  // A retryable cause: the selection changed under the request.
+  expect(refused).toContain('changed while this request was prepared')
+  expect(refused).toContain('Retry after the account selection completes')
   expect(world.cachedRequests).toEqual([])
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
 })
@@ -180,10 +194,24 @@ test('failed credential preparation withholds authorization and cached native re
   await $.command.run({ ...command('cache-reference'), command: 'account-safety' })
   await $.command.run(command('account-a'))
   world.refuseTokenRead()
-  expect((await $.command.run({ ...command('authorize-only'), command: 'account-safety' })).text).toBe('no authorization')
+  const authorization = (await $.command.run({ ...command('authorize-only'), command: 'account-safety' })).text ?? ''
+  expect(authorization).toContain('Rice Accounts could not prepare the session account for this request')
   world.refuseTokenRead()
-  expect((await $.command.run({ ...command('fetch-reference'), command: 'account-safety' })).text).toBe('refused')
+  expect((await $.command.run({ ...command('fetch-reference'), command: 'account-safety' })).text ?? '').toContain('refused: ')
   expect(world.cachedRequests).toEqual([])
+})
+
+test('an authorization never seen is refused while another account is selected, and stays native on the login', safetyDriver, async ($, on) => {
+  const world = fixture(on)
+  await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
+  expect((await $.command.run({ ...command('fetch-unknown'), command: 'account-safety' })).text).toBe('native dispatched')
+  expect(world.cachedRequests).toEqual([{ auth: 'owned-never-issued-handle', authorization: undefined }])
+  await $.command.run(command('account-b'))
+  const refused = (await $.command.run({ ...command('fetch-unknown'), command: 'account-safety' })).text ?? ''
+  // A permanent cause: retrying the same request cannot pick up account-b.
+  expect(refused).toContain('not one Rice Accounts can serve')
+  expect(refused).toContain('will not help')
+  expect(world.cachedRequests.length).toBe(1)
 })
 
 test('a downstream HTTP failure replays its settled result without dispatching the original native A request again', safetyDriver, async ($, on) => {
@@ -193,7 +221,7 @@ test('a downstream HTTP failure replays its settled result without dispatching t
   await $.command.run({ ...command('cache-reference'), command: 'account-safety' })
   await $.command.run(command('account-b'))
   world.refuseCachedProbe()
-  expect((await $.command.run({ ...command('fetch-reference'), command: 'account-safety' })).text).toBe('refused')
+  expect((await $.command.run({ ...command('fetch-reference'), command: 'account-safety' })).text ?? '').toContain('Owned downstream HTTP refusal')
   expect(world.cachedRequests).toEqual([{ auth: undefined, authorization: 'Bearer fixture-account-b' }])
 })
 
@@ -252,24 +280,22 @@ test('a native environment refusal keeps the previous account and its credential
   expect(world.writes).toEqual([])
 })
 
-for (const phase of ['relay', 'state']) {
-  test(`a post-environment ${phase} failure restores the previous credential, descendant relay and selected report`, async ($, on) => {
-    const world = fixture(on)
-    await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
-    await $.command.run(command('account-a'))
-    const before = [...world.environment.entries()].sort()
-    if (phase === 'relay') world.failRelay(); else world.failState()
-    const result = await $.command.run(command('account-b'))
-    expect(result.text ?? '').toContain(phase === 'relay' ? 'refused the session descendant credential change' : 'refused the session account state change')
-    expect([...world.environment.entries()].sort()).toEqual(before)
-    expect(world.status.at(-1) ?? '').toContain('account-a')
-    expect((await $.command.run({ ...command(''), command: 'usage' })).text ?? '').toContain('account-a usage:')
-    expect(world.activeWrites.at(-1)).toBe('account-a')
-    expect(world.writes).toEqual([])
-  })
-}
+test('a post-environment state failure restores the previous credential and selected report', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
+  await $.command.run(command('account-a'))
+  const before = [...world.environment.entries()].sort()
+  world.failState()
+  const result = await $.command.run(command('account-b'))
+  expect(result.text ?? '').toContain('refused the session account state change')
+  expect([...world.environment.entries()].sort()).toEqual(before)
+  expect(world.status.at(-1) ?? '').toContain('account-a')
+  expect((await $.command.run({ ...command(''), command: 'usage' })).text ?? '').toContain('account-a usage:')
+  expect(world.activeWrites.at(-1)).toBe('account-a')
+  expect(world.writes).toEqual([])
+})
 
-test('a refused rollback blocks dispatch until an explicit verified account selection recovers', safetyDriver, async ($, on) => {
+test('a refused rollback blocks every account-bearing dispatch until an explicit verified account selection recovers', safetyDriver, async ($, on) => {
   const world = fixture(on)
   let modelDispatches = 0, toolDispatches = 0, turnDispatches = 0, httpDispatches = 0
   on('model.*', () => { modelDispatches++; return { deny: 'Owned model backend reached' } })
@@ -278,24 +304,26 @@ test('a refused rollback blocks dispatch until an explicit verified account sele
   on('turn.step', async function* (_host, e) { turnDispatches++; return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } })
   await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
   await $.command.run(command('account-a'))
-  world.failRelay(true)
+  world.failState(true)
   const result = await $.command.run(command('account-b'))
-  expect(result.text ?? '').toContain('refused the session descendant credential change')
+  expect(result.text ?? '').toContain('refused the session account state change')
   expect(result.text ?? '').toContain('Rollback could not restore ANTHROPIC_CUSTOM_HEADERS')
   expect(result.text ?? '').toContain('session account is not confirmed')
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-b')
-  expect(world.status.at(-1) ?? '').toContain('account switch incomplete')
+  expect(world.status.at(-1) ?? '').toContain('account not confirmed')
   expect(world.status.at(-1) ?? '').not.toContain('account-a@')
   const processCount = world.processes.length
   const probe = JSON.parse((await $.command.run({ ...command(''), command: 'account-safety' })).text ?? '{}')
-  expect(probe.authorization).toBe(null)
-  for (const kind of ['http', 'model', 'run', 'spawn']) expect(probe.failures[kind]).toContain('session account is not confirmed')
+  for (const kind of ['authorize', 'http', 'model', 'run', 'spawn']) expect(probe.failures[kind]).toContain('session account is not confirmed')
   expect(probe.bashDeny).toContain('session account is not confirmed')
+  // Children that do not start claude keep native behavior, unchanged.
+  expect(probe.plainExitCode).toBe(44)
+  expect(probe.plainBashDeny).toBe('Owned Bash backend reached')
   const text: string[] = []
   for await (const chunk of $.turn.step({ turnId: 'owned-uncertain-turn', index: 0, model: 'haiku', messageCount: 0 })) if (chunk.kind === 'text') text.push(chunk.text)
   expect(text.join('')).toContain('session account is not confirmed')
-  expect(world.processes.length).toBe(processCount)
-  expect([modelDispatches, toolDispatches, turnDispatches, httpDispatches]).toEqual([0, 0, 0, 0])
+  expect(world.processes.length).toBe(processCount + 1)
+  expect([modelDispatches, toolDispatches, turnDispatches, httpDispatches]).toEqual([0, 1, 0, 0])
   for (const name of ['usage', 'status']) expect((await $.command.run({ ...command(''), command: name })).text ?? '').toContain('session account is not confirmed')
   world.allowRecovery()
   const recovered = await $.command.run(command('account-b'))

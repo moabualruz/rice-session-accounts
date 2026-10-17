@@ -8,18 +8,25 @@ import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 
 const configDir = '/fixture/home/.claude'
 const configPath = pathsFor(configDir).config
+const LOCK_MAKE = 'mkdir -p "$(dirname "$0")" && mkdir "$0"'
 
 function command(args: string): CommandRunInput {
   return { command: 'rice-account', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } }
 }
 
+function isLockOrPlatform(argv: readonly string[]): boolean {
+  return argv[0] === '/usr/bin/uname' || argv[0] === '/bin/sh' && (argv[2] === LOCK_MAKE || argv[2]?.includes('rmdir') === true)
+}
+
 /** All account, credential and process effects stay inside the native test host. */
-function fixture(on: On, initial?: Config) {
+function fixture(on: On, initial?: Config, variables: Record<string, string> = { HOME: '/fixture/home', USER: 'fixture', CLAUDE_CONFIG_DIR: configDir }) {
   const files = new Map<string, string>(initial ? [[configPath, serializeConfig(initial)]] : [])
   const reads: string[] = []
   const writes: { path: string; text: string }[] = []
   const processes: (readonly string[])[] = []
-  mock.env(on, { HOME: '/fixture/home', USER: 'fixture', CLAUDE_CONFIG_DIR: configDir })
+  const locks: string[] = []
+  let onLock: (() => void) | undefined
+  mock.env(on, variables)
   mock.clock(on, { now: 1_800_000_000_000 })
   mock.store(on)
   on('state.get', () => ({ value: { value: undefined, version: 0 } }))
@@ -43,6 +50,11 @@ function fixture(on: On, initial?: Config) {
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {
       return { value: { exitCode: 0, stdout: 'Linux\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (input.argv[0] === '/bin/sh' && input.argv[2] === LOCK_MAKE) {
+      locks.push(fixturePath(input.argv[3] ?? ''))
+      onLock?.()
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && input.argv[3] === 'read'
       && input.argv[4] === '/fixture/separate-existing-login/.credentials.json') {
       return { value: { exitCode: 44, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -57,6 +69,9 @@ function fixture(on: On, initial?: Config) {
     reads,
     writes,
     processes,
+    locks,
+    /** Runs while the config lock is taken: another session's write that lands just before this one's. */
+    whenLocked(run: () => void) { onLock = run },
     saved: () => JSON.parse(files.get(configPath) ?? '{}') as Config,
   }
 }
@@ -94,7 +109,20 @@ test('add defaults to an isolated claude.ai login and prints one terminal setup 
   })
   expect(world.writes.length).toBe(1)
   setupCommand(result.text ?? '')
-  expect(world.processes).toEqual([])
+  // accounts.json is changed under a lock beside it; nothing else runs.
+  expect(world.locks).toEqual([`${configPath}.lock`])
+  expect(world.processes.filter(argv => !isLockOrPlatform(argv))).toEqual([])
+})
+
+test('an edit made by another session while this one waited for the lock is kept', async ($, on) => {
+  const world = fixture(on, savedLogin())
+  world.whenLocked(() => {
+    const other = JSON.parse(world.files.get(configPath) ?? '{}') as { accounts: Record<string, unknown> }
+    other.accounts['other-session'] = { kind: 'claudeai', loginDir: '/fixture/other-session' }
+    world.files.set(configPath, JSON.stringify(other))
+  })
+  await $.command.run(command('add second-account'))
+  expect(Object.keys(world.saved().accounts).sort()).toEqual(['login', 'other-session', 'personal-live', 'second-account'])
 })
 
 test('setup repeats the saved account helper command without changing its account', async ($, on) => {
@@ -104,6 +132,14 @@ test('setup repeats the saved account helper command without changing its accoun
   const second = await $.command.run(command('setup personal-live'))
   expect(setupCommand(second.text ?? '')).toBe(setupCommand(first.text ?? ''))
   expect(world.saved()).toEqual(initial)
+  expect(world.writes).toEqual([])
+  expect(world.processes).toEqual([])
+})
+
+test('setup of an unsaved name says to add it first', async ($, on) => {
+  const world = fixture(on, savedLogin())
+  const result = await $.command.run(command('setup new-account'))
+  expect(result.text).toBe('new-account is not saved. Run /rice-account add new-account first.')
   expect(world.writes).toEqual([])
   expect(world.processes).toEqual([])
 })
@@ -155,7 +191,7 @@ for (const [args, problem] of [
   })
 }
 
-for (const args of ['setup personal-live unexpected', 'personal-live unexpected']) {
+for (const args of ['setup personal-live unexpected', 'personal-live unexpected', 'use personal-live unexpected']) {
   test(`${args} refuses extra arguments without changing the saved account`, async ($, on) => {
     const initial = savedLogin()
     const world = fixture(on, initial)
@@ -167,6 +203,64 @@ for (const args of ['setup personal-live unexpected', 'personal-live unexpected'
   })
 }
 
+for (const [args, usage] of [
+  ['list extra', '/rice-account list'], ['usage extra', '/rice-account usage'], ['check one two', '/rice-account check [name]'],
+  ['default extra', '/rice-account default'], ['use', '/rice-account use <name>'], ['remove', '/rice-account remove <name>'],
+  ['remove one two', '/rice-account remove <name>'], ['set-default', '/rice-account set-default <name>'], ['setup', '/rice-account setup <name>'],
+  ['add', '/rice-account add <name>'],
+] as const) {
+  test(`${args} answers with its usage line and changes nothing`, async ($, on) => {
+    const initial = savedLogin()
+    const world = fixture(on, initial)
+    const result = await $.command.run(command(args))
+    expect(result.text ?? '').toContain(`Usage: ${usage}`)
+    expect(result.text ?? '').toContain('/rice-account help')
+    expect(world.saved()).toEqual(initial)
+    expect(world.writes).toEqual([])
+    expect(world.processes).toEqual([])
+  })
+}
+
+for (const args of ['help', '--help', '-h', '?']) {
+  test(`${args} lists every subcommand without reading or changing anything`, async ($, on) => {
+    const world = fixture(on, savedLogin())
+    const text = (await $.command.run(command(args))).text ?? ''
+    for (const usage of ['/rice-account <name>', 'use <name>', 'list', 'usage', 'check [name]', 'add <name> [kind]', 'setup <name>', 'remove <name>', 'default', 'set-default <name>', 'setup-native', 'help']) {
+      expect(text).toContain(usage)
+    }
+    expect(text).toContain('this session only')
+    expect(world.reads).toEqual([])
+    expect(world.writes).toEqual([])
+    expect(world.processes).toEqual([])
+  })
+}
+
+test('use reaches a saved account by name, the same as the bare name', async ($, on) => {
+  const world = fixture(on, savedLogin())
+  const bare = await $.command.run(command('personal-live'))
+  const used = await $.command.run(command('use personal-live'))
+  expect(used.text).toBe(bare.text)
+  expect(used.text ?? '').toContain('/rice-account setup personal-live')
+  expect(world.writes).toEqual([])
+})
+
+test('remove and set-default edit accounts.json under its lock', async ($, on) => {
+  const initial = savedLogin()
+  initial.accounts['spare'] = { kind: 'claudeai', loginDir: '/fixture/spare-login' }
+  const world = fixture(on, initial)
+  expect((await $.command.run(command('set-default spare'))).text ?? '').toContain('The saved default account is now spare.')
+  expect(world.saved().default).toBe('spare')
+  const removed = (await $.command.run(command('remove personal-live'))).text ?? ''
+  expect(removed).toContain('Removed personal-live from accounts.json.')
+  expect(removed).toContain('Sessions already using it keep it')
+  expect(Object.keys(world.saved().accounts).sort()).toEqual(['login', 'spare'])
+  expect(world.locks).toEqual([`${configPath}.lock`, `${configPath}.lock`])
+  expect((await $.command.run(command('remove missing'))).text).toBe('No account named missing.')
+  expect((await $.command.run(command('set-default missing'))).text ?? '').toContain('missing is not a saved OAuth account.')
+  expect((await $.command.run(command('remove login'))).text).toBe("This machine's login cannot be removed.")
+  expect(world.locks.length).toBe(2)
+})
+
 test('switching an unsigned Linux account points to setup without a macOS executable error', async ($, on) => {
   const initial = savedLogin()
   const world = fixture(on, initial)
@@ -176,6 +270,15 @@ test('switching an unsigned Linux account points to setup without a macOS execut
   expect(result.text ?? '').not.toContain('posix_spawn')
   expect(world.processes.some(argv => argv[0] === '/usr/bin/security')).toBe(false)
   expect(world.saved()).toEqual(initial)
+  expect(world.writes).toEqual([])
+})
+
+test('without HOME or CLAUDE_CONFIG_DIR the command names what is missing instead of using /.claude', async ($, on) => {
+  const world = fixture(on, undefined, { USER: 'fixture' })
+  const result = await $.command.run(command('list'))
+  expect(result.text ?? '').toContain('cannot find the Claude configuration folder')
+  expect(result.text ?? '').toContain('HOME')
+  expect(world.reads.some(path => path.startsWith('/.claude'))).toBe(false)
   expect(world.writes).toEqual([])
 })
 
@@ -222,6 +325,7 @@ test('the account list hides preserved provider entries without reading their cr
   const result = await $.command.run(command('list'))
   expect(result.text ?? '').not.toContain('legacy-api')
   expect(result.text ?? '').toContain('personal-live')
+  expect(result.text ?? '').toContain('/rice-account help')
   expect(world.processes.some(argv => argv.includes('fixture-legacy-provider'))).toBe(false)
   expect(world.writes).toEqual([])
   expect(world.files.get(configPath)).toBe(before)

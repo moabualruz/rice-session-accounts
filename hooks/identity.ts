@@ -4,6 +4,7 @@ import { readLogin } from './credentials'
 import type { LoginLocation } from './credentials'
 import type { Io } from './io'
 import type { Credential } from './keychain'
+import type { LoginSource } from './login'
 
 export type AccountIdentity = { email: string; tier: string }
 
@@ -46,8 +47,12 @@ function metadataPath(folder: string): string {
 /**
  * Read cached email and plan for account rows without refreshing the login or
  * making provider requests. Credential bytes are never returned or logged.
+ * The machine login's `source` says what the session launched with: a launch
+ * token or an API key is not the stored /login, so that login is not read.
  */
-export async function accountIdentity(io: Io, account: AccountConfig, machine: Machine): Promise<AccountIdentity> {
+export async function accountIdentity(io: Io, account: AccountConfig, machine: Machine, source: LoginSource = { kind: 'stored' }): Promise<AccountIdentity> {
+  if (account.kind === 'login' && source.kind === 'launch-token') return { email: 'Set by CLAUDE_CODE_OAUTH_TOKEN', tier: 'Unknown' }
+  if (account.kind === 'login' && source.kind === 'not-oauth') return { email: 'Not available', tier: 'API or provider' }
   if (account.kind !== 'login' && account.kind !== 'claudeai') {
     const provider = {
       'claudeai-token': 'Unknown', 'api-key': 'API', gateway: 'Gateway',
