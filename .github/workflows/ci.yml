@@ -2,68 +2,110 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+# Read-only token, no repository secrets anywhere in this workflow.
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
-    runs-on: [self-hosted, linux, x64, generic]
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        claude: ['2.1.296', '2.1.299', '2.1.301', '2.1.302']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.23.3
-      - name: Install the native plugin test prerequisite
-        shell: bash
-        run: |
-          npm install --prefix "$RUNNER_TEMP/claude-native" --cache "$RUNNER_TEMP/npm-cache" --ignore-scripts=false --no-audit --no-fund @anthropic-ai/claude-code@${{ matrix.claude }}
-          claude_bin="$RUNNER_TEMP/claude-native/node_modules/.bin/claude"
-          test "$("$claude_bin" --version)" = '${{ matrix.claude }} (Claude Code)'
-          printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
-          printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
-      - name: Check compatibility contracts
-        if: matrix.claude != '2.1.301'
-        run: npm run check:compat
-      - name: Check current ordinary-Claude behavior
-        if: matrix.claude == '2.1.301'
-        run: npm run check
-      - name: Check the owner's dash policy
-        shell: bash
-        run: |
-          node --input-type=module <<'NODE'
-          import { execFileSync } from 'node:child_process';
-          import { readFileSync } from 'node:fs';
-          for (const file of execFileSync('git', ['ls-files', '-z'], {encoding:'utf8'}).split('\0').filter(Boolean)) {
-            if (/\.(?:ts|mjs|json|md|yml)$/.test(file) && /[\u2013\u2014]/.test(readFileSync(file,'utf8'))) throw Error('Typographic dash in '+file);
-          }
-          NODE
-  windows-native:
-    runs-on: windows-2025
+    name: linux (Claude Code ${{ matrix.claude }})
+    # Pull requests from forks run on GitHub-hosted machines; trusted events use the shared pool.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","linux","x64","generic"]') }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        claude: ['2.1.299', '2.1.301', '2.1.302']
+        claude: ['2.1.296', '2.1.299', '2.1.301', '2.1.302']
+    env:
+      CLAUDE_VERSION: ${{ matrix.claude }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22.23.3
-      - name: Bind official native Windows prerequisite
+      - name: Install the pinned Claude Code
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/claude-native" --cache "$RUNNER_TEMP/npm-cache" --ignore-scripts=false --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+          claude_bin="$RUNNER_TEMP/claude-native/node_modules/.bin/claude"
+          test "$("$claude_bin" --version)" = "${CLAUDE_VERSION} (Claude Code)"
+          printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
+          printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
+      # Unit tests, plugin tests, typecheck (after the plugin types are laid), strict validation,
+      # the dash policy and diff checks.
+      - name: Check compatibility contracts
+        if: matrix.claude != '2.1.301'
+        run: npm run check:compat
+      # The same checks plus the ordinary-Claude auth and bash proofs, which bind to this version.
+      - name: Check current ordinary-Claude behavior
+        if: matrix.claude == '2.1.301'
+        run: npm run check
+  macos:
+    name: macos (Claude Code ${{ matrix.claude }})
+    runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        claude: ['2.1.301', '2.1.302']
+    env:
+      CLAUDE_VERSION: ${{ matrix.claude }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.3
+      - name: Install the pinned Claude Code
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/claude-native" --cache "$RUNNER_TEMP/npm-cache" --ignore-scripts=false --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+          claude_bin="$RUNNER_TEMP/claude-native/node_modules/.bin/claude"
+          test "$("$claude_bin" --version)" = "${CLAUDE_VERSION} (Claude Code)"
+          printf '%s\n' "${claude_bin%/*}" >> "$GITHUB_PATH"
+          printf 'RICE_ACCOUNTS_PROOF_CLAUDE=%s\n' "$claude_bin" >> "$GITHUB_ENV"
+      - name: Check compatibility contracts
+        run: npm run check:compat
+      # The proof skips unless GITHUB_ACTIONS=true (set by the runner) and
+      # RICE_ACCOUNTS_PROOF_KEYCHAIN=1 on darwin, so it never touches a developer keychain.
+      - name: Check the macOS keychain adapter
+        env:
+          RICE_ACCOUNTS_PROOF_KEYCHAIN: '1'
+        run: npm run test:keychain
+  windows-native:
+    name: windows (Claude Code ${{ matrix.claude }})
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        claude: ['2.1.299', '2.1.301', '2.1.302']
+    env:
+      CLAUDE_VERSION: ${{ matrix.claude }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.3
+      - name: Install the pinned Claude Code
         shell: pwsh
         run: |
           Get-PSDrive C | Select-Object Name, Free, Used
           $nativePrefix = Join-Path $env:RUNNER_TEMP 'claude-native'
-          npm install --prefix $nativePrefix --ignore-scripts=false --no-audit --no-fund '@anthropic-ai/claude-code@${{ matrix.claude }}'
+          npm install --prefix $nativePrefix --ignore-scripts=false --no-audit --no-fund "@anthropic-ai/claude-code@$env:CLAUDE_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $nativeExecutable = Join-Path $nativePrefix 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
           $version = & $nativeExecutable --version
-          if ($LASTEXITCODE -ne 0 -or $version -ne '${{ matrix.claude }} (Claude Code)') { throw 'Native prerequisite unavailable' }
+          if ($LASTEXITCODE -ne 0 -or $version -ne "$env:CLAUDE_VERSION (Claude Code)") { throw 'Native prerequisite unavailable' }
           "RICE_ACCOUNTS_PROOF_CLAUDE=$nativeExecutable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $nativePrefix 'node_modules/.bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Check compatibility contracts
@@ -72,4 +114,5 @@ jobs:
       - name: Check current ordinary-Claude behavior
         if: matrix.claude == '2.1.301'
         run: npm run check
-      - run: node scripts/proof-windows-storage.mjs
+      - name: Check native Windows credential storage
+        run: node scripts/proof-windows-storage.mjs

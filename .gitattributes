@@ -1,11 +1,1 @@
 * text=auto eol=lf
-
-# Retain the withdrawn native adapter in Git history and developer checkouts.
-# Release archives contain only the ordinary-Claude plugin path.
-/native export-ignore
-/scripts/proof-native-auth.mjs export-ignore
-/scripts/proof-native-launcher.mjs export-ignore
-/scripts/proof-session-processes.mjs export-ignore
-/scripts/proof-windows-bootstrap.mjs export-ignore
-/scripts/proof-windows-native-launcher.mjs export-ignore
-/tests/native.test.mjs export-ignore

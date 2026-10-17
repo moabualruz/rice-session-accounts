@@ -4,12 +4,14 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
-    "test": "node --test tests/credentials-file.test.mjs tests/setup.test.mjs",
-    "test:legacy": "node --test tests/native.test.mjs",
+    "test": "node --test \"tests/**/*.test.mjs\"",
     "test:plugin": "claude plugin test .",
-    "test:processes": "node scripts/proof-public-auth.mjs",
-    "test:auth": "node scripts/proof-public-auth.mjs && node scripts/proof-public-auth.mjs --baseline-storage",
-    "check:compat": "npm test && npm run test:plugin && claude plugin validate --strict . && git diff --check && git diff --cached --check",
+    "typecheck": "npx --yes -p typescript@6.0.3 tsc -p . --noEmit",
+    "test:keychain": "node scripts/proof-macos-keychain.mjs",
+    "test:bash": "node scripts/proof-public-bash.mjs",
+    "test:auth": "node scripts/proof-public-auth.mjs && node scripts/proof-public-auth.mjs --baseline-storage && npm run test:bash",
+    "check:dashes": "node scripts/check-dashes.mjs",
+    "check:compat": "npm test && npm run test:plugin && npm run typecheck && claude plugin validate --strict . && npm run check:dashes && git diff --check && git diff --cached --check",
     "check": "npm run check:compat && npm run test:auth"
   }
 }
