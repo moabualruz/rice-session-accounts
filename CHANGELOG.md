@@ -35,8 +35,8 @@ rewritten, failures are visible and closed, and a renewed login is never lost.
 - Lockout also covers compaction, subagent spawn, web tools and child `claude`.
   An unconfirmed token is replaced by one no server accepts, so requests no hook
   sees fail instead of using the wrong account. `/clear` followed by a reload no
-  longer mistakes a selected account's header for the launch login (a non-secret
-  `RICE_SESSION_ACCOUNTS_SELECTED` marker names the account).
+  longer mistakes a selected account's header for the launch login (a short-lived
+  non-secret note in the plugin's own store names the account).
 - An explicit selection made while a restore waits is no longer undone by it.
 - The `claude` detector reads shell keywords, `eval`, redirections, quoting,
   `env -S` and nested shells; host refusal text is redacted; an unknown

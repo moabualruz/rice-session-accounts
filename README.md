@@ -146,10 +146,11 @@ selected one. The status entry shows its name, email, plan and usage windows.
   replaced by one no server accepts, so requests that no plugin hook sees (the
   permission classifier, titles, MCP servers) fail instead of using the wrong
   account. The lockout survives a plugin reload and `/clear`.
-- **A marker, not a secret.** `RICE_SESSION_ACCOUNTS_SELECTED` names the selected
-  account (never a credential). It lets a reload that follows `/clear` notice
-  that the environment still holds a selected account, and lock instead of
-  mistaking it for your launch login.
+- **`/clear` plus a reload.** When you clear a conversation that has a selected
+  account, the plugin keeps a short-lived, non-secret note of the account name in
+  its own store (never in the environment, so children cannot inherit it). A
+  reload that follows locks the session instead of mistaking the still-selected
+  account's header for your launch login.
 - **Renewals.** Expiring browser logins are renewed automatically in the
   background (and before a turn that starts after expiry), with backoff after a
   failure. A running session keeps working if you remove its account elsewhere.
@@ -187,10 +188,13 @@ servers are untouched.
 
 **A renewed login is never lost.** The server rotates the refresh token on every
 renewal, so the new login is first written to a private `.credentials.json.rice-pending`
-file (and kept in memory), then saved; if saving fails (antivirus holding the
-file, full disk, locked keychain) it is kept and saved on the next use. On macOS
-a login too large for the keychain's line limit is stored without optional keys
-such as `mcpOAuth`; it is never truncated.
+file (and kept in memory), then saved, then the file is removed. If saving fails
+(antivirus holding the file, full disk, locked keychain) the file is kept and is
+saved on the next use. The file records which stored login it continues, so it is
+only ever adopted when the store still holds that login; reading never changes
+anything, and only a renewal (under its lock) promotes or removes a pending file.
+On macOS a login too large for the keychain's line limit is stored without
+optional keys such as `mcpOAuth`; it is never truncated.
 
 On WSL a config folder under `/mnt/c/...` cannot be made private (Windows drives
 ignore Unix modes); setup warns and recommends a Linux-side folder.
