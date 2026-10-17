@@ -142,8 +142,14 @@ selected one. The status entry shows its name, email, plan and usage windows.
 - **Not confirmed means locked.** If a switch cannot be verified or undone, the
   status line shows "account not confirmed" and model requests, compaction,
   subagents, web tools and child `claude` runs are refused until you run
-  `/rice-account login` or select an account again. The lockout survives a plugin
-  reload and `/clear`.
+  `/rice-account login` or select an account again. The unconfirmed token is
+  replaced by one no server accepts, so requests that no plugin hook sees (the
+  permission classifier, titles, MCP servers) fail instead of using the wrong
+  account. The lockout survives a plugin reload and `/clear`.
+- **A marker, not a secret.** `RICE_SESSION_ACCOUNTS_SELECTED` names the selected
+  account (never a credential). It lets a reload that follows `/clear` notice
+  that the environment still holds a selected account, and lock instead of
+  mistaking it for your launch login.
 - **Renewals.** Expiring browser logins are renewed automatically in the
   background (and before a turn that starts after expiry), with backoff after a
   failure. A running session keeps working if you remove its account elsewhere.
@@ -153,6 +159,19 @@ selected one. The status entry shows its name, email, plan and usage windows.
 Native panels that read Claude's internal cached identity directly (outside
 `/usage`, interactive `/status` and the status entry) can still show the machine
 account.
+
+### Limits
+
+- The values your session started with (an API key, a launch `CLAUDE_CODE_OAUTH_TOKEN`,
+  provider settings) are kept in the session's plugin state so `/rice-account login`
+  can restore them exactly, even after a reload. Plugin state is readable by every
+  plugin in the session, as the environment already is. If you start sessions
+  without such variables there is nothing to keep.
+- If the selected account cannot be put back after a reload (network down, locked
+  keychain), the session stays locked until you select it again rather than guess.
+- A `claude` started from a shell is recognized by name (quotes, wrappers, `eval`,
+  `env -S` and nested shells are handled); a renamed copy of the binary is not, but
+  the replaced token above still stops it from using an unconfirmed account.
 
 ## Credentials on each system
 
