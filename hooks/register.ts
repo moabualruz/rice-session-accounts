@@ -39,7 +39,6 @@ const USAGE_REFRESH_MS = 60_000
 const RENEWAL_BACKOFF_MS = 30_000
 const RENEWAL_BACKOFF_MAX_MS = 600_000
 const LOADING_USAGE = 'loading usage'
-/** RICE_SESSION_ACCOUNTS_SELECTED: a non-secret marker in the process environment naming the selected account; it survives /clear and a reload, which empty `$.state`. Literal at its call sites because the validator lists the variables a module touches. */
 /** What a lockout puts in place of the unconfirmed bearer, so requests nothing hooks fail loudly instead of using the wrong account. */
 const LOCKOUT_BEARER = 'rice-session-accounts-account-not-confirmed'
 
@@ -358,9 +357,8 @@ async function originalsOf($: EngineInterface): Promise<Originals> {
   }
   const taken = {} as Originals
   for (const name of MANAGED) taken[name] = (await getManaged($, name)) ?? null
-  // After /clear and a reload the environment can still hold a selected account's generated
-  // header; it is not a launch value, so only its non-authentication lines are kept.
-  if (await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED')) taken.ANTHROPIC_CUSTOM_HEADERS = withoutAuthHeaders(taken.ANTHROPIC_CUSTOM_HEADERS ?? undefined) ?? null
+  // A lockout leaves its placeholder bearer in the header; it is not a launch value.
+  if (headerToken(taken.ANTHROPIC_CUSTOM_HEADERS ?? undefined) === LOCKOUT_BEARER) taken.ANTHROPIC_CUSTOM_HEADERS = withoutAuthHeaders(taken.ANTHROPIC_CUSTOM_HEADERS ?? undefined) ?? null
   local.mirror = { ...local.mirror, originals: taken }
   await update($, originalsAtom, () => taken)
 
@@ -525,7 +523,6 @@ async function refreshReport($: EngineInterface, taken: Selection, account: Acco
       if (!token) problem = 'usage unavailable'
       else {
         local.usageCheckedAt = await $.clock.now()
-        if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) throw new Error('usage lookups are off while nonessential traffic is disabled')
         const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
         if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
         else {
@@ -598,11 +595,6 @@ async function renewIfActive($: EngineInterface, name: string): Promise<void> {
   }
 }
 
-/** Best effort: the marker only helps a later load recognize an environment that holds a generated bearer. */
-async function setMarker($: EngineInterface, name: string | undefined): Promise<void> {
-  try { if ((await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED')) !== name) await $.env.set('RICE_SESSION_ACCOUNTS_SELECTED', name) } catch (error) { $.ui.log(`The account marker was not updated: ${message(error)}`, { to: 'debug' }) }
-}
-
 /**
  * Puts this process on an account: its secret read, the managed variables
  * set, the state and status updated. `isQuiet` renews or restores the
@@ -654,7 +646,6 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false, expec
         precedingValues.set(variableName, before)
         await setManagedChecked($, variableName, plan[variableName])
       }
-      await setMarker($, name === LOGIN_NAME ? undefined : name)
       const now = await $.clock.now()
       const snapshot = snapshotOf(account)
       const active: ActiveAccount | null = name === LOGIN_NAME ? null : { name, switchedAt: now, ...(snapshot ? { account: snapshot } : {}) }
@@ -682,7 +673,6 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false, expec
       for (const [variableName, before] of [...precedingValues.entries()].reverse()) {
         try { await setManagedChecked($, variableName, before) } catch { rollbackProblems.push(variableName) }
       }
-      await setMarker($, previous.mirror.active?.name)
       if (timerChanged) {
         try { scheduleExpiry($, previous.mirror.active?.name ?? LOGIN_NAME, await $.clock.now()) } catch { rollbackProblems.push('renewal timer') }
       }
@@ -977,6 +967,30 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
 }
 
 /**
+ * /clear empties `$.state` while the process keeps the selected account's
+ * environment and goes on under a new session id with no `session.start`. At
+ * that `session.end` the account's name (never a credential) is left in the
+ * plugin store; the next prompt puts the state back from memory and removes it.
+ * A load that finds it while the state is empty is a reload in between, which
+ * can no longer tell the environment's header from a launch value.
+ */
+const CLEAR_KEY = 'cleared-with-account'
+const CLEAR_WINDOW_MS = 15 * 60 * 1000
+
+async function clearedWithAccount($: EngineInterface): Promise<boolean> {
+  try {
+    const kept = await $.store.get(CLEAR_KEY)
+    if (kept === undefined || kept === null) return false
+    await $.store.delete(CLEAR_KEY)
+    const at = typeof kept === 'object' && kept !== null && 'at' in kept && typeof kept.at === 'number' ? kept.at : 0
+    return (await $.clock.now()) - at < CLEAR_WINDOW_MS
+  } catch (error) {
+    $.ui.log(`The /clear record was not read: ${message(error)}`, { to: 'debug' })
+    return false
+  }
+}
+
+/**
  * What a failed account guard refuses with. A hook that threw or overran
  * cannot say the account is confirmed, so it refuses; one asked in place of a
  * re-entry was never run, and refuses only on a lockout this module holds.
@@ -1056,7 +1070,7 @@ export const register: Register = on => {
     local.isStarted = true
     // /clear empties `$.state` while the process keeps the selected account's environment; a
     // reload before the next turn then finds a generated bearer it can no longer attribute.
-    if (!problem && !active && await $.env.get('RICE_SESSION_ACCOUNTS_SELECTED') && !(await read($, originalsAtom).catch(() => null))) {
+    if (!problem && !active && !(await read($, originalsAtom).catch(() => null)) && await clearedWithAccount($)) {
       await enterLockout($, ACCOUNT_RECOVERY)
       $.ui.toast(ACCOUNT_RECOVERY)
     }
@@ -1078,12 +1092,20 @@ export const register: Register = on => {
     // /clear empties the state while this module keeps the account: put it
     // back, and keep a lockout and the authorization table for a later reload.
     if (local.mirror.active && !(await read($, activeAtom))) await restore($)
+    await $.store.delete(CLEAR_KEY).catch(() => {})
     if (local.transitionProblem && !(await read($, problemAtom))) await enterLockout($, local.transitionProblem)
     const table = local.authorizations.snapshot()
     if ((table.native.length > 0 || table.issued.length > 0) && !(await read($, authorizationsAtom))) await keepAuthorizations($)
     const active = local.mirror.active
     if (active && !local.transitionProblem && local.expiresAt !== undefined && local.expiresAt - EXPIRY_MARGIN_MS <= (await $.clock.now())) await renewIfActive($, active.name)
 
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' && local.mirror.active) {
+      await $.store.set(CLEAR_KEY, { name: local.mirror.active.name, at: await $.clock.now() }).catch(error => $.ui.log(`The /clear record was not kept: ${message(error)}`, { to: 'debug' }))
+    }
     return next(e)
   })
 

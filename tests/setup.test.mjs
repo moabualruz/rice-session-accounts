@@ -377,11 +377,13 @@ test('the config folder must be absolute, exist, be a folder, and not be a link 
 })
 
 test('the actual CLI exits nonzero with a useful missing-account error', () => {
-  const result = spawnSync(process.execPath, ['scripts/account-setup.mjs', '--config-dir', '/nonexistent/rice-account-fixture', 'personal'], { encoding: 'utf8' })
+  // An absolute folder that does not exist, spelled for this platform (a POSIX path is refused on Windows).
+  const missing = join(tmpdir(), 'rice-account-fixture-nonexistent', 'config')
+  const result = spawnSync(process.execPath, ['scripts/account-setup.mjs', '--config-dir', missing, 'personal'], { encoding: 'utf8' })
   assert.equal(result.status, 1)
   assert.match(result.stderr, /First run \/rice-account add/)
   assert.equal(result.stdout, '')
-  assert.equal(existsSync('/nonexistent/rice-account-fixture'), false)
+  assert.equal(existsSync(missing), false)
 })
 
 // Item 4: names. Existing accounts keep the rule they were saved under.
@@ -791,7 +793,8 @@ test('an installed PowerShell reads the PowerShell form back exactly, including 
 test('Command Prompt passes the cmd form to a program exactly', { skip: process.platform !== 'win32' && 'needs native Windows' }, () => {
   const comspec = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe')
   for (const value of QUOTING_VALUES.filter(each => !each.includes('"') && each !== '')) {
-    const line = `"${process.execPath}" -e "process.stdout.write(process.argv[1])" ${quoteCmd(value)}`
+    // `--` ends node's own options, so a value such as "-dash" reaches the script.
+    const line = `"${process.execPath}" -e "process.stdout.write(process.argv[1])" -- ${quoteCmd(value)}`
     const result = spawnSync(comspec, ['/d', '/v:off', '/s', '/c', `"${line}"`], { encoding: 'utf8', windowsVerbatimArguments: true, timeout: 20_000 })
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.stdout, value, JSON.stringify(value))

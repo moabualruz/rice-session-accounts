@@ -143,6 +143,7 @@ function fixture(on: On, options: Options = {}) {
   on('session.start', (_host, input) => ({ cwd: input.cwd }))
   on('session.authorize', () => ({ value: { handle: 'owned-native-handle', kind: 'bearer' } }))
   on('session.usage', () => ({ value: { startedAt: now, context: { window: 200_000 }, rateLimits: MACHINE_LIMITS } }))
+  on('session.end', (_host, input) => ({ sessionId: input.sessionId }))
   on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'Owned compaction summary', toolUses: [] }] }))
   on('turn.start', (_host, input) => ({ turnId: input.turnId }))
   on('turn.complete', (_host, input) => ({ text: input.answer }))
@@ -410,14 +411,24 @@ test('after /clear and a reload the selected account is not mistaken for the lau
   const world = fixture(on)
   await $.session.start(START)
   await $.command.run(command('account-b'))
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_SELECTED')).toBe('account-b')
+  // /clear: the conversation ends under a new id, the state is emptied, no session.start follows.
+  await $.session.end({ reason: 'clear', sessionId: 'owned-session-before-clear', resume: { id: 'owned-session-before-clear' } } as never)
   world.clearState()
+  // A plugin reload before the next prompt.
   await $.session.start(START)
   expect(world.status.at(-1) ?? '').toContain('account not confirmed')
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('rice-session-accounts-account-not-confirmed')
   expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe(undefined)
-  expect(world.environment.get('RICE_SESSION_ACCOUNTS_SELECTED')).toBe(undefined)
+})
+
+test('a fresh load with no /clear record, such as a child claude that inherits the environment, is not locked', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start(START)
+  await $.command.run(command('account-b'))
+  world.clearState()
+  await $.session.start(START)
+  expect(world.status.at(-1) ?? '').not.toContain('account not confirmed')
 })
 
 test('an explicit selection made while a restore is waiting is not undone by it', async ($, on) => {
