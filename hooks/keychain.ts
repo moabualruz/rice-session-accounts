@@ -1,14 +1,30 @@
 // Adapted from simplecore-inc/claude-mods mods/accounts/hooks/keychain.ts at 722763c
 // (MIT, Copyright (c) 2026 SimpleCORE Inc., see LICENSES/simplecore-claude-mods.MIT.txt).
 // Modified: macOS keychain only; Orca and file-vault helpers removed; read and write
-// helpers over Io added; `security` called by absolute path.
+// helpers over Io added; `security` called by absolute path; the `security -i` line
+// limit, error text and account-name fallback handled.
 import type { Io } from './io'
+import { runFailure, trustedRun } from './io'
 
 /** The keychain item Claude Code reads its login from, with its default config directory. */
 export const LIVE_SERVICE = 'Claude Code-credentials'
 /** `security`'s exit code for an item that is not there. */
 export const ITEM_NOT_FOUND = 44
+/** `security`'s exit code when the keychain is locked and may not ask to unlock (Claude Code 2.1.302 reads 36 the same way). */
+export const KEYCHAIN_LOCKED = 36
+/**
+ * The longest `security -i` line this module writes. `security -i` splits a
+ * line over 4095 characters into separate commands and runs the first part,
+ * so a longer `add-generic-password -U` line would replace the item with a
+ * truncated login. Claude Code 2.1.302 itself switches away from `-i` above
+ * 4032 characters; this stays below both.
+ */
+export const SECURITY_LINE_LIMIT = 4000
 const SECURITY = '/usr/bin/security'
+/** `security` is called by absolute path; a root-owned working folder keeps the project folder out of it. */
+const SECURITY_CWD = '/'
+/** Text `security` prints for a failed command; with `-i` the exit status is only the last command's. */
+const SECURITY_ERROR = /unknown command|error|fail|invalid|cannot|could not|couldn't|not allowed|denied|usage:|SecKeychain|errSec/i
 
 /** The environment variables that decide where Claude Code keeps its login. */
 export type StorageVariables = { configDir?: string; secureStorageDir?: string }
@@ -31,9 +47,45 @@ export async function liveServiceName(variables: StorageVariables, defaultConfig
   return `${LIVE_SERVICE}-${hex.slice(0, 8)}`
 }
 
-/** The keychain account Claude Code reads its login with: the user's name, or `claude-code-user` when that holds other characters. */
+const ACCOUNT_NAME = /^[a-zA-Z0-9._-]+$/
+const FALLBACK_ACCOUNT = 'claude-code-user'
+
+/**
+ * The keychain account Claude Code reads and writes its login with, for a
+ * known user name. Verified read-only against the Claude Code 2.1.302 binary
+ * (`rg -a claude-code-user` on ~/.local/share/claude/versions/2.1.302):
+ *
+ *   let e; try { e = process.env.USER || os.userInfo().username } catch { e = "claude-code-user" }
+ *   if (!/^[a-zA-Z0-9._-]+$/.test(e)) return "claude-code-user"; return e
+ *
+ * and it reads with `security find-generic-password -a <account> -w -s <service>`.
+ * So a non-empty USER is used as it is, or `claude-code-user` when it holds
+ * other characters; an unset or empty USER is NOT `claude-code-user` there but
+ * the process's login name, which `resolveKeychainAccount` looks up. Called
+ * without a name this keeps the 0.4.1 answer for compatibility.
+ */
 export function keychainAccountName(user: string | undefined): string {
-  return user && /^[a-zA-Z0-9._-]+$/.test(user) ? user : 'claude-code-user'
+  return user && ACCOUNT_NAME.test(user) ? user : FALLBACK_ACCOUNT
+}
+
+/**
+ * The keychain account as Claude Code computes it: USER when set, else the
+ * login name (`id -un`, what `os.userInfo().username` reads), each passed
+ * through `keychainAccountName`. Undefined when the login name cannot be
+ * found; reads then omit `-a` and writes use `claude-code-user`, Claude Code's
+ * own fallback when `os.userInfo()` throws.
+ */
+export async function resolveKeychainAccount(io: Io, user: string | undefined): Promise<string | undefined> {
+  if (user) return keychainAccountName(user)
+  try {
+    const ran = await io.run(['/usr/bin/id', '-un'], trustedRun(SECURITY_CWD, { timeoutMs: 10_000 }))
+    const name = ran.exitCode === 0 ? ran.stdout.trim() : ''
+    if (name) return keychainAccountName(name)
+  } catch {
+    // Unknown: the caller reads without an account.
+  }
+
+  return undefined
 }
 
 /** The OAuth credential document Claude Code stores, kept whole. */
@@ -51,6 +103,9 @@ export type Credential = {
 }
 
 export class KeychainError extends Error {}
+
+/** A write refused because its `security -i` line would be cut and a truncated login stored. */
+export class KeychainLimitError extends KeychainError {}
 
 function toHex(text: string): string {
   return Array.from(new TextEncoder().encode(text), byte => byte.toString(16).padStart(2, '0')).join('')
@@ -77,11 +132,7 @@ export function parseCredential(text: string): Credential {
   return parsed as Credential
 }
 
-/**
- * The `security -i` line that creates or replaces an item. The secret travels
- * on stdin as hex, never in argv, the way Claude Code writes its own item.
- */
-export function addLine(service: string, account: string, text: string): string {
+function commandLine(service: string, account: string, text: string): string {
   // `security -i` reads the line as a command line of its own: a quote, a backslash or a line break would end it.
   for (const value of [service, account]) {
     if (/["\\\n\r]/.test(value)) throw new KeychainError(`refused a keychain name with a quote, backslash or line break: ${JSON.stringify(value)}`)
@@ -90,19 +141,97 @@ export function addLine(service: string, account: string, text: string): string 
   return `add-generic-password -U -a "${account}" -s "${service}" -X "${toHex(text)}"\n`
 }
 
-/** An item's secret, or null when there is no such item. */
-export async function readItem(io: Io, service: string, account: string): Promise<string | null> {
-  const ran = await io.run([SECURITY, 'find-generic-password', '-s', service, '-a', account, '-w'], { timeoutMs: 15_000 })
+/** How long the `security -i` line for this item would be, newline included. */
+export function addLineLength(service: string, account: string, text: string): number {
+  return commandLine(service, account, text).length
+}
+
+/**
+ * The `security -i` line that creates or replaces an item. The secret travels
+ * on stdin as hex, never in argv, the way Claude Code writes its own item. A
+ * line over `SECURITY_LINE_LIMIT` is refused rather than cut.
+ */
+export function addLine(service: string, account: string, text: string): string {
+  const line = commandLine(service, account, text)
+  if (line.length > SECURITY_LINE_LIMIT) {
+    throw new KeychainLimitError(`refused a ${line.length}-character keychain write: security -i accepts ${SECURITY_LINE_LIMIT} here and would store a truncated login`)
+  }
+
+  return line
+}
+
+function sizeOf(value: unknown): number {
+  try { return JSON.stringify(value)?.length ?? 0 } catch { return 0 }
+}
+
+/**
+ * The text to store for a login within the `security -i` line limit. When the
+ * whole document is too long, top-level keys other than `claudeAiOauth` (for
+ * example `mcpOAuth`) are left out, largest first, until it fits; `dropped`
+ * names them. `claudeAiOauth` is never left out: a login that does not fit
+ * with it alone is refused with `KeychainLimitError`.
+ */
+export function fitCredential(credential: Credential, service: string, account: string): { text: string; dropped: string[] } {
+  const document: Record<string, unknown> = { ...credential }
+  const others = Object.keys(document).filter(key => key !== 'claudeAiOauth').sort((a, b) => sizeOf(document[b]) - sizeOf(document[a]))
+  const dropped: string[] = []
+  for (;;) {
+    const text = JSON.stringify(document)
+    const length = addLineLength(service, account, text)
+    if (length <= SECURITY_LINE_LIMIT) return { text, dropped }
+    const next = others.shift()
+    if (next === undefined) {
+      throw new KeychainLimitError(`the login needs a ${length}-character keychain line even without its optional fields, over the ${SECURITY_LINE_LIMIT}-character security -i limit`)
+    }
+    delete document[next]
+    dropped.push(next)
+  }
+}
+
+function securityProblem(error: unknown, action: string): KeychainError {
+  switch (runFailure(error)) {
+    case 'timeout':
+      return new KeychainError(`the macOS keychain did not answer within 15 seconds while trying to ${action}: a keychain prompt may be waiting, or the keychain is locked. Answer or unlock it, then retry.`)
+    case 'missing':
+    case 'denied':
+      return new KeychainError(`${SECURITY} could not be started to ${action}.`)
+    default:
+      return new KeychainError(`${SECURITY} failed to ${action}.`)
+  }
+}
+
+function lockedProblem(action: string): KeychainError {
+  return new KeychainError(`cannot ${action}: the macOS keychain is locked and cannot ask to unlock here. Unlock it (security unlock-keychain), then retry.`)
+}
+
+/** An item's secret, or null when there is no such item. Without an account, the first item of the service is read. */
+export async function readItem(io: Io, service: string, account: string | undefined): Promise<string | null> {
+  const argv = account === undefined
+    ? [SECURITY, 'find-generic-password', '-s', service, '-w']
+    : [SECURITY, 'find-generic-password', '-s', service, '-a', account, '-w']
+  const action = `read the keychain item "${service}"`
+  const ran = await io.run(argv, trustedRun(SECURITY_CWD, { timeoutMs: 15_000 }))
+    .catch((error: unknown) => { throw securityProblem(error, action) })
   if (ran.exitCode === ITEM_NOT_FOUND) return null
-  if (ran.exitCode !== 0) throw new KeychainError(`cannot read the keychain item "${service}" (security exit ${ran.exitCode})`)
+  if (ran.exitCode === KEYCHAIN_LOCKED) throw lockedProblem(action)
+  if (ran.exitCode !== 0 || ran.isStdoutTruncated) throw new KeychainError(`cannot ${action} (security exit ${ran.exitCode})`)
 
   return itemText(ran.stdout)
 }
 
-/** Creates or replaces an item; the secret goes over stdin. */
+/**
+ * Creates or replaces an item; the secret goes over stdin. `security -i`
+ * exits with its last command's status only, so error text on stderr is a
+ * failure too. stderr is never quoted: it may repeat the line.
+ */
 export async function writeItem(io: Io, service: string, account: string, text: string): Promise<void> {
-  const ran = await io.run([SECURITY, '-i'], { stdin: addLine(service, account, text), timeoutMs: 15_000 })
-  if (ran.exitCode !== 0) throw new KeychainError(`cannot write the keychain item "${service}" (security exit ${ran.exitCode})`)
+  const input = addLine(service, account, text)
+  const action = `write the keychain item "${service}"`
+  const ran = await io.run([SECURITY, '-i'], trustedRun(SECURITY_CWD, { stdin: input, timeoutMs: 15_000 }))
+    .catch((error: unknown) => { throw securityProblem(error, action) })
+  if (ran.exitCode === KEYCHAIN_LOCKED) throw lockedProblem(action)
+  if (ran.exitCode !== 0) throw new KeychainError(`cannot ${action} (security exit ${ran.exitCode})`)
+  if (SECURITY_ERROR.test(ran.stderr)) throw new KeychainError(`cannot ${action}: security reported an error`)
 }
 
 /** Whether two logins are one grant: the same refresh token, whatever access token each holds now. */

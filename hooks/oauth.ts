@@ -1,25 +1,53 @@
 // Adapted from simplecore-inc/claude-mods mods/accounts/hooks/anthropic.ts at 722763c
 // (MIT, Copyright (c) 2026 SimpleCORE Inc., see LICENSES/simplecore-claude-mods.MIT.txt).
 // Modified: kept the endpoint constants, refresh, usage and profile parsing; pane-specific
-// readings, spend and healing removed; LimitView declared here.
-import type { HttpInit } from 'claude-code'
+// readings, spend and healing removed; LimitView declared here; refresh responses and
+// token-endpoint failures validated and classified without echoing bodies.
+import type { HttpInit, HttpResponse } from 'claude-code'
 
 import type { Credential } from './keychain'
 
 export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+/** Claude Code 2.1.302's TOKEN_URL and CLIENT_ID constants, verified read-only in its binary. */
 export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 export const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const OAUTH_BETA = 'oauth-2025-04-20'
-/** Refresh this long before the access token expires. */
+/** Refresh this long before the access token expires, by the local clock; it also absorbs a few minutes of clock skew. */
 export const EXPIRY_MARGIN_MS = 5 * 60 * 1000
+/** The largest token-endpoint body parsed; a larger one is refused without being read or quoted. */
+export const MAX_TOKEN_BODY = 64 * 1024
+/** A longer `expires_in` is treated as this, so a login is still renewed in time if the value is wrong. */
+export const MAX_TOKEN_LIFETIME_S = 7 * 24 * 60 * 60
+/** The lifetime assumed when `expires_in` is missing or not a positive number: short, so the login is renewed again soon. */
+export const UNKNOWN_TOKEN_LIFETIME_S = 10 * 60
+const MAX_TOKEN_LENGTH = 16 * 1024
+/** OAuth and API error codes that may be shown; any other text of an error body is never echoed. */
+const KNOWN_ERRORS = new Set([
+  'invalid_grant', 'invalid_request', 'invalid_client', 'invalid_scope', 'unauthorized_client', 'unsupported_grant_type',
+  'invalid_request_error', 'authentication_error', 'permission_error', 'rate_limit_error', 'api_error', 'overloaded_error',
+])
 
 export class AnthropicError extends Error {
-  constructor(
-    message: string,
-    readonly status?: number,
-  ) {
+  readonly status?: number
+
+  constructor(message: string, status?: number) {
     super(message)
+    this.status = status
+  }
+}
+
+/**
+ * A successful refresh whose body cannot be used. When it still rotated the
+ * refresh token, `salvage` is the login holding that new refresh token (its
+ * access token expired), which must be saved: the old refresh token is spent.
+ */
+export class RefreshResponseError extends AnthropicError {
+  readonly salvage?: Credential
+
+  constructor(message: string, salvage?: Credential) {
+    super(message)
+    this.salvage = salvage
   }
 }
 
@@ -69,13 +97,21 @@ export function oauthInit(auth: { token: string } | { handle: string }): HttpIni
   return { headers: { 'anthropic-beta': OAUTH_BETA, Authorization: `Bearer ${auth.token}` } }
 }
 
-/** Whether a token expires within `marginMs`: refreshed before it is used. */
+/** Whether a token expires within `marginMs` of the local clock: refreshed before it is used. A login without a usable expiry is renewed. */
 export function needsRefresh(credential: Credential, now: number, marginMs = EXPIRY_MARGIN_MS): boolean {
-  return credential.claudeAiOauth.expiresAt - marginMs <= now
+  const expiresAt = credential.claudeAiOauth.expiresAt
+  return !Number.isFinite(expiresAt) || expiresAt - marginMs <= now
 }
 
+/**
+ * The refresh request Claude Code sends: grant type, refresh token, client id
+ * and the login's scopes. A login without scopes omits `scope`, which keeps
+ * the scopes originally granted (RFC 6749 section 6); an empty `scope` would
+ * ask for none.
+ */
 export function refreshInit(credential: Credential): HttpInit {
   const oauth = credential.claudeAiOauth
+  const scopes = Array.isArray(oauth.scopes) ? oauth.scopes.filter(scope => typeof scope === 'string' && scope !== '') : []
 
   return {
     method: 'POST',
@@ -84,30 +120,108 @@ export function refreshInit(credential: Credential): HttpInit {
       grant_type: 'refresh_token',
       refresh_token: oauth.refreshToken,
       client_id: CLIENT_ID,
-      scope: (oauth.scopes ?? []).join(' '),
+      ...(scopes.length > 0 ? { scope: scopes.join(' ') } : {}),
     }),
   }
 }
 
-/** The credential after a refresh; the server rotates the refresh token, so it must be saved. */
+function isToken(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_TOKEN_LENGTH && !/[\s\u0000-\u001f\u007f]/.test(value)
+}
+
+function lifetimeOf(value: unknown): number {
+  const seconds = typeof value === 'number' ? value : typeof value === 'string' && /^\d{1,10}$/.test(value) ? Number(value) : Number.NaN
+  if (!Number.isFinite(seconds) || seconds <= 0) return UNKNOWN_TOKEN_LIFETIME_S
+
+  return Math.min(seconds, MAX_TOKEN_LIFETIME_S)
+}
+
+/**
+ * The credential after a refresh; the server rotates the refresh token, so it
+ * must be saved. An absent `refresh_token` means the server did not rotate it
+ * and the current one stays. A missing, negative or non-numeric `expires_in`
+ * counts as ten minutes, and one over seven days as seven days. Errors never
+ * quote the body: it carries grants.
+ */
 export function applyRefresh(credential: Credential, responseText: string, now: number): Credential {
-  let body: { access_token?: string; refresh_token?: string; expires_in?: number } | null
+  if (responseText.length > MAX_TOKEN_BODY) throw new RefreshResponseError('the token refresh returned an oversized response')
+  let body: unknown
   // A JSON syntax error quotes the text it read, and this response carries grants.
-  try { body = JSON.parse(responseText) as typeof body } catch { throw new AnthropicError('the token refresh returned an unreadable response') }
-  if (typeof body?.access_token !== 'string' || typeof body.expires_in !== 'number') {
-    throw new AnthropicError('the token refresh returned no access token')
-  }
+  try { body = JSON.parse(responseText) } catch { throw new RefreshResponseError('the token refresh returned an unreadable response') }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new RefreshResponseError('the token refresh returned an unreadable response')
+  const fields = body as Record<string, unknown>
   const oauth = credential.claudeAiOauth
+  const refreshToken = fields.refresh_token
+  const rotated = isToken(refreshToken) ? refreshToken : undefined
+  const accessToken = fields.access_token
+  if (!isToken(accessToken)) {
+    const salvage = rotated !== undefined && rotated !== oauth.refreshToken
+      ? { ...credential, claudeAiOauth: { ...oauth, refreshToken: rotated, expiresAt: 0 } }
+      : undefined
+    throw new RefreshResponseError('the token refresh returned no access token', salvage)
+  }
 
   return {
     ...credential,
     claudeAiOauth: {
       ...oauth,
-      accessToken: body.access_token,
-      refreshToken: body.refresh_token ?? oauth.refreshToken,
-      expiresAt: now + body.expires_in * 1000,
+      accessToken,
+      refreshToken: rotated ?? oauth.refreshToken,
+      expiresAt: now + lifetimeOf(fields.expires_in) * 1000,
     },
   }
+}
+
+/** The error code of a token-endpoint error body, only when it is a known code; the body itself is never returned. */
+export function tokenErrorCode(text: string): string | undefined {
+  if (text.length > MAX_TOKEN_BODY) return undefined
+  try {
+    const body: unknown = JSON.parse(text)
+    const error = (body as { error?: unknown } | null)?.error
+    const code = typeof error === 'string' ? error : (error as { type?: unknown } | null | undefined)?.type
+    return typeof code === 'string' && KNOWN_ERRORS.has(code) ? code : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function retryAfterSeconds(headers: Record<string, string> | undefined): number | undefined {
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    if (name.toLowerCase() === 'retry-after' && /^\d{1,6}$/.test(value.trim())) return Number(value.trim())
+  }
+
+  return undefined
+}
+
+/**
+ * Why the token endpoint refused a renewal, for the account `name`. Only
+ * `invalid_grant` means the login itself is gone and must be signed in again;
+ * rate limits and server failures keep the saved login for a retry. The body
+ * is never echoed, only a known error code.
+ */
+export function refreshFailure(name: string, response: Pick<HttpResponse, 'status' | 'text'> & { headers?: Record<string, string> }): AnthropicError {
+  const { status } = response
+  const code = tokenErrorCode(response.text)
+  if (code === 'invalid_grant') {
+    return new AnthropicError(`the ${name} login was revoked or has expired (HTTP ${status}, invalid_grant); sign it in again: /rice-account setup ${name}`, status)
+  }
+  if (status === 429) {
+    const wait = retryAfterSeconds(response.headers)
+    return new AnthropicError(`the Anthropic sign-in service is rate limiting renewals (HTTP 429); the saved ${name} login was kept, retry ${wait === undefined ? 'in a few minutes' : `in ${wait} seconds`}`, status)
+  }
+  if (status >= 500) {
+    return new AnthropicError(`the Anthropic sign-in service failed (HTTP ${status}); the saved ${name} login was kept, retry later`, status)
+  }
+
+  return new AnthropicError(`the token endpoint refused to renew the ${name} login (HTTP ${status}${code ? `, ${code}` : ''}); the saved login was kept. Retry, and update Rice Accounts if this persists`, status)
+}
+
+/** A short, secret-free reason a token request could not be sent: its error code or kind, never its text. */
+export function networkProblem(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  if (/timed? ?out|ETIMEDOUT|still running after/i.test(text)) return 'the request timed out'
+  const code = /\b(E[A-Z]{3,}|UND_ERR_[A-Z_]+|CERT_[A-Z_]+)\b/.exec(text)?.[1]
+  return code ? `the network request failed (${code})` : 'the network request failed'
 }
 
 /** Whose a token is, as the profile endpoint answers. */
