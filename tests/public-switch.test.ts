@@ -105,7 +105,9 @@ function fixture(on: On) {
   on('fs.list', () => ({ value: [] }))
   on('process.run', (_host, e) => {
     processes.push(e.argv)
-    const text = e.argv[0] === 'node' && e.argv[3] === 'read' ? documents.get(e.argv[4] ?? '') : undefined
+    const text = e.argv[0] === 'node' && (e.argv[3] === 'read' || e.argv[3] === 'examine') ? documents.get(e.argv[4] ?? '') : undefined
+    // `examine` reports a missing store as null; `read` as exit 44.
+    if (e.argv[0] === 'node' && e.argv[3] === 'examine') return { value: { exitCode: 0, stdout: JSON.stringify({ stored: text === undefined ? null : JSON.parse(text), pending: null }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const stdout = e.argv[0] === '/usr/bin/uname' ? 'Linux\n' : text ?? ''
     return { value: { exitCode: stdout ? 0 : 44, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })

@@ -1,12 +1,12 @@
 import type { AccountConfig, Paths } from './config'
-import { checkRenewable, hasUnsavedLogin, inspectLogin, promoteLogin, readLogin, readSecret, saveRenewal } from './credentials'
+import { checkRenewable, inspectLogin, promoteLogin, readLogin, readSecret, saveRenewal } from './credentials'
 import type { LoginLocation } from './credentials'
 import type { Io } from './io'
 import { message } from './io'
 import { isSameGrant } from './keychain'
 import type { Credential, StorageVariables } from './keychain'
-import { LockLostError, withLock } from './lock'
-import type { Lock } from './lock'
+import { LockBusyError, LockLostError, withLock } from './lock'
+import type { Lock, LockOptions } from './lock'
 import { AnthropicError, applyRefresh, needsRefresh, networkProblem, RefreshResponseError, refreshFailure, refreshInit, TOKEN_URL } from './oauth'
 
 /** Where Claude Code keeps this machine's own login. */
@@ -20,12 +20,22 @@ export type Material = { secret?: string; expiresAt?: number }
  * token request, a keychain re-read, a 15 s write and a read-back, so a lock
  * is taken as abandoned only after 150 s. The holder renews its time
  * (heartbeat) before the token request, every `LOCK_HEARTBEAT_MS` while the
- * request is pending, and before the write.
+ * request is pending (for at most `LOCK_HEARTBEAT_LIMIT_MS`), and after the
+ * renewal is written ahead, before the store write.
  */
 export const RENEWAL_LOCK = { staleMs: 150_000, tries: 20 } as const
 
 /** How often the renewal lock is renewed while the token request is pending: well inside its stale time. */
 export const LOCK_HEARTBEAT_MS = 45_000
+
+/**
+ * How long a pending token request keeps the lock. A connection that went
+ * silent (half-open after a network change) never answers; past this the lock
+ * is left to go stale so other sessions are not locked out for hours. The
+ * request is still awaited, and its answer saved: the compare-and-swap and the
+ * rotation make a takeover in the meantime safe.
+ */
+export const LOCK_HEARTBEAT_LIMIT_MS = 10 * 60_000
 
 /** The secret, and when it expires for a login that does, read from its platform store. */
 export async function materialFor(io: Io, name: string, account: AccountConfig, paths: Paths, machine: Machine): Promise<Material> {
@@ -70,8 +80,9 @@ type TokenResponse = Awaited<ReturnType<Io['fetch']>>
  * The token request, renewing the lock every `LOCK_HEARTBEAT_MS` while it is
  * pending. The request itself is never timed out: the server may already have
  * rotated the refresh token, and that answer must be saved. After it settles,
- * heartbeat failures are ignored; a lock taken over meanwhile is reported in
- * `lockLost`, and the answer is still returned for saving.
+ * heartbeat failures are ignored; a lock taken over meanwhile, or no longer
+ * renewed because the request outlasted `LOCK_HEARTBEAT_LIMIT_MS`, is reported
+ * in `lockLost`, and the answer is still returned for saving.
  */
 async function requestKeepingLock(io: Io, lock: Lock, name: string, current: Credential): Promise<{ response: TokenResponse; lockLost: boolean }> {
   let request: Promise<TokenResponse>
@@ -85,13 +96,18 @@ async function requestKeepingLock(io: Io, lock: Lock, name: string, current: Cre
   const done = request.then(() => { settled = true }, () => { settled = true })
   let lockLost = false
   const keeping = (async () => {
-    for (;;) {
+    for (let beat = 0; ; beat += 1) {
       try {
         await Promise.race([io.sleep(LOCK_HEARTBEAT_MS), done])
       } catch {
         return
       }
       if (settled) return
+      if ((beat + 1) * LOCK_HEARTBEAT_MS > LOCK_HEARTBEAT_LIMIT_MS) {
+        lockLost = true
+        io.log(`the ${name} token request has been pending for ${Math.round(LOCK_HEARTBEAT_LIMIT_MS / 60_000)} minutes; its renewal lock is no longer renewed, and the answer is still saved if one arrives`)
+        return
+      }
       try {
         await lock.heartbeat()
       } catch (error) {
@@ -141,11 +157,25 @@ export async function freshLogin(io: Io, name: string, account: AccountConfig, p
     user: machine.user,
   }
   const signedOut = () => new Error(`${name} is not signed in yet: /rice-account setup ${name}`)
-  const first = await readLogin(io, location)
-  if (first === null) throw signedOut()
-  if (!needsRefresh(first, await io.now()) && !(await hasUnsavedLogin(io, location))) return first
+  // Read only. A saved login that does not expire soon is answered without the lock.
+  const first = await inspectLogin(io, location)
+  if (first.login === null) throw signedOut()
+  const usable = !needsRefresh(first.login, await io.now())
+  if (usable && first.source === 'store') return first.login
+  // A renewal kept unsaved (a failed store write, or before a plugin reload) works as it is, and is saved when the lock is free.
+  const options = { ...RENEWAL_LOCK, cwd: machine.claudeDir, ...(usable ? { tries: 1 } : {}) }
+  try {
+    return await renewing(io, name, location, paths, machine, options)
+  } catch (error) {
+    if (usable && error instanceof LockBusyError) return first.login
+    throw error
+  }
+}
 
-  return withLock(io, paths.lock(name), { ...RENEWAL_LOCK, cwd: machine.claudeDir }, async lock => {
+async function renewing(io: Io, name: string, location: LoginLocation, paths: Paths, machine: Machine, options: LockOptions): Promise<Credential> {
+  const signedOut = () => new Error(`${name} is not signed in yet: /rice-account setup ${name}`)
+
+  return withLock(io, paths.lock(name), options, async lock => {
     const state = await inspectLogin(io, location)
     const current = state.login
     if (current === null) throw signedOut()
@@ -160,6 +190,10 @@ export async function freshLogin(io: Io, name: string, account: AccountConfig, p
       throw new Error(`Cannot keep the ${name} renewal lock (${message(error)}); this session made no token request. Retry the account switch.`)
     }
     const { response, lockLost } = await requestKeepingLock(io, lock, name, current)
+    // The refresh token is spent once the answer arrives: the lock is extended after the renewal is written ahead (a failure only logged; the store write checks the grant).
+    const extend = async (): Promise<void> => {
+      if (!lockLost) await lock.heartbeat().catch((error: unknown) => io.log(`the ${name} renewal lock heartbeat failed before saving: ${message(error)}`))
+    }
     if (!response.ok) throw refreshFailure(name, response)
     let fresh: Credential
     try {
@@ -168,7 +202,7 @@ export async function freshLogin(io: Io, name: string, account: AccountConfig, p
       // The response may still have rotated the refresh token: save that before reporting.
       if (error instanceof RefreshResponseError && error.salvage) {
         try {
-          await saveRenewal(io, location, error.salvage, state)
+          await saveRenewal(io, location, error.salvage, state, extend)
         } catch (saving) {
           throw new AnthropicError(`the ${name} renewal returned no usable access token. ${message(saving)}`)
         }
@@ -176,10 +210,8 @@ export async function freshLogin(io: Io, name: string, account: AccountConfig, p
       }
       throw new AnthropicError(`the ${name} login could not be renewed: ${message(error)}; retry, and if this repeats sign it in again: /rice-account setup ${name}`)
     }
-    // The refresh token is spent now: write even when the heartbeat fails (the store write checks the grant).
-    if (!lockLost) await lock.heartbeat().catch((error: unknown) => io.log(`the ${name} renewal lock heartbeat failed before saving: ${message(error)}`))
-    const saved = await saveRenewal(io, location, fresh, state)
-    io.log(lockLost ? `renewed the ${name} login; its renewal lock was taken over meanwhile, so this session starts no other renewal` : `renewed the ${name} login`)
+    const saved = await saveRenewal(io, location, fresh, state, extend)
+    io.log(lockLost ? `renewed the ${name} login; its renewal lock was no longer held meanwhile, so this session starts no other renewal` : `renewed the ${name} login`)
 
     return saved
   })

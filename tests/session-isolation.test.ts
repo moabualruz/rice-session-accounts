@@ -104,7 +104,7 @@ function fixture(on: On) {
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {
       return { value: { exitCode: 0, stdout: 'Linux\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && input.argv[3] === 'read') {
+    if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && (input.argv[3] === 'read' || input.argv[3] === 'examine')) {
       const path = input.argv[4] ?? ''
       processReads.push(path)
       if (heldRead?.path === path) {
@@ -114,6 +114,8 @@ function fixture(on: On) {
         await held.wait
       }
       const text = documents.get(path)
+      // `examine` reports a missing store as null; `read` as exit 44.
+      if (input.argv[3] === 'examine') return { value: { exitCode: 0, stdout: JSON.stringify({ stored: text === undefined ? null : JSON.parse(text), pending: null }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return { value: { exitCode: text === undefined ? 44 : 0, stdout: text ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     writes.push(`unexpected-process:${input.argv[0] ?? ''}`)

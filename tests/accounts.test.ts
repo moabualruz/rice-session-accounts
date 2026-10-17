@@ -1,7 +1,7 @@
 import type { ProcessRunInit } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-import { freshLogin, LOCK_HEARTBEAT_MS, RENEWAL_LOCK } from '../hooks/accounts'
+import { freshLogin, LOCK_HEARTBEAT_LIMIT_MS, LOCK_HEARTBEAT_MS, RENEWAL_LOCK } from '../hooks/accounts'
 import { pathsFor } from '../hooks/config'
 import { bestLogin, forgetHostPlatform, forgetUnsavedLogins, hasUnsavedLogin, hostPlatform, nativeCredentialPath, parsePendingLogin, pendingState, readLogin, readSecret, writeLogin } from '../hooks/credentials'
 import type { LoginLocation, PendingLogin } from '../hooks/credentials'
@@ -81,6 +81,9 @@ test('a Linux isolated login reads the native credential file without launching 
       }
       if (argv[0] === 'node' && argv[3] === 'read' && argv[4] === `${folder}/.credentials.json`) {
         return { exitCode: 0, stdout: JSON.stringify(document), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      }
+      if (argv[0] === 'node' && argv[3] === 'examine' && argv[4] === `${folder}/.credentials.json`) {
+        return { exitCode: 0, stdout: JSON.stringify({ stored: document, pending: null }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
       }
       throw new Error(`unexpected executable on Linux: ${argv[0]}`)
     },
@@ -346,10 +349,13 @@ function nativeProgram(state: LinuxState, operation: string, stdin: string | und
       state.stored = withGrant(state.stored, input.oauth)
       return result(JSON.stringify(state.stored))
     }
+    case 'readpending':
+      if (state.readOnly) return result('', 44)
+      return result(JSON.stringify({ pending }))
     case 'clearpending': {
       if (state.readOnly) return result('', 44)
-      const input = JSON.parse(stdin ?? '{}') as { base: string }
-      if (pending?.base === input.base) state.pending = undefined
+      const input = JSON.parse(stdin ?? '{}') as { base: string; tokens: string[] }
+      if (pending?.base === input.base && input.tokens.includes(pending.credential.claudeAiOauth.refreshToken)) state.pending = undefined
       return result()
     }
     default:
@@ -414,9 +420,11 @@ test('freshLogin renews an isolated Linux grant: written ahead with the stored t
   expect(JSON.parse(state.pendings[0] ?? '{}')).toEqual({ base: 'fixture-refresh', credential: { claudeAiOauth: grant } })
   expect(state.pending).toBe(undefined)
   const cleared = world.calls.find(call => call.argv[3] === 'clearpending')
-  expect(JSON.parse(cleared?.init?.stdin ?? '{}')).toEqual({ base: 'fixture-refresh' })
+  // Only the renewal's own tokens clear a pending file: the one it spent and the one it saved.
+  expect(JSON.parse(cleared?.init?.stdin ?? '{}')).toEqual({ base: 'fixture-refresh', tokens: ['fixture-refresh', 'rotated-grant'] })
   // A plain read, the inspection under the lock, heartbeats before the token request and before the write.
-  expect(state.order).toEqual(['read', 'examine', 'touch', 'fetch', 'touch', 'pending', 'write', 'clearpending'])
+  // A saved login is inspected without the lock, then again under it; the lock is extended before the request and after the write-ahead.
+  expect(state.order).toEqual(['examine', 'examine', 'touch', 'fetch', 'pending', 'touch', 'write', 'clearpending'])
   expect(world.calls.some(call => call.argv.includes('rotated-access') || call.argv.includes('rotated-grant'))).toBe(false)
   expect(world.calls.some(call => call.argv[0] === '/usr/bin/security')).toBe(false)
   for (const call of world.calls) {
@@ -425,14 +433,13 @@ test('freshLogin renews an isolated Linux grant: written ahead with the stored t
   }
 })
 
-test('a program runner that answers only read and write (an earlier host or fixture) still renews through the store', async () => {
+test('a program runner that cannot examine the store refuses to renew: no guess, no token request', async () => {
   const state = linuxState({ readOnly: true })
   const world = linuxWorld(state)
-  const saved = await renew(world.io)
-  expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
-  expect(state.stored?.claudeAiOauth.refreshToken).toBe('rotated-grant')
-  expect(JSON.parse(state.writes[0] ?? '{}').expectedRefreshToken).toBe('fixture-refresh')
-  expect(state.order).toEqual(['read', 'examine', 'read', 'touch', 'fetch', 'touch', 'pending', 'write', 'clearpending'])
+  expect(await errorOf(() => renew(world.io))).toContain('disappeared while the login was renewed')
+  expect(world.requests()).toBe(0)
+  expect(state.order).toEqual(['examine'])
+  expect(state.writes).toEqual([])
 })
 
 test('a renewal whose store write fails keeps the new login in a pending file and memory, then saves it on the next use', async () => {
@@ -609,6 +616,81 @@ test('a compare-and-swap mismatch keeps a pending renewal that is usable against
   expect(await hasUnsavedLogin(world.io, LOCATION)).toBe(false)
 })
 
+test('a stalled session that saves its older renewal after a newer one began does not cost the newer login', async () => {
+  // Session A renewed B to X and wrote {B, X} ahead, then stalled before its store write. Session C found {B, X},
+  // renewed X to Y and wrote {B, Y}. A wakes: it saves X (the store held B), then clears only the pending file it owns.
+  const stalled = { accessToken: 'stalled-access', refreshToken: 'stalled-grant', expiresAt: 1 }
+  const state = linuxState({ pending: pendingText('fixture-refresh', stalled) })
+  const world = linuxWorld(state)
+  const run = world.io.run
+  let woke = false
+  let clearedByStalled: string | undefined
+  world.io.run = async (argv, init) => {
+    if (!woke && argv[3] === 'write') {
+      woke = true
+      state.stored = withGrant(state.stored as Credential, stalled)
+      nativeProgram(state, 'clearpending', JSON.stringify({ base: 'fixture-refresh', tokens: ['fixture-refresh', 'stalled-grant'] }))
+      clearedByStalled = state.pending
+    }
+    return run(argv, init)
+  }
+  const saved = await renew(world.io)
+  expect(world.sent).toEqual(['stalled-grant'])
+  expect(parsePendingLogin(clearedByStalled ?? '')?.credential.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(state.stored?.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(state.pending).toBe(undefined)
+  expect(world.logs.some(line => line.includes('saving the newer one over it'))).toBe(true)
+  // The second store write compared against the older renewal the stalled session had saved.
+  expect(state.writes.map(text => (JSON.parse(text) as { expectedRefreshToken: string }).expectedRefreshToken)).toEqual(['fixture-refresh', 'stalled-grant'])
+  expect(await hasUnsavedLogin(world.io, LOCATION)).toBe(false)
+})
+
+test('a store that cannot be read still answers with the newest renewal: a later pending renewal beats the one in memory', async () => {
+  const state = linuxState({ writeExit: 48 })
+  const world = linuxWorld(state)
+  await errorOf(() => renew(world.io))
+  const run = world.io.run
+  world.io.run = async (argv, init) => argv[3] === 'examine' ? result('', 46) : run(argv, init)
+  expect((await readLogin(world.io, LOCATION))?.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  // Another session renewed further under the same base while this one's store was unreadable.
+  state.pending = pendingText('fixture-refresh', { accessToken: 'later-access', refreshToken: 'later-grant', expiresAt: 9_000_000 })
+  expect((await readLogin(world.io, LOCATION))?.claudeAiOauth.refreshToken).toBe('later-grant')
+  // A pending file with another base is not on this chain.
+  state.pending = pendingText('someone-else', { accessToken: 'foreign-access', refreshToken: 'foreign-grant', expiresAt: 9_000_000 })
+  expect((await readLogin(world.io, LOCATION))?.claudeAiOauth.refreshToken).toBe('later-grant')
+  // The memory now holds the later renewal and the ones it descends from.
+  state.pending = undefined
+  expect((await readLogin(world.io, LOCATION))?.claudeAiOauth.refreshToken).toBe('later-grant')
+})
+
+test('after a plugin reload an unsaved renewal is saved when the lock is free, and used as it is when another session holds the lock', async () => {
+  const state = linuxState({ writeExit: 48 })
+  const world = linuxWorld(state)
+  await errorOf(() => renew(world.io))
+  forgetUnsavedLogins()
+  state.writeExit = undefined
+  // The lock is held by another session: no wait, no token request, the kept renewal is used.
+  const run = world.io.run
+  world.io.run = async (argv, init) => argv[0] === '/bin/sh' && String(argv[2]).includes('mkdir') ? result('', 1, 'mkdir: File exists') : run(argv, init)
+  world.io.stat = async () => ({ kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
+  const used = await renew(world.io)
+  expect(used.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(state.stored?.claudeAiOauth.refreshToken).toBe('fixture-refresh')
+  expect(world.requests()).toBe(1)
+  // The lock is free: the renewal is saved without another token request.
+  world.io.run = run
+  const saved = await renew(world.io)
+  expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(state.stored?.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(state.pending).toBe(undefined)
+  expect(world.requests()).toBe(1)
+  // Saved, it is answered without the lock.
+  const before = state.order.length
+  await renew(world.io)
+  expect(state.order.slice(before)).toEqual(['examine'])
+})
+
 test('a lock taken over before the token request stops the renewal without spending the refresh token', async () => {
   const state = linuxState()
   const world = linuxWorld(state)
@@ -640,7 +722,7 @@ test('the renewal lock is renewed every 45 seconds while the token request hangs
   expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
   expect(pauses).toEqual([LOCK_HEARTBEAT_MS, LOCK_HEARTBEAT_MS, LOCK_HEARTBEAT_MS])
   expect(LOCK_HEARTBEAT_MS * 3).toBeLessThan(RENEWAL_LOCK.staleMs)
-  expect(state.order).toEqual(['read', 'examine', 'touch', 'fetch', 'touch', 'touch', 'touch', 'pending', 'write', 'clearpending'])
+  expect(state.order).toEqual(['examine', 'examine', 'touch', 'fetch', 'touch', 'touch', 'pending', 'touch', 'write', 'clearpending'])
 })
 
 test('a lock taken over while the token request hangs still saves what the server returned, and starts nothing else', async () => {
@@ -663,10 +745,36 @@ test('a lock taken over while the token request hangs still saves what the serve
   const saved = await renew(world.io)
   expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
   expect(state.stored?.claudeAiOauth.refreshToken).toBe('rotated-grant')
-  expect(state.order).toEqual(['read', 'examine', 'touch', 'fetch', 'pending', 'write', 'clearpending'])
+  expect(state.order).toEqual(['examine', 'examine', 'touch', 'fetch', 'pending', 'write', 'clearpending'])
   expect(world.logs.some(line => line.includes('took over'))).toBe(true)
   // The lock is now the other session's: it is not removed.
   expect(world.calls.some(call => String(call.argv[2]).includes('rmdir'))).toBe(false)
+})
+
+test('the lock stops being renewed after 10 minutes of a hanging token request, and the answer that arrives is still saved', async () => {
+  const state = linuxState()
+  const world = linuxWorld(state)
+  const pauses: number[] = []
+  let answer: (() => void) | undefined
+  world.io.fetch = () => new Promise<Response>(resolve => {
+    state.order.push('fetch')
+    answer = () => resolve({ ok: true, status: 200, headers: {}, text: ROTATION })
+  })
+  world.io.sleep = async ms => { pauses.push(ms) }
+  const log = world.io.log
+  world.io.log = text => {
+    log(text)
+    if (text.includes('is no longer renewed')) answer?.()
+  }
+  const saved = await renew(world.io)
+  expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  // One heartbeat before the request and one per pause inside the limit; none after it, and none before the store write.
+  const beats = Math.floor(LOCK_HEARTBEAT_LIMIT_MS / LOCK_HEARTBEAT_MS)
+  expect(state.order.filter(operation => operation === 'touch').length).toBe(1 + beats)
+  expect(pauses.length).toBe(beats + 1)
+  expect(state.order.slice(-3)).toEqual(['pending', 'write', 'clearpending'])
+  expect(world.logs.some(line => line.includes('no longer held meanwhile'))).toBe(true)
+  expect(state.stored?.claudeAiOauth.refreshToken).toBe('rotated-grant')
 })
 
 test('the renewal lock is stale only after 150 seconds', async () => {
@@ -742,6 +850,28 @@ test('a failed stat right after taking the lock is asked again at once, and a lo
   expect(await errorOf(() => old.heartbeat())).toContain('taken over')
   await old.release()
   expect(unknown.commands).toEqual(['make', 'touch', 'remove', 'make'])
+})
+
+test('a stat that fails while the lock is held is not a takeover: the youth rule decides, and an old unknown time is', async () => {
+  const held = lockWorld()
+  let failing = false
+  held.io.stat = async () => {
+    if (failing) throw new Error('EIO: fixture stat failure')
+    return { kind: 'dir', size: 0, mtimeMs: 7, isLink: false }
+  }
+  let clock = 1_000
+  held.io.now = async () => clock
+  const lock = await acquire(held.io, '/locks/personal.lock', RENEWAL_LOCK)
+  failing = true
+  // The time was known when the lock was made; three failed stats now do not lose the lock.
+  clock += 60_000
+  await lock.heartbeat()
+  clock += 60_000
+  await lock.heartbeat()
+  expect(held.commands).toEqual(['make', 'touch', 'touch'])
+  // Left unrenewed past half the stale time while the time stays unknown, another session may own it.
+  clock += RENEWAL_LOCK.staleMs / 2
+  expect(await errorOf(() => lock.heartbeat())).toContain('taken over')
 })
 
 test('a lock released between a failed mkdir and its stat is taken on the next try; one that cannot be made says why', async () => {
@@ -1016,6 +1146,22 @@ test('macOS re-reads the item before writing and keeps another session\'s grant,
   expect(world.state.lines).toEqual([])
   expect(world.state.pending).toBe(undefined)
   expect(world.state.removed).toEqual([MAC_PENDING])
+})
+
+test('macOS clears only the pending file this renewal owns: a later renewal by another session under the same base stays', async () => {
+  const world = await macWorld(macExpired)
+  const theirs = pendingText('fixture-refresh', { accessToken: 'later-access', refreshToken: 'later-grant', expiresAt: 9_000_000 })
+  const run = world.io.run
+  world.io.run = async (argv, init) => {
+    const ran = await run(argv, init)
+    // Another session wrote its later renewal after this one's write-ahead.
+    if (argv[0] === '/usr/bin/security' && argv[1] === '-i') world.state.pending = theirs
+    return ran
+  }
+  const saved = await renewMac(world.io)
+  expect(saved.claudeAiOauth.refreshToken).toBe('rotated-grant')
+  expect(world.state.removed).toEqual([])
+  expect(world.state.pending).toBe(theirs)
 })
 
 test('security -i error text is a failed write: the renewal is kept in the pending file and used by later reads', async () => {

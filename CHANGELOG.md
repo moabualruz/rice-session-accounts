@@ -27,8 +27,13 @@ rewritten, failures are visible and closed, and a renewed login is never lost.
   login. Windows renames are retried; leftovers from killed writes are recovered.
 - macOS: a login too large for `security -i` is reduced (optional keys only) and
   refused before the token is spent, never truncated.
-- The renewal lock stays valid for a slow renewal (heartbeat, 150 s) and macOS
-  re-reads before writing.
+- The renewal lock stays valid for a slow renewal (heartbeat, 150 s, for at most
+  10 minutes of a hanging request) and macOS re-reads before writing.
+- A pending renewal is adopted only while the store still holds the login it
+  continues, and removed only by the renewal that wrote it, so a session that
+  stalls mid-renewal cannot cost a newer login. An unsaved renewal is saved
+  again after a plugin reload when the lock is free, and found even while the
+  store cannot be read.
 - Reload safety: the unconfirmed-account lockout and the observed authorization
   handles survive plugin reload and `/clear`; a failed restore now locks the
   session instead of reporting the machine login while using another account.

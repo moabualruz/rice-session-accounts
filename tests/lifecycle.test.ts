@@ -107,6 +107,11 @@ function fixture(on: On, options: Options = {}) {
       const text = documents.get(path)
       return text === undefined ? answer(44) : text === 'unreadable' ? answer(46) : answer(0, text)
     }
+    // `examine` reports a missing store as null.
+    if (program === 'node' && operation === 'examine') {
+      const text = documents.get(path)
+      return text === 'unreadable' ? answer(46) : answer(0, JSON.stringify({ stored: text === undefined ? null : JSON.parse(text), pending: null }))
+    }
     if (program === 'node' && operation === 'write') {
       const current = JSON.parse(documents.get(path) ?? '{}') as { claudeAiOauth: Record<string, unknown> }
       const request = JSON.parse(input.init?.stdin ?? '{}') as { expectedRefreshToken: string; oauth: Record<string, unknown> }

@@ -192,9 +192,19 @@ file (and kept in memory), then saved, then the file is removed. If saving fails
 (antivirus holding the file, full disk, locked keychain) the file is kept and is
 saved on the next use. The file records which stored login it continues, so it is
 only ever adopted when the store still holds that login; reading never changes
-anything, and only a renewal (under its lock) promotes or removes a pending file.
-On macOS a login too large for the keychain's line limit is stored without
-optional keys such as `mcpOAuth`; it is never truncated.
+anything, and only a renewal (under its lock) promotes or removes a pending file,
+and removes only one it wrote itself. So a session that stalls between its
+write-ahead and its save cannot cost a newer login: the newer renewal is saved
+over it. A renewal kept unsaved is saved again after a plugin reload as soon as
+the renewal lock is free. On macOS a login too large for the keychain's line
+limit is stored without optional keys such as `mcpOAuth`; it is never truncated.
+
+Limits of that guarantee: the macOS keychain has no atomic compare-and-swap, so
+a sign-in that finishes within milliseconds of a renewal of the same account can
+be overwritten (sign it in again); a token request that hangs for more than 10
+minutes stops renewing the lock (its answer is still saved if one arrives); and
+a power loss right after a renewal can lose the write-ahead copy, because macOS
+`fsync` does not flush to the physical disk.
 
 On WSL a config folder under `/mnt/c/...` cannot be made private (Windows drives
 ignore Unix modes); setup warns and recommends a Linux-side folder.

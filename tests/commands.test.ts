@@ -59,6 +59,10 @@ function fixture(on: On, initial?: Config, variables: Record<string, string> = {
       && input.argv[4] === '/fixture/separate-existing-login/.credentials.json') {
       return { value: { exitCode: 44, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && input.argv[3] === 'examine'
+      && input.argv[4] === '/fixture/separate-existing-login/.credentials.json') {
+      return { value: { exitCode: 0, stdout: '{"stored":null,"pending":null}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     return { value: { exitCode: 127, stdout: '', stderr: 'No credential executables in this Linux fixture', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('process.spawn', async function* () { throw new Error('The command fixture must not start a process') })

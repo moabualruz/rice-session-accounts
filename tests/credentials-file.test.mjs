@@ -185,7 +185,7 @@ test('rule B in the program: only a pending renewal based on the stored refresh 
   }
 }))
 
-test('a store write never touches the pending file; clearpending removes it only for its own base, and nothing else', () => fixture(({ folder, file, run }) => {
+test('a store write never touches the pending file; clearpending removes it only for its own base and owner, and nothing else', () => fixture(({ folder, file, run }) => {
   fs.writeFileSync(file, JSON.stringify(login), { mode: 0o600 })
   writeJson(`${file}.rice-pending`, pendingDocument('fixture-refresh', fresh))
   const leftover = `${file}.rice-4243-00112233445566778899aabbccddeeff`
@@ -195,16 +195,36 @@ test('a store write never touches the pending file; clearpending removes it only
   assert.equal(fs.existsSync(`${file}.rice-pending`), true, 'the pending file outlives the store write until it is cleared')
   writeJson(leftover, '{"fixture-partial')
   ageFile(leftover)
-  const other = run('clearpending', { base: 'fixture-unrelated-refresh' })
+  const other = run('clearpending', { base: 'fixture-unrelated-refresh', tokens: [fresh.refreshToken] })
   assert.equal(other.status, 0)
   assert.equal(other.stdout, '')
   assert.equal(fs.existsSync(`${file}.rice-pending`), true, 'another base leaves the pending file')
-  assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 0)
+  // Another session's later renewal under the same base is not this renewal's to remove.
+  assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: ['fixture-refresh', 'fixture-other-session'] }).status, 0)
+  assert.equal(fs.existsSync(`${file}.rice-pending`), true, 'a pending renewal this caller does not own stays')
+  assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: [] }).status, 0)
+  assert.equal(fs.existsSync(`${file}.rice-pending`), true, 'no owned token removes nothing')
+  assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: ['fixture-refresh', fresh.refreshToken] }).status, 0)
   assert.equal(fs.existsSync(`${file}.rice-pending`), false)
   assert.equal(fs.existsSync(leftover), true, 'clearpending removes only the pending file')
-  assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 0, 'nothing to clear is not an error')
+  assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: [fresh.refreshToken] }).status, 0, 'nothing to clear is not an error')
   assert.equal(run('clearpending', {}).status, 46)
+  assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 46, 'the owned tokens are required')
   assert.deepEqual(readJson(file), storeWith(fresh))
+}))
+
+test('readpending prints the pending renewal alone, even when the store cannot be read, and writes nothing', () => fixture(({ folder, file, run }) => {
+  assert.deepEqual(JSON.parse(run('readpending').stdout), { pending: null }, 'no pending file is null, whatever the store')
+  writeJson(`${file}.rice-pending`, pendingDocument('fixture-refresh', fresh))
+  fs.writeFileSync(file, '{"not json', { mode: 0o600 })
+  assert.equal(run('examine').status, 46, 'the store itself cannot be read')
+  const before = snapshot(folder)
+  const printed = run('readpending')
+  assert.equal(printed.status, 0)
+  assert.deepEqual(JSON.parse(printed.stdout), { pending: { base: 'fixture-refresh', credential: { claudeAiOauth: fresh } } })
+  assert.deepEqual(snapshot(folder), before)
+  writeJson(`${file}.rice-pending`, '{"fixture-partial')
+  assert.deepEqual(JSON.parse(run('readpending').stdout), { pending: null })
 }))
 
 test('a version 1 or malformed pending file is ignored, and clearpending removes it only once it is older than five minutes', () => fixture(({ file, run }) => {
@@ -214,12 +234,12 @@ test('a version 1 or malformed pending file is ignored, and clearpending removes
     writeJson(pending, content)
     assert.equal(JSON.parse(run('examine').stdout).pending, null)
     assert.equal(JSON.parse(run('read').stdout).claudeAiOauth.refreshToken, 'fixture-refresh')
-    assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 0)
+    assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: [] }).status, 0)
     assert.equal(fs.existsSync(pending), true, 'a young file of another format is kept')
     ageFile(pending)
     assert.equal(run('read').status, 0)
     assert.equal(fs.existsSync(pending), true, 'a read never removes it')
-    assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 0)
+    assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: [] }).status, 0)
     assert.equal(fs.existsSync(pending), false, 'an old file of another format is removed')
   }
 }))
@@ -353,7 +373,7 @@ test('a renewal chain whose store writes fail keeps its first base, and the fina
   assert.deepEqual(readJson(`${file}.rice-pending`), pendingDocument('fixture-refresh', second))
   // The store accepts writes again.
   assert.equal(run('write', { expectedRefreshToken: 'fixture-refresh', oauth: second }).status, 0)
-  assert.equal(run('clearpending', { base: 'fixture-refresh' }).status, 0)
+  assert.equal(run('clearpending', { base: 'fixture-refresh', tokens: ['fixture-refresh', first.refreshToken, second.refreshToken] }).status, 0)
   assert.equal(readJson(file).claudeAiOauth.refreshToken, second.refreshToken)
   assert.deepEqual(fs.readdirSync(folder).sort(), ['.credentials.json', 'fault-preload.cjs'])
 }))

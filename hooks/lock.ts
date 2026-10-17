@@ -93,16 +93,18 @@ async function mtimeOf(io: Io, path: string): Promise<number | undefined> {
  * The lock this session made at `path`. With its modification time known, the
  * lock is this session's while that time is the one it set: another session
  * that took it over as stale made it again with another time. When the time
- * cannot be read, the lock is this session's only while it is far too young
- * for anyone to take it over (half the stale time since this session last
- * made or renewed it, measured from before it did), so a release still
- * removes it and nobody is locked out for the whole stale time.
+ * cannot be read (now, or when the lock was made), the lock is this session's
+ * only while it is far too young for anyone to take it over (half the stale
+ * time since this session last made or renewed it, measured from before it
+ * did), so a release still removes it and nobody is locked out for the whole
+ * stale time.
  */
 function held(io: Io, path: string, options: LockOptions, commands: Commands, init: ReturnType<typeof trustedRun>, madeAt: number | undefined, since: number): Lock {
   let mtimeMs = madeAt
   let renewedAt = since
   const lost = () => new LockLostError(`the lock ${path} was taken over by another session`)
-  const isOwn = async (current: number | undefined): Promise<boolean> => mtimeMs !== undefined
+  // Both times known: the lock is this session's while it is the one set. Either unknown (a failed stat is not a takeover): the youth rule.
+  const isOwn = async (current: number | undefined): Promise<boolean> => mtimeMs !== undefined && current !== undefined
     ? current === mtimeMs
     : (await io.now()) - renewedAt < options.staleMs / 2
 

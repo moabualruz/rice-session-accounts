@@ -91,6 +91,10 @@ function fixture(on: On, isPlaced = true, launchToken?: string) {
       const value = documents.get(input.argv[4] ?? '')
       return { value: { exitCode: value === undefined ? 44 : 0, stdout: value ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (input.argv.length === 5 && input.argv[0] === 'node' && input.argv[1] === '-e' && input.argv[3] === 'examine') {
+      const value = documents.get(input.argv[4] ?? '')
+      return { value: { exitCode: 0, stdout: JSON.stringify({ stored: value === undefined ? null : JSON.parse(value), pending: null }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     return { value: { exitCode: 127, stdout: '', stderr: 'Unsupported fixture process', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('process.spawn', async function* () { throw new Error('The picker fixture must not launch a real child') })
