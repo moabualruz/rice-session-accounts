@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 import { hostPlatform, nativeCredentialPath, readLogin, readSecret } from '../hooks/credentials'
 import type { Io } from '../hooks/io'
-import { setupCommand } from '../hooks/setup'
+import { setupCommand, signOutHint } from '../hooks/setup'
+import { WINDOWS_CREDENTIAL_STORE, WINDOWS_EXIT, WINDOWS_PRIVATE_DIRECTORY, windowsStoreProblem } from '../scripts/windows-store-payloads.mjs'
 
 function windowsIo(run: Io['run']): Io {
   return {
@@ -38,6 +39,27 @@ test('the Windows token lookup keeps references on stdin and returns only the na
 
 test('the copied Windows setup command uses PowerShell quoting for spaces and apostrophes', () => {
   expect(setupCommand("C:\\Users\\fixture's name\\plugin", "C:\\Users\\fixture's name\\.claude", 'personal', 'win32')).toBe("& node 'C:\\Users\\fixture''s name\\plugin/scripts/account-setup.mjs' --config-dir 'C:\\Users\\fixture''s name\\.claude' 'personal'")
+})
+
+test('Windows commands keep typographic apostrophes, $ and backticks literal and drop the trailing separator PowerShell 5.1 mangles', () => {
+  const command = setupCommand('C:\\Users\\Zoë O\u2019Brien\\plugin', 'C:\\Users\\Zoë O\u2019Brien\\$cfg `x`\\', 'personal', 'win32')
+  expect(command).toBe("& node 'C:\\Users\\Zoë O\u2019\u2019Brien\\plugin/scripts/account-setup.mjs' --config-dir 'C:\\Users\\Zoë O\u2019\u2019Brien\\$cfg `x`' 'personal'")
+  expect(signOutHint('C:\\Users\\Zoë O\u2019Brien\\.claude/rice-session-accounts/logins/personal', 'win32')).toContain("'C:\\Users\\Zoë O\u2019\u2019Brien\\.claude/rice-session-accounts/logins/personal'")
+})
+
+test('Windows storage payloads report distinct causes and keep 46 as the catch-all', () => {
+  expect([WINDOWS_EXIT.FAILED, WINDOWS_EXIT.PATH_TOO_LONG, WINDOWS_EXIT.CONSTRAINED_LANGUAGE, WINDOWS_EXIT.ACCESS_DENIED, WINDOWS_EXIT.NOT_FOUND, WINDOWS_EXIT.NO_LOGON_SESSION]).toEqual([46, 48, 49, 51, 52, 53])
+  expect(windowsStoreProblem(48)).toContain('too long')
+  expect(windowsStoreProblem(49)).toContain('ConstrainedLanguage')
+  expect(windowsStoreProblem(51, 'the isolated login folder', 'UnauthorizedAccessException')).toContain('denied access to the isolated login folder (UnauthorizedAccessException)')
+  expect(windowsStoreProblem(52)).toContain('does not exist')
+  expect(windowsStoreProblem(53)).toContain('interactive Windows sign-in')
+  expect(windowsStoreProblem(46)).toContain('exit 46')
+  for (const payload of [WINDOWS_PRIVATE_DIRECTORY, WINDOWS_CREDENTIAL_STORE]) {
+    expect(payload.includes("LanguageMode -ne 'FullLanguage'")).toBe(true)
+    expect(payload.indexOf("LanguageMode -ne 'FullLanguage'") < payload.indexOf('[Console]::In.ReadToEnd()')).toBe(true)
+  }
+  expect(WINDOWS_PRIVATE_DIRECTORY).toContain('[System.IO.Directory]::SetAccessControl($path, $repair)')
 })
 
 test('a requested unsupported Windows browser store fails before reading another native store', async () => {

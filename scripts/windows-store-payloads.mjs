@@ -1,39 +1,162 @@
 // Pure static payloads shared by the native plugin and its terminal helper.
 // Account references and credential bytes travel on stdin, never in arguments.
+
+/** Exit codes of the Windows payloads; 0 is success and 46 stays the catch-all. */
+export const WINDOWS_EXIT = Object.freeze({
+  /** The credential store has no item for this reference. */
+  NOT_FOUND_CREDENTIAL: 44,
+  /** Anything else, including a refused link, junction or foreign owner; stderr names the cause. */
+  FAILED: 46,
+  /** The folder path is too long for Windows PowerShell 5.1 (about 248 characters for a folder). */
+  PATH_TOO_LONG: 48,
+  /** PowerShell runs in ConstrainedLanguage mode, which blocks Add-Type and the .NET security APIs. */
+  CONSTRAINED_LANGUAGE: 49,
+  /** Windows denied access. */
+  ACCESS_DENIED: 51,
+  /** A drive or parent folder does not exist. */
+  NOT_FOUND: 52,
+  /** No interactive Windows sign-in, so Credential Manager is unavailable (SSH, services, scheduled tasks). */
+  NO_LOGON_SESSION: 53,
+})
+
+/** Folders this long or longer fail in Windows PowerShell 5.1 on .NET Framework. */
+export const WINDOWS_FOLDER_LIMIT = 248
+
+/**
+ * The person-readable cause for a payload exit code. `subject` names what was
+ * being prepared, and `detail` is the payload's own one-line cause, if any.
+ */
+export function windowsStoreProblem(exitCode, subject = 'the isolated login folder', detail = '') {
+  const cause = typeof detail === 'string' && detail.trim() ? ` (${detail.trim()})` : ''
+  switch (exitCode) {
+    case WINDOWS_EXIT.PATH_TOO_LONG:
+      return `The path of ${subject} is too long for Windows PowerShell 5.1, which handles folders of up to ${WINDOWS_FOLDER_LIMIT - 1} characters. Use a shorter Claude config folder (CLAUDE_CONFIG_DIR) or a shorter account name, then rerun setup.`
+    case WINDOWS_EXIT.CONSTRAINED_LANGUAGE:
+      return 'Windows PowerShell runs in ConstrainedLanguage mode here (usually set by an AppLocker, WDAC or Device Guard policy), which blocks Add-Type and the Windows security APIs that setup needs. Ask your administrator to allow Windows PowerShell scripts for your account, then rerun setup.'
+    case WINDOWS_EXIT.ACCESS_DENIED:
+      return `Windows denied access to ${subject}${cause}. Check that your Windows user owns it and may change its permissions, then rerun setup.`
+    case WINDOWS_EXIT.NOT_FOUND:
+      return `A drive or parent folder of ${subject} does not exist${cause}. Check the Claude config folder path, then rerun setup.`
+    case WINDOWS_EXIT.NO_LOGON_SESSION:
+      return 'Windows Credential Manager is unavailable in this session because there is no interactive Windows sign-in (as in SSH, a service or a scheduled task). Run setup from a signed-in desktop session.'
+    default:
+      return `Windows could not secure ${subject} for your user${cause || ` (exit ${exitCode})`}. Run the same setup command to retry.`
+  }
+}
+
+// Exits 49 before anything that ConstrainedLanguage mode would refuse.
+const LANGUAGE_GUARD = String.raw`
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+  try { [Console]::Error.WriteLine('PowerShell language mode is ' + $ExecutionContext.SessionState.LanguageMode + '.') } catch {}
+  exit 49
+}`
+
+// Classifies a caught failure; the base exception type names the real cause.
+const FAILURE_EXITS = String.raw`
+  $failure = $_.Exception.GetBaseException()
+  $code = 46
+  if ($failure -is [System.IO.PathTooLongException]) { $code = 48 }
+  if ($code -eq 46 -and ($failure -is [System.UnauthorizedAccessException] -or $failure -is [System.Security.AccessControl.PrivilegeNotHeldException])) { $code = 51 }
+  if ($code -eq 46 -and ($failure -is [System.IO.DirectoryNotFoundException] -or $failure -is [System.IO.DriveNotFoundException] -or $failure -is [System.IO.FileNotFoundException] -or $failure -is [System.Management.Automation.ItemNotFoundException])) { $code = 52 }
+  if ($code -eq 46 -and $failure -is [System.ComponentModel.Win32Exception] -and $failure.NativeErrorCode -eq 5) { $code = 51 }
+  if ($code -eq 46 -and $failure -is [System.ComponentModel.Win32Exception] -and $failure.NativeErrorCode -eq 1312) { $code = 53 }`
+
 export const WINDOWS_PRIVATE_DIRECTORY = String.raw`
 $ErrorActionPreference = 'Stop'
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+${LANGUAGE_GUARD}
+function Stop-Setup([int]$code, [string]$text) {
+  [Console]::Error.WriteLine($text)
+  exit $code
+}
+# Expands 8.3 short components such as RUNNER~1 so every check and access rule names the real folder.
+function Get-LongPath([string]$value) {
+  $full = [System.IO.Path]::GetFullPath($value)
+  if (-not $full.Contains('~')) { return $full }
+  $root = [System.IO.Path]::GetPathRoot($full)
+  $current = $root
+  foreach ($part in $full.Substring($root.Length).Split([char[]]@([char]92, [char]47), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+    $directory = [System.IO.DirectoryInfo]::new($current)
+    $match = @()
+    if ($directory.Exists) { $match = @($directory.GetFileSystemInfos($part)) }
+    $name = $part
+    if ($match.Count -eq 1) { $name = $match[0].Name }
+    $current = [System.IO.Path]::Combine($current, $name)
+  }
+  return $current
+}
+# Owner-only: protected from inheritance, owned by this user, and no other identity allowed except, optionally, SYSTEM.
+function Test-Private([string]$target, [string]$sid) {
+  $acl = [System.IO.Directory]::GetAccessControl($target, [System.Security.AccessControl.AccessControlSections]'Access,Owner')
+  if (-not $acl.AreAccessRulesProtected) { return $false }
+  if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { return $false }
+  foreach ($entry in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if ($entry.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $entry.IdentityReference.Value -ne $sid -and $entry.IdentityReference.Value -ne 'S-1-5-18') { return $false }
+  }
+  return $true
+}
+function Test-Folder([string]$target) {
+  $item = Get-Item -Force -LiteralPath $target
+  return $item.PSIsContainer -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
+}
 try {
+  [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
   $inputValue = [Console]::In.ReadToEnd() | ConvertFrom-Json
   $path = [string]$inputValue.path
-  if ($path -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or $path.Contains([char]0)) { throw 'invalid directory' }
+  $root = [string]$inputValue.root
+  $absolute = '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)'
+  if ($path -notmatch $absolute -or $path.Contains([char]0)) { Stop-Setup 46 'The login folder is not an absolute Windows path.' }
+  if ($root -and ($root -notmatch $absolute -or $root.Contains([char]0))) { Stop-Setup 46 'The Claude config folder is not an absolute Windows path.' }
+  $path = (Get-LongPath $path).TrimEnd([char[]]@([char]92, [char]47))
+  if ($path.Length -ge ${WINDOWS_FOLDER_LIMIT}) { Stop-Setup 48 ('The login folder path has ' + $path.Length + ' characters.') }
   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $user = $identity.User
+  if ($root) {
+    # Every existing folder from the config folder down to the login folder must be a real folder, never a link or junction.
+    $root = (Get-LongPath $root).TrimEnd([char[]]@([char]92, [char]47))
+    if (-not $path.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { Stop-Setup 46 'The login folder is not inside the Claude config folder.' }
+    $cursor = [System.IO.Path]::GetDirectoryName($path)
+    while ($cursor -and $cursor.Length -gt $root.Length) {
+      if ((Test-Path -LiteralPath $cursor) -and -not (Test-Folder $cursor)) { Stop-Setup 46 ($cursor + ' is a link, junction or file, not a folder. Remove it, then rerun setup.') }
+      $cursor = [System.IO.Path]::GetDirectoryName($cursor)
+    }
+  }
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($user, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
   if (Test-Path -LiteralPath $path) {
-    $old = Get-Item -Force -LiteralPath $path
-    $oldAcl = [System.IO.Directory]::GetAccessControl($path, [System.Security.AccessControl.AccessControlSections]'Access,Owner')
-    if (-not $old.PSIsContainer -or ($old.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $oldAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { throw 'unsafe existing login directory' }
+    if (-not (Test-Folder $path)) { Stop-Setup 46 'The login folder is a link, junction or file, not a folder. Remove it, then rerun setup.' }
+    $owner = [System.IO.Directory]::GetAccessControl($path, [System.Security.AccessControl.AccessControlSections]'Owner').GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    # An elevated administrator's new folders are owned by the Administrators group; that owner is this user's own.
+    $elevated = [System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($owner -ne $user.Value -and -not ($owner -eq 'S-1-5-32-544' -and $elevated)) { Stop-Setup 46 'The login folder belongs to another Windows user. Remove it or run setup as its owner.' }
+    if (-not (Test-Private $path $user.Value)) {
+      # CreateDirectory leaves an existing folder's rules unchanged, so repair them: inheritance is cut,
+      # only this user is allowed, and the owner becomes this user when it was the Administrators group.
+      # When the owner is already this user only the access rules are written, which the owner may always do.
+      $repair = New-Object System.Security.AccessControl.DirectorySecurity
+      $repair.SetAccessRuleProtection($true, $false)
+      if ($owner -ne $user.Value) { $repair.SetOwner($user) }
+      $repair.AddAccessRule($rule)
+      [System.IO.Directory]::SetAccessControl($path, $repair)
+    }
+  } else {
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($user)
+    $security.AddAccessRule($rule)
+    [void][System.IO.Directory]::CreateDirectory($path, $security)
   }
-  $security = New-Object System.Security.AccessControl.DirectorySecurity
-  $security.SetAccessRuleProtection($true, $false)
-  $security.SetOwner($identity.User)
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
-  $security.AddAccessRule($rule)
-  [void][System.IO.Directory]::CreateDirectory($path, $security)
-  $item = Get-Item -Force -LiteralPath $path
-  $acl = [System.IO.Directory]::GetAccessControl($path, [System.Security.AccessControl.AccessControlSections]'Access,Owner')
-  if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $acl.AreAccessRulesProtected -or $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { throw 'unsafe login directory' }
-  foreach ($entry in $acl.Access) {
-    if ($entry.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { throw 'unsafe login directory access' }
-  }
+  if (-not (Test-Folder $path)) { Stop-Setup 46 'The login folder is a link, junction or file, not a folder.' }
+  if (-not (Test-Private $path $user.Value)) { Stop-Setup 46 'Windows did not keep owner-only access rules on the login folder.' }
   exit 0
 } catch {
-  [Console]::Error.WriteLine('Cannot secure the isolated Windows login directory for its current owner.')
-  exit 46
+${FAILURE_EXITS}
+  [Console]::Error.WriteLine('Cannot secure the isolated Windows login directory for its current owner: ' + $failure.GetType().Name + '.')
+  exit $code
 }
 `
 
 export const WINDOWS_CREDENTIAL_STORE = String.raw`
 $ErrorActionPreference = 'Stop'
+${LANGUAGE_GUARD}
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 try {
@@ -110,7 +233,8 @@ public static class RiceAccountsCredentialStore {
   } else { [RiceAccountsCredentialStore]::Delete($target) }
   exit 0
 } catch {
-  [Console]::Error.WriteLine('Windows Credential Manager operation failed.')
-  exit 46
+${FAILURE_EXITS}
+  [Console]::Error.WriteLine('Windows Credential Manager operation failed: ' + $failure.GetType().Name + '.')
+  exit $code
 }
 `

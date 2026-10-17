@@ -7,11 +7,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
-import { WINDOWS_CREDENTIAL_STORE, WINDOWS_PRIVATE_DIRECTORY } from './windows-store-payloads.mjs'
+import { WINDOWS_CREDENTIAL_STORE, WINDOWS_EXIT, WINDOWS_PRIVATE_DIRECTORY } from './windows-store-payloads.mjs'
 
 assert.equal(process.platform, 'win32', 'this proof requires actual Windows')
 const root = fileURLToPath(new URL('../', import.meta.url))
-const { setupCommand } = await import(pathToFileURL(process.argv[2] ?? join(root, 'hooks/setup.ts')).href)
+const { legacyCleanupText, setupCommand, signOutHint } = await import(pathToFileURL(process.argv[2] ?? join(root, 'hooks/setup.ts')).href)
+/** Every file the terminal helper loads; the copied plugin folder must hold all of them. */
+const HELPER_FILES = ['account-setup.mjs', 'account-setup-main.mjs', 'account-names.mjs', 'claude-command.mjs', 'shell-quote.mjs', 'windows-store-payloads.mjs']
 const nativeFile = /const NATIVE_FILE = String\.raw`([\s\S]*?)`\n/.exec(readFileSync(join(root, 'hooks/credentials.ts'), 'utf8'))?.[1]
 assert(nativeFile)
 new vm.Script(nativeFile)
@@ -40,6 +42,40 @@ try {
   assert.equal(acl.status, 0)
   assert(permissions.owner && permissions.protected && permissions.onlySelf, 'the login folder is protected and owned by this user')
   emit({ phase: 'private-login-acl', ...permissions })
+  // A folder that already exists with inherited, shared rules is repaired, not refused.
+  const configRoot = join(fixture, 'config root')
+  const unprotected = join(configRoot, 'rice-session-accounts', 'logins', 'pre-existing')
+  mkdirSync(unprotected, { recursive: true })
+  writeFileSync(join(unprotected, 'sentinel'), 'kept\n')
+  const before = JSON.parse(ps(ACL_PROBE, { path: unprotected }).stdout)
+  assert.equal(before.protected, false, 'the fixture starts with inherited rules')
+  const repaired = ps(WINDOWS_PRIVATE_DIRECTORY, { path: unprotected, root: configRoot })
+  assert.equal(repaired.status, 0, repaired.stderr)
+  const after = JSON.parse(ps(ACL_PROBE, { path: unprotected }).stdout)
+  assert(after.owner && after.protected && after.onlySelf, 'the pre-existing login folder is repaired to owner-only rules')
+  assert.equal(readFileSync(join(unprotected, 'sentinel'), 'utf8'), 'kept\n')
+  emit({ phase: 'private-login-repair', before: before.protected, ...after })
+  // An 8.3 short spelling of the folder (when the volume generates one) is expanded before access rules are checked.
+  const shortName = spawnSync(join(process.env.SystemRoot, 'System32', 'cmd.exe'), ['/d', '/s', '/c', `"chcp 65001>nul & for %I in ("${configRoot}") do @echo %~sI"`], { encoding: 'utf8', windowsVerbatimArguments: true, timeout: 15000 })
+  const shortRoot = shortName.stdout.trim()
+  if (shortName.status === 0 && shortRoot && shortRoot !== configRoot && existsSync(shortRoot)) {
+    const viaShort = ps(WINDOWS_PRIVATE_DIRECTORY, { path: join(shortRoot, 'rice-session-accounts', 'logins', 'short-name'), root: shortRoot })
+    assert.equal(viaShort.status, 0, viaShort.stderr)
+    const shortAcl = JSON.parse(ps(ACL_PROBE, { path: join(configRoot, 'rice-session-accounts', 'logins', 'short-name') }).stdout)
+    assert(shortAcl.owner && shortAcl.protected && shortAcl.onlySelf)
+    emit({ phase: 'private-login-short-name', expanded: true })
+  } else emit({ phase: 'private-login-short-name', skipped: 'this volume generated no 8.3 name' })
+  // Distinct causes: a path too long for Windows PowerShell 5.1, a missing drive, and ConstrainedLanguage mode.
+  const tooLong = ps(WINDOWS_PRIVATE_DIRECTORY, { path: join(fixture, 'x'.repeat(250)) })
+  assert.equal(tooLong.status, WINDOWS_EXIT.PATH_TOO_LONG, tooLong.stderr)
+  const missingDrive = 'ZYXWVUTSRQPONMLKJIHGFED'.split('').find(letter => !existsSync(`${letter}:\\`))
+  if (missingDrive) assert.equal(ps(WINDOWS_PRIVATE_DIRECTORY, { path: `${missingDrive}:\\rice-accounts-missing\\login` }).status, WINDOWS_EXIT.NOT_FOUND)
+  for (const payload of [WINDOWS_PRIVATE_DIRECTORY, WINDOWS_CREDENTIAL_STORE]) {
+    const constrained = ps(`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n${payload}`, { path: join(fixture, 'constrained'), operation: 'read', ...reference })
+    assert.equal(constrained.status, WINDOWS_EXIT.CONSTRAINED_LANGUAGE, constrained.stderr)
+  }
+  assert.equal(existsSync(join(fixture, 'constrained')), false)
+  emit({ phase: 'windows-distinct-failures', pathTooLong: true, missingDrive: Boolean(missingDrive), constrainedLanguage: true })
   const file = join(loginDir, '.credentials.json')
   const document = { unrelated: { keep: 'fixture-名' }, claudeAiOauth: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', expiresAt: 100000, extra: 'preserved' } }
   writeFileSync(file, JSON.stringify(document))
@@ -71,17 +107,21 @@ try {
   assert.equal(recalled.status, 0)
   assert(recalled.stdout === secret, 'Credential Manager returns the exact in-memory Unicode fixture')
   emit({ phase: 'windows-credential-manager-read', exactMatch: true, secretInArguments: false, secretInFiles: false })
-  const plugin = join(fixture, "plugin's 名 folder")
+  // U+2019 is a single quote to PowerShell too, so the printed command must double it.
+  const plugin = join(fixture, "plugin's ’ 名 folder")
   mkdirSync(join(plugin, 'scripts'), { recursive: true })
-  for (const name of ['account-setup.mjs', 'windows-store-payloads.mjs']) cpSync(join(root, 'scripts', name), join(plugin, 'scripts', name))
-  const config = join(fixture, "config's 名 folder")
-  const copiedCommand = setupCommand(plugin, config, 'fixture-account', 'win32')
-  assert.equal(ps('[void][ScriptBlock]::Create($env:RICE_ACCOUNT_PARSE_SOURCE)', {}, { RICE_ACCOUNT_PARSE_SOURCE: copiedCommand }).status, 0)
+  for (const name of HELPER_FILES) cpSync(join(root, 'scripts', name), join(plugin, 'scripts', name))
+  const config = join(fixture, "config's ‘ 名 folder")
+  const copiedCommand = setupCommand(plugin, `${config}\\`, 'fixture-account', 'win32')
+  for (const source of [copiedCommand, signOutHint(join(config, 'rice-session-accounts', 'logins', 'fixture-account'), 'win32'), legacyCleanupText(config, 'win32').split('\n').at(-1).replace(/^In PowerShell: /, '')]) {
+    assert.equal(ps('[void][ScriptBlock]::Create($env:RICE_ACCOUNT_PARSE_SOURCE)', {}, { RICE_ACCOUNT_PARSE_SOURCE: source }).status, 0, source)
+  }
   const copied = ps(COMMAND_WRAPPER, {}, { RICE_ACCOUNT_SETUP_COMMAND: copiedCommand })
   assert.equal(copied.status, 1)
   assert.match(copied.stderr, /First run \/rice-account add/)
+  assert(copied.stderr.includes(config), 'the helper received the config folder with its quotes intact')
   assert.equal(existsSync(config), false, 'a missing account command does not create config or credential folders')
-  emit({ phase: 'copied-powershell-command', helperReached: true, spacesApostrophesUnicodePreserved: true, missingAccountNoWrites: true })
+  emit({ phase: 'copied-powershell-command', helperReached: true, spacesApostrophesUnicodeQuotesPreserved: true, missingAccountNoWrites: true })
   emit({ windowsAccountStorage: 'pass' })
 } catch (error) {
   failed = true
