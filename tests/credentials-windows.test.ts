@@ -62,12 +62,73 @@ test('Windows storage payloads report distinct causes and keep 46 as the catch-a
   expect(WINDOWS_PRIVATE_DIRECTORY).toContain('[System.IO.Directory]::SetAccessControl($path, $repair)')
 })
 
+async function errorOf(work: () => Promise<unknown>): Promise<string> {
+  try { await work(); return '' } catch (error) { return error instanceof Error ? error.message : String(error) }
+}
+
 test('a requested unsupported Windows browser store fails before reading another native store', async () => {
   const io = windowsIo(async () => { throw new Error('must not read another credential store') })
   const environment = io.env
-  io.env = async name => name === 'FORCE_WINDOWS_CREDMAN' ? '1' : environment(name)
-  let message = ''
-  try { await readLogin(io, { storage: {}, defaultConfigDir: 'C:\\fixture\\.claude' }) }
-  catch (error) { message = error instanceof Error ? error.message : String(error) }
-  expect(message).toContain('FORCE_WINDOWS_CREDMAN')
+  io.env = async name => name === 'CLAUDE_CODE_FORCE_WINDOWS_CREDMAN' ? '1' : environment(name)
+  const message = await errorOf(() => readLogin(io, { storage: {}, defaultConfigDir: 'C:\\fixture\\.claude' }))
+  expect(message).toContain('Windows Credential Manager (CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is 1)')
+  expect(message).toContain('the credentials file C:\\fixture\\.claude/.credentials.json')
+  expect(message).toContain('claudeai-token')
+  expect(message).toContain('without CLAUDE_CODE_FORCE_WINDOWS_CREDMAN')
+})
+
+/** A Windows machine whose config files are `files`; its credentials file is absent, so a read that is not refused answers null. */
+function credmanWorld(files: Record<string, string>, variables: Record<string, string> = {}): Io {
+  const io = windowsIo(async argv => {
+    if (argv[0] === 'node') return { exitCode: 44, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+    throw new Error('unexpected executable')
+  })
+  io.env = async name => variables[name] ?? (name === 'OS' ? 'Windows_NT' : name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined)
+  io.stat = async path => {
+    const text = files[path]
+    if (text === undefined) throw new Error('ENOENT')
+    return { kind: 'file', size: text.length, mtimeMs: 0, isLink: false }
+  }
+  io.read = async path => {
+    const text = files[path]
+    if (text === undefined) throw new Error('ENOENT')
+    return text
+  }
+  return io
+}
+
+test('Claude Code\'s own rule decides Credential Manager: the exact variable, else the cached flag in .config.json, else in .claude.json', async () => {
+  const machine = { storage: {}, defaultConfigDir: 'C:\\Users\\me\\.claude' }
+  const loginDir = 'C:\\Users\\me\\.claude/rice-session-accounts/logins/work'
+  const account = { storage: { configDir: loginDir, secureStorageDir: loginDir }, defaultConfigDir: 'C:\\Users\\me\\.claude' }
+  const flagged = JSON.stringify({ cachedGrowthBookFeatures: { tengu_windows_credman: true } })
+  const plain = JSON.stringify({ cachedGrowthBookFeatures: { tengu_windows_credman: false }, oauthAccount: {} })
+  const machineGlobal = 'C:\\Users\\me/.claude.json'
+  const machineLegacy = 'C:\\Users\\me\\.claude/.config.json'
+  const refusal = (files: Record<string, string>, location: typeof machine | typeof account = machine, variables: Record<string, string> = {}) =>
+    errorOf(() => readLogin(credmanWorld(files, variables), location))
+
+  // Only exactly 1 counts; the name without the CLAUDE_CODE_ prefix is not Claude Code's.
+  expect(await refusal({}, machine, { CLAUDE_CODE_FORCE_WINDOWS_CREDMAN: '1' })).toContain('(CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is 1)')
+  const ignored: Record<string, string>[] = [{ CLAUDE_CODE_FORCE_WINDOWS_CREDMAN: 'true' }, { CLAUDE_CODE_FORCE_WINDOWS_CREDMAN: '0' }, { FORCE_WINDOWS_CREDMAN: '1' }]
+  for (const variables of ignored) {
+    expect(await refusal({}, machine, variables)).toBe('')
+  }
+  // The machine login: the global config in the home folder.
+  const cached = await refusal({ [machineGlobal]: flagged })
+  expect(cached).toContain(`(its cached setting tengu_windows_credman is on in ${machineGlobal})`)
+  expect(cached).toContain('Use a claudeai-token account instead')
+  expect(cached.includes('without CLAUDE_CODE_FORCE_WINDOWS_CREDMAN')).toBe(false)
+  expect(await refusal({ [machineGlobal]: plain })).toBe('')
+  // A legacy .config.json that is present and not empty is read instead, even without the flag.
+  expect(await refusal({ [machineLegacy]: plain, [machineGlobal]: flagged })).toBe('')
+  expect(await refusal({ [machineLegacy]: flagged, [machineGlobal]: plain })).toContain(`on in ${machineLegacy}`)
+  expect(await refusal({ [machineLegacy]: '', [machineGlobal]: flagged })).toContain(`on in ${machineGlobal}`)
+  // An isolated login: the config Claude Code reads with CLAUDE_CONFIG_DIR set to its folder.
+  expect(await refusal({ [`${loginDir}/.claude.json`]: flagged }, account)).toContain(`for ${loginDir} in Windows Credential Manager`)
+  expect(await refusal({ [machineGlobal]: flagged }, account)).toBe('')
+  // A config that cannot be parsed, or a flag that is not true, counts as off.
+  for (const text of ['{"cachedGrowthBookFeatures":', 'null', JSON.stringify({ cachedGrowthBookFeatures: { tengu_windows_credman: 'true' } })]) {
+    expect(await refusal({ [machineGlobal]: text })).toBe('')
+  }
 })

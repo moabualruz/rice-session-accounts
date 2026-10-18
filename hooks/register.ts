@@ -115,8 +115,8 @@ async function variable($: EngineInterface, name: EnvName): Promise<string | und
       return $.env.get('SystemRoot')
     case 'WINDIR':
       return $.env.get('WINDIR')
-    case 'FORCE_WINDOWS_CREDMAN':
-      return $.env.get('FORCE_WINDOWS_CREDMAN')
+    case 'CLAUDE_CODE_FORCE_WINDOWS_CREDMAN':
+      return $.env.get('CLAUDE_CODE_FORCE_WINDOWS_CREDMAN')
     case 'CLAUDE_CONFIG_DIR':
       return $.env.get('CLAUDE_CONFIG_DIR')
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':

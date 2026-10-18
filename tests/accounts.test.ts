@@ -1218,6 +1218,41 @@ test('macOS: a renewal chain whose keychain writes fail keeps the first base, re
   expect(world.state.items.length).toBe(1)
 })
 
+test('a macOS login Claude Code kept in its plaintext file instead of the keychain is named with its fix, and never used, renewed or changed', async () => {
+  const plaintext = `${MAC_LOGIN}/.credentials.json`
+  const files: Record<string, string> = { [plaintext]: JSON.stringify(macExpired) }
+  const world = await macWorld(macExpired)
+  const { stat, read } = world.io
+  const consulted: string[] = []
+  world.io.stat = async path => {
+    const text = files[path]
+    if (path === plaintext) consulted.push(path)
+    return text === undefined ? stat(path) : { kind: 'file', size: text.length, mtimeMs: 1, isLink: false }
+  }
+  world.io.read = async path => files[path] ?? read(path)
+  // Claude Code reads the keychain item first: while there is one, the file is not consulted.
+  expect((await readLogin(world.io, MAC_LOCATION))?.claudeAiOauth.refreshToken).toBe('fixture-refresh')
+  expect(consulted).toEqual([])
+  world.state.items = []
+  const error = await errorOf(() => renewMac(world.io))
+  expect(error).toContain(`is in its plaintext credentials file ${plaintext}, not in the macOS keychain item "${world.service}"`)
+  expect(error).toContain('security unlock-keychain')
+  expect(error).toContain('/rice-account setup <name> prints, with --login added')
+  expect(error).toContain('claude auth login')
+  expect(error.includes('fixture-access') || error.includes('fixture-refresh')).toBe(false)
+  expect(await errorOf(() => readLogin(world.io, MAC_LOCATION))).toContain('plaintext credentials file')
+  expect(world.requests()).toBe(0)
+  expect(world.state.lines).toEqual([])
+  expect(world.state.writers).toBe(0)
+  expect(world.state.removed).toEqual([])
+  expect(files[plaintext]).toBe(JSON.stringify(macExpired))
+  // A file without a login, or none, is no login: not signed in, as before.
+  files[plaintext] = JSON.stringify({ mcpOAuth: { server: 'fixture' } })
+  expect(await errorOf(() => renewMac(world.io))).toContain('personal is not signed in yet')
+  delete files[plaintext]
+  expect(await readLogin(world.io, MAC_LOCATION)).toBe(null)
+})
+
 test('macOS without a known login name reads, compares and reads back the same item without -a, and writes it as claude-code-user', async () => {
   const world = await macWorld(macExpired, { account: 'claude-code-user' })
   const saved = await renewMac(world.io, null)
