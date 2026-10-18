@@ -92,5 +92,5 @@ Keep commits focused and do not mix unrelated formatting changes into a fix.
 2. Open a pull request and wait for CI to pass on every job. Run `npm run check` locally against
    Claude Code 2.1.301 as well.
 3. Merge to `main` and confirm CI is green on the release commit before tagging.
-4. Tag that commit `rice-session-accounts--vX.Y.Z` (for example `rice-session-accounts--v0.5.0`)
+4. Tag that commit `rice-session-accounts--vX.Y.Z` (for example `rice-session-accounts--v0.6.0`)
    and push the tag. The tag version must equal the version in `plugin.json`.
