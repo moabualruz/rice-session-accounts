@@ -1,8 +1,10 @@
-import type { ProcessRunInit } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import type { CommandRunInput, On, ProcessRunInit } from 'claude-code'
+import { expect, mock, test } from 'claude-code/testing'
+
+import { fixturePath } from './fixture-path'
 
 import { freshLogin, LOCK_HEARTBEAT_LIMIT_MS, LOCK_HEARTBEAT_MS, RENEWAL_LOCK } from '../hooks/accounts'
-import { pathsFor } from '../hooks/config'
+import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 import { bestLogin, forgetHostPlatform, forgetUnsavedLogins, hasUnsavedLogin, hostPlatform, nativeCredentialPath, parsePendingLogin, pendingState, readLogin, readSecret, writeLogin } from '../hooks/credentials'
 import type { LoginLocation, PendingLogin } from '../hooks/credentials'
 import type { Io } from '../hooks/io'
@@ -56,8 +58,9 @@ function spentBy(init: { body?: unknown } | undefined): string {
   return (JSON.parse(String(init?.body ?? '{}')) as { refresh_token?: string }).refresh_token ?? ''
 }
 
+/** The grant a renewal changes, as the native file program and the keychain path copy it. */
 function grantOf(oauth: Credential['claudeAiOauth']) {
-  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt, ...(typeof oauth.refreshTokenExpiresAt === 'number' ? { refreshTokenExpiresAt: oauth.refreshTokenExpiresAt } : {}) }
 }
 
 function withGrant(document: Credential, oauth: Credential['claudeAiOauth']): Credential {
@@ -431,6 +434,32 @@ test('freshLogin renews an isolated Linux grant: written ahead with the stored t
     expect(call.init?.cwd).toBe('/')
     expect(call.init?.env).toEqual(TRUSTED_ENV)
   }
+})
+
+test('a renewal records refreshTokenExpiresAt as Claude Code does, and a later renewal without one keeps it through the pending file and the store', async () => {
+  const state = linuxState({ stored: { keep: 'unrelated', claudeAiOauth: { ...login.claudeAiOauth, expiresAt: 1, refreshTokenExpiresAt: 50, clientId: 'fixture-client', scopes: ['user:inference'] } } })
+  const world = linuxWorld(state)
+  const answers = [
+    JSON.stringify({ access_token: 'rotated-access', refresh_token: 'rotated-grant', expires_in: 3600, refresh_token_expires_in: 86_400 }),
+    JSON.stringify({ access_token: 'rotated-access-2', refresh_token: 'rotated-grant-2', expires_in: 3600 }),
+  ]
+  const bodies: Record<string, string>[] = []
+  world.io.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, string>)
+    state.order.push('fetch')
+    return { ok: true, status: 200, headers: {}, text: answers[bodies.length - 1] ?? '' }
+  }
+  const first = await renew(world.io)
+  expect(first.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  // Written ahead with the grant, then saved by compare-and-swap with it.
+  expect((JSON.parse(state.pendings[0] ?? '{}') as PendingLogin).credential.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  expect(JSON.parse(state.writes[0] ?? '{}').oauth.refreshTokenExpiresAt).toBe(86_400_000)
+  state.now = 4_000_000
+  const second = await renew(world.io)
+  expect(second.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  expect(state.stored).toEqual({ keep: 'unrelated', claudeAiOauth: { accessToken: 'rotated-access-2', refreshToken: 'rotated-grant-2', expiresAt: 7_600_000, refreshTokenExpiresAt: 86_400_000, clientId: 'fixture-client', scopes: ['user:inference'] } })
+  // The login's own OAuth client renews it, as in Claude Code.
+  expect(bodies.map(body => body.client_id)).toEqual(['fixture-client', 'fixture-client'])
 })
 
 test('a program runner that cannot examine the store refuses to renew: no guess, no token request', async () => {
@@ -1218,6 +1247,41 @@ test('macOS: a renewal chain whose keychain writes fail keeps the first base, re
   expect(world.state.items.length).toBe(1)
 })
 
+test('a macOS login Claude Code kept in its plaintext file instead of the keychain is named with its fix, and never used, renewed or changed', async () => {
+  const plaintext = `${MAC_LOGIN}/.credentials.json`
+  const files: Record<string, string> = { [plaintext]: JSON.stringify(macExpired) }
+  const world = await macWorld(macExpired)
+  const { stat, read } = world.io
+  const consulted: string[] = []
+  world.io.stat = async path => {
+    const text = files[path]
+    if (path === plaintext) consulted.push(path)
+    return text === undefined ? stat(path) : { kind: 'file', size: text.length, mtimeMs: 1, isLink: false }
+  }
+  world.io.read = async path => files[path] ?? read(path)
+  // Claude Code reads the keychain item first: while there is one, the file is not consulted.
+  expect((await readLogin(world.io, MAC_LOCATION))?.claudeAiOauth.refreshToken).toBe('fixture-refresh')
+  expect(consulted).toEqual([])
+  world.state.items = []
+  const error = await errorOf(() => renewMac(world.io))
+  expect(error).toContain(`is in its plaintext credentials file ${plaintext}, not in the macOS keychain item "${world.service}"`)
+  expect(error).toContain('security unlock-keychain')
+  expect(error).toContain('/rice-account setup <name> prints, with --login added')
+  expect(error).toContain('claude auth login')
+  expect(error.includes('fixture-access') || error.includes('fixture-refresh')).toBe(false)
+  expect(await errorOf(() => readLogin(world.io, MAC_LOCATION))).toContain('plaintext credentials file')
+  expect(world.requests()).toBe(0)
+  expect(world.state.lines).toEqual([])
+  expect(world.state.writers).toBe(0)
+  expect(world.state.removed).toEqual([])
+  expect(files[plaintext]).toBe(JSON.stringify(macExpired))
+  // A file without a login, or none, is no login: not signed in, as before.
+  files[plaintext] = JSON.stringify({ mcpOAuth: { server: 'fixture' } })
+  expect(await errorOf(() => renewMac(world.io))).toContain('personal is not signed in yet')
+  delete files[plaintext]
+  expect(await readLogin(world.io, MAC_LOCATION)).toBe(null)
+})
+
 test('macOS without a known login name reads, compares and reads back the same item without -a, and writes it as claude-code-user', async () => {
   const world = await macWorld(macExpired, { account: 'claude-code-user' })
   const saved = await renewMac(world.io, null)
@@ -1228,4 +1292,119 @@ test('macOS without a known login name reads, compares and reads back the same i
   expect((world.state.lines[0] ?? '').startsWith(`add-generic-password -U -a "claude-code-user" -s "${world.service}" -X "`)).toBe(true)
   expect(world.state.items.length).toBe(1)
   expect(JSON.parse(world.item()?.text ?? '{}').claudeAiOauth.refreshToken).toBe('rotated-grant')
+})
+
+// The plugin in a Linux host: what its requests carry, and the usage it hands the engine.
+const HOST_HOME = '/fixture/identity-host'
+const HOST_CONFIG = `${HOST_HOME}/.claude`
+const HOST_PATHS = pathsFor(HOST_CONFIG)
+const HOST_NOW = 1_800_000_000_000
+const HOST_LOCK = { make: 'mkdir -p "$(dirname "$0")" && mkdir "$0"', touch: '[ -d "$0" ] && touch -c "$0"', remove: '[ ! -d "$0" ] || rmdir "$0"' }
+const USAGE_DRIVER = { plugins: [{ name: 'usage-driver', register(on: On) {
+  on('command.run', { command: 'usage-probe' }, async $ => ({ text: JSON.stringify((await $.session.usage()).rateLimits) }))
+} }] }
+
+function hostCommand(args: string, name = 'rice-account'): CommandRunInput {
+  return { command: name, args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } }
+}
+
+function identityHost(on: On) {
+  const work = HOST_PATHS.loginDir('work')
+  const documents = new Map<string, string>([
+    [HOST_PATHS.config, serializeConfig({ ...defaultConfig(), accounts: { ...defaultConfig().accounts, work: { kind: 'claudeai', loginDir: work } } })],
+    [`${work}/.credentials.json`, JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-work', refreshToken: 'fixture-refresh-work', expiresAt: 1 } })],
+    [`${work}/.claude.json`, JSON.stringify({ oauthAccount: { emailAddress: 'work@example.test' } })],
+    [`${HOST_CONFIG}/.credentials.json`, JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-machine', refreshToken: 'fixture-refresh-machine', expiresAt: HOST_NOW + 3_600_000 } })],
+  ])
+  const environment = new Map([['HOME', HOST_HOME], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', HOST_CONFIG]])
+  const kept = new Map<string, { value: unknown; version: number }>()
+  const locks = new Map<string, number>()
+  const requests: { url: string; agent: string | undefined }[] = []
+  const status: (string | undefined)[] = []
+  const answer = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const json = (body: unknown) => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify(body) } })
+  mock.clock(on, { now: HOST_NOW })
+  mock.store(on)
+  on('state.get', (_host, input) => ({ value: (kept.get(String(input.key)) ?? { value: undefined, version: 0 }) as never }))
+  on('state.set', (_host, input) => {
+    const version = (kept.get(String(input.key))?.version ?? 0) + 1
+    kept.set(String(input.key), { value: input.value, version })
+    return { value: { isSet: true, version } }
+  })
+  on('env.get', (_host, input) => ({ value: environment.get(input.name) }))
+  on('env.set', (_host, input) => {
+    if (input.value === undefined) environment.delete(input.name)
+    else environment.set(input.name, input.value)
+    return { value: {} }
+  })
+  on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
+  on('fs.read', (_host, input) => {
+    const text = documents.get(fixturePath(input.path))
+    if (text === undefined) throw new Error('ENOENT: isolated fixture file')
+    return { value: text }
+  })
+  on('fs.write', (_host, input) => { documents.set(fixturePath(input.path), input.text); return { value: undefined } })
+  on('fs.stat', (_host, input) => {
+    const modified = locks.get(fixturePath(input.path))
+    if (modified === undefined) throw new Error('ENOENT: isolated fixture file')
+    return { value: { kind: 'dir' as const, size: 0, mtimeMs: modified, isLink: false } }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', (_host, input) => {
+    const [program, , script, operation, path = ''] = input.argv
+    if (program === '/usr/bin/uname') return answer(0, 'Linux\n')
+    if (program === '/bin/sh' && script === HOST_LOCK.make) { locks.set(fixturePath(operation ?? ''), HOST_NOW); return answer(0) }
+    if (program === '/bin/sh' && script === HOST_LOCK.touch) { locks.set(fixturePath(operation ?? ''), HOST_NOW + 1); return answer(0) }
+    if (program === '/bin/sh' && script === HOST_LOCK.remove) { locks.delete(fixturePath(operation ?? '')); return answer(0) }
+    if (program !== 'node') return answer(127)
+    const text = documents.get(path)
+    if (operation === 'read') return text === undefined ? answer(44) : answer(0, text)
+    if (operation === 'examine') return answer(0, JSON.stringify({ stored: text === undefined ? null : JSON.parse(text), pending: null }))
+    if (operation === 'write') {
+      const current = JSON.parse(text ?? '{}') as Credential
+      const request = JSON.parse(input.init?.stdin ?? '{}') as { oauth: Credential['claudeAiOauth'] }
+      const saved = { ...current, claudeAiOauth: { ...current.claudeAiOauth, ...request.oauth } }
+      documents.set(path, JSON.stringify(saved))
+      return answer(0, JSON.stringify(saved))
+    }
+    return answer(0)
+  })
+  on('http.fetch', (_host, input) => {
+    requests.push({ url: input.url, agent: input.init?.headers?.['User-Agent'] })
+    if (input.url === 'https://platform.claude.com/v1/oauth/token') return json({ access_token: 'fixture-access-work-renewed', refresh_token: 'fixture-refresh-work-2', expires_in: 3600 })
+    if (input.url === 'https://api.anthropic.com/api/oauth/profile') return json({ account: { email: 'machine@example.test' } })
+    return json({ limits: [
+      { kind: 'session', percent: 12.345, resets_at: '2026-10-18T15:00:00+00:00' },
+      { kind: 'weekly_all', percent: 40 },
+      { kind: 'weekly_opus', percent: 7.000000000000001, scope: { model: { display_name: 'Opus' } } },
+    ] })
+  })
+  on('session.version', () => ({ value: { version: '2.1.302' } }))
+  on('session.start', (_host, input) => ({ cwd: input.cwd }))
+  on('session.usage', () => ({ value: { startedAt: HOST_NOW, context: { window: 200_000 }, rateLimits: [] } }))
+  on('command.register', (_host, input) => ({ value: { command: input.name } }))
+  on('ui.status', (_host, input) => { status.push(input.text); return { value: undefined } })
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.log', () => ({ value: undefined }))
+
+  return { requests, status }
+}
+
+test('usage, profile and token requests carry Claude Code\'s User-Agent, and session.usage gets only the windows the engine declares', USAGE_DRIVER, async ($, on) => {
+  const host = identityHost(on)
+  await $.session.start({ cwd: HOST_HOME, surface: 'terminal', isInteractive: true })
+  expect((await $.command.run(hostCommand('check'))).text ?? '').toContain('login: signed in as machine@example.test')
+  expect((await $.command.run(hostCommand('work'))).text ?? '').toContain('now uses work')
+  expect(JSON.parse((await $.command.run(hostCommand('', 'usage-probe'))).text ?? '[]')).toEqual([
+    { kind: 'five_hour', percentUsed: 12.3, resetsAt: '2026-10-18T15:00:00+00:00' },
+    { kind: 'seven_day', percentUsed: 40 },
+  ])
+  // The plugin's own status line still shows the model's window.
+  expect(host.status.at(-1) ?? '').toContain('5h 12%, wk 40%, Opus 7%')
+  expect(host.requests.map(request => request.url)).toEqual([
+    'https://api.anthropic.com/api/oauth/profile',
+    'https://platform.claude.com/v1/oauth/token',
+    'https://api.anthropic.com/api/oauth/usage',
+  ])
+  for (const request of host.requests) expect(request.agent).toBe('claude-cli/2.1.302 (external, cli)')
 })

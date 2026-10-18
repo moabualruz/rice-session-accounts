@@ -265,7 +265,9 @@ test('Windows browser setup uses USERPROFILE, drive-qualified credential storage
       return { status: ready ? 0 : 1, stdout: JSON.stringify({ loggedIn: ready, authMethod: ready ? 'claude.ai' : 'none', apiProvider: 'firstParty' }) }
     },
   })
-  assert.deepEqual(inspected, ['C:\\Users\\fixture user\\.claude'])
+  // The login folder's configs are checked for the Credential Manager flag before sign-in and after it.
+  const configs = [`${loginDir}\\.config.json`, `${loginDir}\\.claude.json`]
+  assert.deepEqual(inspected, ['C:\\Users\\fixture user\\.claude', ...configs, ...configs])
   assert.deepEqual(reads, ['C:\\Users\\fixture user\\.claude\\rice-session-accounts\\accounts.json'])
   assert.deepEqual(prepared, [loginDir])
   assert.deepEqual(calls.map(call => call.args), [['auth', 'status', '--json'], ['auth', 'login', '--claudeai'], ['auth', 'status', '--json']])
@@ -305,10 +307,46 @@ test('Windows rejects drive-relative login directories before preparing storage 
 })
 
 test('a requested unsupported Windows vendor store is rejected before login preparation', async () => {
-  const world = fixture({ kind: 'claudeai', loginDir: SAVED_LOGIN.win32 }, { platform: 'win32', env: { USERPROFILE: 'C:\\fixture', FORCE_WINDOWS_CREDMAN: '1' } })
-  await assert.rejects(world.run(), /FORCE_WINDOWS_CREDMAN/)
+  const world = fixture({ kind: 'claudeai', loginDir: SAVED_LOGIN.win32 }, { platform: 'win32', env: { USERPROFILE: 'C:\\fixture', CLAUDE_CODE_FORCE_WINDOWS_CREDMAN: '1' } })
+  await assert.rejects(world.run(), /Windows Credential Manager while CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is 1[\s\S]*claudeai-token/)
   assert.deepEqual(world.prepared, [])
   assert.deepEqual(world.calls, [])
+  // Claude Code honors exactly 1, under its own name only.
+  for (const env of [{ CLAUDE_CODE_FORCE_WINDOWS_CREDMAN: 'true' }, { FORCE_WINDOWS_CREDMAN: '1' }]) {
+    const other = fixture({ kind: 'claudeai', loginDir: SAVED_LOGIN.win32 }, { platform: 'win32', env: { USERPROFILE: 'C:\\fixture', ...env } })
+    other.deps.exec = (command, args) => { other.calls.push(args); return { status: 0, stdout: READY } }
+    await other.run()
+    assert.deepEqual(other.calls, [['auth', 'status', '--json']])
+  }
+})
+
+test('Windows setup refuses a login folder whose cached tengu_windows_credman flag is on, before sign-in or once sign-in cached it', async () => {
+  const cachedConfig = 'C:\\fixture\\.claude\\rice-session-accounts\\logins\\personal\\.claude.json'
+  const flagged = JSON.stringify({ cachedGrowthBookFeatures: { tengu_windows_credman: true } })
+  const accounts = JSON.stringify({ accounts: { personal: { kind: 'claudeai', loginDir: SAVED_LOGIN.win32 } } })
+  const world = (flagFrom) => {
+    let signedIn = false
+    const files = () => signedIn || flagFrom === 'start' ? { [cachedConfig]: flagged } : {}
+    const state = fixture({ kind: 'claudeai', loginDir: SAVED_LOGIN.win32 }, {
+      platform: 'win32',
+      inspect: path => path in files() ? { directory: false, symlink: false } : { directory: true, symlink: false },
+      read: path => files()[path] ?? accounts,
+    })
+    state.deps.exec = (command, args) => {
+      state.calls.push(args)
+      if (args[1] === 'login') { signedIn = true; return { status: 0 } }
+      return { status: signedIn ? 0 : 1, stdout: signedIn ? READY : '{"loggedIn":false}' }
+    }
+    return state
+  }
+  const before = world('start')
+  await assert.rejects(before.run(), new RegExp(`tengu_windows_credman is on in ${cachedConfig.replace(/\\/g, '\\\\')}[\\s\\S]*claudeai-token`))
+  assert.deepEqual(before.prepared, [])
+  assert.deepEqual(before.calls, [])
+  const after = world('login')
+  await assert.rejects(after.run(), /tengu_windows_credman is on/)
+  assert.deepEqual(after.calls, [['auth', 'status', '--json'], ['auth', 'login', '--claudeai'], ['auth', 'status', '--json']])
+  assert.equal(after.messages.some(text => text.includes('isolated Claude login is ready')), false)
 })
 
 // Item 3: setup prepares only folders it derives itself.

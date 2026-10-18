@@ -97,6 +97,10 @@ export type Credential = {
     accessToken: string
     refreshToken: string
     expiresAt: number
+    /** When the refresh token expires; Claude Code's signed-in check reads it. */
+    refreshTokenExpiresAt?: number
+    /** The OAuth client the login was signed in with, when not Claude Code's own. */
+    clientId?: string
     scopes?: string[]
     subscriptionType?: string
     rateLimitTier?: string

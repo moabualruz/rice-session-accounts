@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, HookFailure, Register, Timer, On } from 'claude-code'
+import type { EngineInterface, HookFailure, HttpInit, HttpResponse, Register, Timer, On } from 'claude-code'
 
 import type { AccountSnapshot, ActiveAccount, EnvSnapshot } from '../types'
 import { loginEmail, materialFor } from './accounts'
@@ -17,7 +17,7 @@ import { message } from './io'
 import { withLock } from './lock'
 import { loginSourceOf, NOT_OAUTH_LOGIN } from './login'
 import type { LoginSource } from './login'
-import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, USAGE_URL } from './oauth'
+import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, sessionRateLimits, USAGE_URL, withUserAgent } from './oauth'
 import { ACCOUNT_PICKER_ID, openAccountPicker, renderAccountPicker } from './picker'
 import type { AccountRow } from './picker'
 import { refusalText, SessionAuthorizations, UNKNOWN_HANDLE } from './session-auth'
@@ -115,8 +115,8 @@ async function variable($: EngineInterface, name: EnvName): Promise<string | und
       return $.env.get('SystemRoot')
     case 'WINDIR':
       return $.env.get('WINDIR')
-    case 'FORCE_WINDOWS_CREDMAN':
-      return $.env.get('FORCE_WINDOWS_CREDMAN')
+    case 'CLAUDE_CODE_FORCE_WINDOWS_CREDMAN':
+      return $.env.get('CLAUDE_CODE_FORCE_WINDOWS_CREDMAN')
     case 'CLAUDE_CONFIG_DIR':
       return $.env.get('CLAUDE_CONFIG_DIR')
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
@@ -276,6 +276,12 @@ async function setManagedChecked($: EngineInterface, name: Managed, value: strin
   }
 }
 
+/** `$.http.fetch` for the Anthropic OAuth endpoints, with the User-Agent Claude Code of this version sends. */
+async function oauthFetch($: EngineInterface, url: string, init: HttpInit | undefined): Promise<HttpResponse> {
+  const version = await $.session.version().then(running => running.version, () => undefined)
+  return $.http.fetch(url, withUserAgent(init, version))
+}
+
 function machineIo($: EngineInterface): Io {
   return {
     run: (argv, init) => $.process.run(argv, init),
@@ -286,7 +292,7 @@ function machineIo($: EngineInterface): Io {
     env: name => variable($, name),
     now: () => $.clock.now(),
     sleep: ms => $.clock.sleep(ms),
-    fetch: (url, init) => $.http.fetch(url, init),
+    fetch: (url, init) => oauthFetch($, url, init),
     log: text => $.ui.log(text, { to: 'debug' }),
   }
 }
@@ -484,7 +490,7 @@ function reportStatus(report: AccountReport): string {
 
 function withReportedLimits<T>(result: T, rateLimits: ReportedLimit[]): T {
   if (typeof result !== 'object' || result === null || !('value' in result) || typeof result.value !== 'object' || result.value === null) return result
-  return { ...result, value: { ...result.value, rateLimits } }
+  return { ...result, value: { ...result.value, rateLimits: sessionRateLimits(rateLimits) } }
 }
 
 function reportedLimits(text: string): ReportedLimit[] {
@@ -529,7 +535,7 @@ async function refreshReport($: EngineInterface, taken: Selection, account: Acco
       if (!token) problem = 'usage unavailable'
       else {
         local.usageCheckedAt = await $.clock.now()
-        const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
+        const response = await oauthFetch($, USAGE_URL, oauthInit({ token }))
         if (!response.ok) problem = `usage unavailable (HTTP ${response.status})`
         else {
           try { rateLimits = reportedLimits(response.text) } catch { problem = 'usage unavailable (the usage response did not parse)' }
@@ -821,7 +827,7 @@ async function usageText($: EngineInterface): Promise<string> {
     token = material.secret
   }
   local.usageCheckedAt = await $.clock.now()
-  const response = await $.http.fetch(USAGE_URL, oauthInit({ token }))
+  const response = await oauthFetch($, USAGE_URL, oauthInit({ token }))
   if (!response.ok) return `${name}: the usage lookup answered HTTP ${response.status}${account.kind === 'claudeai-token' ? ' (setup tokens may not reach it)' : ''}.`
   const body: unknown = JSON.parse(response.text)
   const report = local.accountReport
@@ -858,13 +864,13 @@ async function checkText($: EngineInterface, name: string): Promise<string> {
   if (account.kind === 'login') {
     const login = await loginToken($)
     if ('problem' in login) return `login: ${login.problem}`
-    const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: login.token }))
+    const response = await oauthFetch($, PROFILE_URL, oauthInit({ token: login.token }))
     if (!response.ok) return `login: the profile lookup answered HTTP ${response.status}.`
     return `login: signed in as ${parseProfile(response.text).email}.`
   }
   const machine = await machineOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)
-  const response = await $.http.fetch(PROFILE_URL, oauthInit({ token: material.secret ?? '' }))
+  const response = await oauthFetch($, PROFILE_URL, oauthInit({ token: material.secret ?? '' }))
   if (!response.ok) return `${name}: token found; the profile lookup answered HTTP ${response.status}.`
   const owner = parseProfile(response.text)
 

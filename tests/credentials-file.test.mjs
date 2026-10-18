@@ -85,6 +85,23 @@ test('refresh retains unrelated fields added after the caller loaded its credent
   assert.deepEqual(JSON.parse(saved.stdout), { ...current, claudeAiOauth: { ...current.claudeAiOauth, ...oauth } })
 }))
 
+test('refreshTokenExpiresAt travels with the grant: written when a renewal has one, kept from the store when it has none', () => fixture(({ file, run }) => {
+  const stored = { ...login, claudeAiOauth: { ...login.claudeAiOauth, refreshTokenExpiresAt: 5_000_000 } }
+  writeJson(file, stored)
+  const withExpiry = { ...fresh, refreshTokenExpiresAt: 9_000_000 }
+  assert.equal(run('pending', { base: 'fixture-refresh', credential: { claudeAiOauth: withExpiry } }).status, 0)
+  assert.deepEqual(readJson(`${file}.rice-pending`), pendingDocument('fixture-refresh', withExpiry))
+  assert.deepEqual(JSON.parse(run('read').stdout), { ...stored, claudeAiOauth: { ...stored.claudeAiOauth, ...withExpiry } })
+  assert.equal(run('write', { expectedRefreshToken: 'fixture-refresh', oauth: withExpiry }).status, 0)
+  assert.equal(readJson(file).claudeAiOauth.refreshTokenExpiresAt, 9_000_000)
+  // A renewal without one (or with a value that is not a number) keeps the stored one.
+  const next = { accessToken: 'fixture-third-access', refreshToken: 'fixture-third-refresh', expiresAt: 3_000_000 }
+  assert.equal(run('write', { expectedRefreshToken: fresh.refreshToken, oauth: { ...next, refreshTokenExpiresAt: 'soon' } }).status, 0)
+  assert.deepEqual(readJson(file), { ...stored, claudeAiOauth: { ...stored.claudeAiOauth, ...next, refreshTokenExpiresAt: 9_000_000 } })
+  assert.equal(run('pending', { base: 'fixture-third-refresh', credential: { claudeAiOauth: { ...next, refreshTokenExpiresAt: 'soon' } } }).status, 0)
+  assert.deepEqual(readJson(`${file}.rice-pending`), pendingDocument('fixture-third-refresh', next))
+}))
+
 test('symlink reads and writes are refused without altering their target', { skip: windows ? 'creating a Windows file symlink requires Developer Mode or elevation; Windows reparse refusal is checked separately' : false }, () => fixture(({ file, run }) => {
   fs.writeFileSync(`${file}.target`, JSON.stringify(login), { mode: 0o600 })
   fs.symlinkSync(`${file}.target`, file)

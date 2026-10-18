@@ -14,8 +14,12 @@ export const PENDING_SUFFIX = '.rice-pending'
 export const PENDING_VERSION = 2
 /** A leftover temporary copy, or a pending file of another format, is removed only once it is older than this. */
 export const STALE_COPY_MS = 5 * 60 * 1000
-/** The largest pending file read on macOS; the Node program applies the same cap. */
+/** The largest pending or credentials file read on macOS; the Node program applies the same cap. */
 const PENDING_LIMIT = 1024 * 1024
+/** Set to exactly 1, it makes Claude Code on Windows keep logins in Credential Manager. */
+const CREDMAN_VARIABLE = 'CLAUDE_CODE_FORCE_WINDOWS_CREDMAN'
+/** The cached GrowthBook flag that does the same when it is true. */
+const CREDMAN_FLAG = 'tengu_windows_credman'
 /** How many spent refresh tokens a renewal kept in memory remembers it descends from. */
 const SPENT_KEPT = 32
 
@@ -88,8 +92,10 @@ export function nativeCredentialPath(location: LoginLocation, home: string | und
  * grant, and never writes or removes anything; `examine` prints
  * `{"stored":document or null,"pending":{"base":B,"credential":...} or null}`
  * (null for a missing store; otherwise its exit codes are `read`'s), also
- * without writing; `write` replaces only the OAuth grant when the stored
- * refresh token is still the expected one, and leaves the pending file alone;
+ * without writing; `write` replaces only the OAuth grant (the two tokens,
+ * `expiresAt`, and `refreshTokenExpiresAt` when the renewal has one; a stored
+ * one stays otherwise) when the stored refresh token is still the expected
+ * one, and leaves the pending file alone;
  * `pending` writes `{base, credential}` from stdin as the pending file;
  * `readpending` prints `{"pending":...}` alone, for a store that cannot be
  * read; `clearpending` takes `{base, tokens}` and removes the pending file only
@@ -137,16 +143,22 @@ function copy(source) {
   }
   return target;
 }
+function grantOnly(oauth) {
+  var grant = { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt };
+  if (typeof oauth.refreshTokenExpiresAt === 'number' && isFinite(oauth.refreshTokenExpiresAt)) grant.refreshTokenExpiresAt = oauth.refreshTokenExpiresAt;
+  return grant;
+}
 function merged(document, oauth) {
   var next = copy(document);
   var inner = copy(document.claudeAiOauth);
-  inner.accessToken = oauth.accessToken;
-  inner.refreshToken = oauth.refreshToken;
-  inner.expiresAt = oauth.expiresAt;
+  var grant = grantOnly(oauth);
+  inner.accessToken = grant.accessToken;
+  inner.refreshToken = grant.refreshToken;
+  inner.expiresAt = grant.expiresAt;
+  if (grant.refreshTokenExpiresAt !== undefined) inner.refreshTokenExpiresAt = grant.refreshTokenExpiresAt;
   next.claudeAiOauth = inner;
   return next;
 }
-function grantOnly(oauth) { return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }; }
 function remove(file) { try { fs.unlinkSync(file); } catch (ignored) {} }
 function readJson(file, strict) {
   var fd;
@@ -340,8 +352,10 @@ if /bin/cat >> "$t" && /bin/sync && /bin/mv -f "$t" "$0"; then /bin/sync; exit 0
 exit 1
 `
 
-type OAuthGrant = Pick<Credential['claudeAiOauth'], 'accessToken' | 'refreshToken' | 'expiresAt'>
-type KeychainStore = { kind: 'keychain'; key: string; service: string; account: string | undefined; writeAccount: string; pendingPath: string | undefined; cwd: string }
+/** What a renewal changes in a stored login; `refreshTokenExpiresAt` only when the server gave one. */
+type OAuthGrant = Pick<Credential['claudeAiOauth'], 'accessToken' | 'refreshToken' | 'expiresAt' | 'refreshTokenExpiresAt'>
+/** `filePath` is the credentials file Claude Code falls back to when the keychain cannot store a login. */
+type KeychainStore = { kind: 'keychain'; key: string; service: string; account: string | undefined; writeAccount: string; filePath: string | undefined; pendingPath: string | undefined; cwd: string }
 type FileStore = { kind: 'file'; key: string; path: string; pendingPath: string; cwd: string; platform: HostPlatform }
 type Store = KeychainStore | FileStore
 // Never name an operation `inspect` (or `debug`): Node runs a first program argument with that name as its debugger client, even after -e.
@@ -400,7 +414,7 @@ function invalidStore(): Error {
 function grantOf(value: unknown): OAuthGrant | null {
   const oauth = (value as { claudeAiOauth?: Partial<OAuthGrant> } | null)?.claudeAiOauth
   return typeof oauth?.accessToken === 'string' && typeof oauth.refreshToken === 'string' && typeof oauth.expiresAt === 'number' && Number.isFinite(oauth.expiresAt)
-    ? { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+    ? grantOnly(oauth as OAuthGrant)
     : null
 }
 
@@ -452,12 +466,14 @@ export function pendingState(stored: Credential | null, pending: PendingLogin): 
   return 'obsolete'
 }
 
+/** The stored document with a renewal's grant; a stored `refreshTokenExpiresAt` stays when the renewal gave none, as in Claude Code. */
 function merged(document: Credential, oauth: OAuthGrant): Credential {
-  return { ...document, claudeAiOauth: { ...document.claudeAiOauth, accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt } }
+  return { ...document, claudeAiOauth: { ...document.claudeAiOauth, ...grantOnly(oauth) } }
 }
 
 function grantOnly(oauth: OAuthGrant): OAuthGrant {
-  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+  const expiry = oauth.refreshTokenExpiresAt
+  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt, ...(typeof expiry === 'number' && Number.isFinite(expiry) ? { refreshTokenExpiresAt: expiry } : {}) }
 }
 
 /** Whether a usable pending renewal is later than a usable memory one: memory does not descend from it. */
@@ -484,10 +500,59 @@ export function bestLogin(stored: Credential | null, pending: PendingLogin | nul
   return { login: merged(stored, candidate.credential.claudeAiOauth), source: candidate === fromMemory ? 'memory' : 'pending', candidate }
 }
 
-async function fileStoreAvailable(io: Io, platform: HostPlatform): Promise<void> {
-  if (platform !== 'win32') return
-  const forced = await io.env('FORCE_WINDOWS_CREDMAN')
-  if (forced && !/^(?:0|false|no|off)$/i.test(forced)) throw new Error('The optional FORCE_WINDOWS_CREDMAN native browser store is not supported by Rice Accounts. Start this session without that override, or use a claudeai-token account in Windows Credential Manager.')
+/** A config file's text: '' when there is none (or a folder stands there), undefined when it cannot be read. */
+async function configText(io: Io, path: string): Promise<string | undefined> {
+  const stat = await io.stat(path).catch(() => null)
+  if (stat === null || stat.kind === 'dir') return ''
+  if (stat.kind !== 'file') return undefined
+  return io.read(path).catch(() => undefined)
+}
+
+/**
+ * Why Claude Code on Windows keeps the login at `location` in Credential
+ * Manager (read before the credentials file), or undefined when it uses the
+ * file alone. Its rule, read in the 2.1.302 binary: CLAUDE_CODE_FORCE_WINDOWS_CREDMAN
+ * is exactly 1, or the cached GrowthBook flag tengu_windows_credman is true in
+ * `<config folder>/.config.json` when that file is present and not empty, else
+ * in `<CLAUDE_CONFIG_DIR or home>/.claude.json`. A config that cannot be read
+ * or parsed counts as off, as it does there.
+ */
+async function credentialManagerCause(io: Io, location: LoginLocation, home: string | undefined): Promise<string | undefined> {
+  if (await io.env(CREDMAN_VARIABLE) === '1') return `${CREDMAN_VARIABLE} is 1`
+  const { configDir } = location.storage
+  const folder = (path: string) => path.replace(/[\\/]+$/, '')
+  let file: string | undefined = `${folder(configDir ?? location.defaultConfigDir)}/.config.json`
+  let text = await configText(io, file)
+  if (text === '') {
+    file = configDir ? `${folder(configDir)}/.claude.json` : home ? `${folder(home)}/.claude.json` : undefined
+    text = file === undefined ? undefined : await configText(io, file)
+  }
+  if (!text) return undefined
+  let flag: unknown
+  try { flag = (JSON.parse(text) as { cachedGrowthBookFeatures?: Record<string, unknown> }).cachedGrowthBookFeatures?.[CREDMAN_FLAG] } catch { return undefined }
+
+  return flag === true ? `its cached setting ${CREDMAN_FLAG} is on in ${file}` : undefined
+}
+
+/** Refuse a Windows login Claude Code keeps in Credential Manager: this module reads browser logins from the credentials file only. */
+async function refuseCredentialManager(io: Io, location: LoginLocation, home: string | undefined, path: string): Promise<void> {
+  const cause = await credentialManagerCause(io, location, home)
+  if (cause === undefined) return
+  const variable = cause.startsWith(CREDMAN_VARIABLE) ? `, or start this session and account setup without ${CREDMAN_VARIABLE}` : ''
+  throw new Error(`Claude Code keeps the login for ${path.replace(/[\\/]\.credentials\.json$/, '')} in Windows Credential Manager (${cause}), and Rice Accounts reads browser logins only from the credentials file ${path}. Use a claudeai-token account instead (/rice-account add <name> claudeai-token), whose token Rice Accounts keeps in Windows Credential Manager itself${variable}.`)
+}
+
+/**
+ * Claude Code on macOS keeps a login in its plaintext credentials file only
+ * when the keychain could not store it, and reads that file when the keychain
+ * holds no item. Whether `path` holds such a login; the grant is not kept.
+ */
+async function fileHoldsLogin(io: Io, path: string): Promise<boolean> {
+  const stat = await io.stat(path).catch(() => null)
+  if (stat === null || stat.kind !== 'file' || stat.size > PENDING_LIMIT) return false
+  const text = await io.read(path).catch(() => null)
+  if (text === null) return false
+  try { return grantOf(JSON.parse(text)) !== null } catch { return false }
 }
 
 /** Windows paths name one file whatever their case or separators. */
@@ -500,14 +565,15 @@ async function storeOf(io: Io, location: LoginLocation): Promise<Store> {
   if (platform === 'darwin') {
     const service = await liveServiceName(location.storage, location.defaultConfigDir)
     const account = await resolveKeychainAccount(io, location.user)
-    let pendingPath: string | undefined
-    try { pendingPath = `${nativeCredentialPath(location, await io.env('HOME'), platform)}${PENDING_SUFFIX}` } catch { pendingPath = undefined }
+    let filePath: string | undefined
+    try { filePath = nativeCredentialPath(location, await io.env('HOME'), platform) } catch { filePath = undefined }
+    const pendingPath = filePath === undefined ? undefined : `${filePath}${PENDING_SUFFIX}`
 
-    return { kind: 'keychain', key: `keychain\0${service}\0${account ?? ''}`, service, account, writeAccount: account ?? keychainAccountName(undefined), pendingPath, cwd: '/' }
+    return { kind: 'keychain', key: `keychain\0${service}\0${account ?? ''}`, service, account, writeAccount: account ?? keychainAccountName(undefined), filePath, pendingPath, cwd: '/' }
   }
-  await fileStoreAvailable(io, platform)
   const home = platform === 'win32' ? await io.env('USERPROFILE') ?? await io.env('HOME') : await io.env('HOME')
   const path = nativeCredentialPath(location, home, platform)
+  if (platform === 'win32') await refuseCredentialManager(io, location, home, path)
   // POSIX never searches the working folder for a program; Windows does, so
   // there it is the Claude config folder, which only this user writes.
   const cwd = platform === 'win32' ? location.defaultConfigDir : '/'
@@ -657,10 +723,14 @@ async function readPendingFile(io: Io, path: string): Promise<PendingFile | null
 /**
  * The keychain item and the pending file. Reads, the compare before a write
  * and the read-back after it all address the same item: the account when it
- * is known, else none.
+ * is known, else none. Without an item, a login Claude Code kept in its
+ * plaintext credentials file instead is reported, never used.
  */
 async function keychainView(io: Io, store: KeychainStore): Promise<StoreView> {
   const text = await readItem(io, store.service, store.account)
+  if (text === null && store.filePath !== undefined && await fileHoldsLogin(io, store.filePath)) {
+    throw new StoreGoneError(`The Claude login for ${store.filePath.replace(/\/\.credentials\.json$/, '')} is in its plaintext credentials file ${store.filePath}, not in the macOS keychain item "${store.service}" that Rice Accounts reads: Claude Code keeps a login in that file only when the keychain could not store it, for example while the keychain was locked. Unlock the login keychain (security unlock-keychain), then sign in again in a terminal so Claude Code moves the login into the keychain: for a saved account, run the command /rice-account setup <name> prints, with --login added; for this machine's login, run claude auth login.`)
+  }
   const stored = text === null ? null : credential(text)
   if (stored === null || store.pendingPath === undefined) return { stored, pending: null }
 
@@ -1020,7 +1090,7 @@ export async function checkRenewable(io: Io, location: LoginLocation, current: C
   if (store.kind !== 'keychain') return
   const oauth = current.claudeAiOauth
   try {
-    fitCredential(merged(current, { accessToken: grown(oauth.accessToken), refreshToken: grown(oauth.refreshToken), expiresAt: Number.MAX_SAFE_INTEGER }), store.service, store.writeAccount)
+    fitCredential(merged(current, { accessToken: grown(oauth.accessToken), refreshToken: grown(oauth.refreshToken), expiresAt: Number.MAX_SAFE_INTEGER, refreshTokenExpiresAt: Number.MAX_SAFE_INTEGER }), store.service, store.writeAccount)
   } catch (error) {
     throw new Error(`This login is too large to store in the macOS keychain (${message(error)}). It was not renewed, so its refresh token was not spent; sign it in again with account setup.`)
   }

@@ -256,6 +256,35 @@ function loginFolder(account, name, deps) {
   return { expected, saved }
 }
 
+/**
+ * Why Claude Code on Windows keeps the browser login in `loginDir` in
+ * Credential Manager, which Rice Accounts does not read, or undefined. Its rule
+ * (2.1.302, as hooks/credentials.ts reads it for the plugin):
+ * CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is exactly 1, or the cached GrowthBook flag
+ * tengu_windows_credman is true in <loginDir>/.config.json when that file is
+ * present and not empty, else in <loginDir>/.claude.json (CLAUDE_CONFIG_DIR is
+ * the login folder there). A config that cannot be read counts as off.
+ */
+function credentialManagerProblem(deps, loginDir) {
+  const fix = 'Add a claudeai-token account for Windows Credential Manager instead: /rice-account add <name> claudeai-token.'
+  if (deps.env.CLAUDE_CODE_FORCE_WINDOWS_CREDMAN === '1') {
+    return `Claude Code keeps browser logins in Windows Credential Manager while CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is 1, and Rice Accounts reads them only from the credentials file. Run this setup without that variable, or: ${fix}`
+  }
+  const text = path => {
+    let found
+    try { found = deps.inspect(path) } catch { return undefined }
+    if (!found || found.directory) return ''
+    try { return deps.read(path) } catch { return undefined }
+  }
+  let file = win32.join(loginDir, '.config.json')
+  let content = text(file)
+  if (content === '') content = text(file = win32.join(loginDir, '.claude.json'))
+  let flag
+  try { flag = content ? JSON.parse(content).cachedGrowthBookFeatures?.tengu_windows_credman : undefined } catch { return undefined }
+  if (flag !== true) return undefined
+  return `Claude Code's cached setting tengu_windows_credman is on in ${file}, so it keeps this account's browser login in Windows Credential Manager, and Rice Accounts reads browser logins only from the credentials file. ${fix}`
+}
+
 /** All credential bytes remain in memory or the native credential-store process. */
 async function secretSetup(account, name, deps, force) {
   const ref = secretArguments(account, name)
@@ -386,9 +415,11 @@ export async function runSetup(args, overrides = {}) {
   if (expectedEmail !== undefined && account.kind !== 'claudeai') throw Error('--email is supported only for claudeai browser login, not setup tokens or provider accounts.')
   if ((manual || browser !== undefined) && account.kind !== 'claudeai') throw Error('--manual and --browser are supported only for claudeai browser login.')
   if (account.kind === 'claudeai') {
-    if (deps.platform === 'win32' && deps.env.FORCE_WINDOWS_CREDMAN && !/^(?:0|false|no|off)$/i.test(deps.env.FORCE_WINDOWS_CREDMAN)) throw Error('The optional FORCE_WINDOWS_CREDMAN browser store is not supported by Rice Accounts. Run this setup without that override, or add a claudeai-token account for Windows Credential Manager.')
     if (account.loginDir === undefined) throw Error(`${name} has no absolute loginDir. Check accounts.json.`)
     const folder = loginFolder(account, name, deps)
+    const credentialManager = () => deps.platform === 'win32' ? credentialManagerProblem(deps, folder.saved) : undefined
+    const refused = credentialManager()
+    if (refused) throw Error(refused)
     deps.prepare(folder.expected, deps.prepareContext)
     const env = loginEnvironment(deps.env, folder.saved)
     // Native Claude honors BROWSER for this child only. Literal true keeps
@@ -415,6 +446,9 @@ export async function runSetup(args, overrides = {}) {
       successful(deps.exec('claude', args, { env, interactive: true }), 'Claude login')
       verified = status()
       if (!verified.ready) throw Error('Claude login is incomplete. Run the same command to resume.')
+      // The sign-in can cache the flag that moves this folder's next login into Credential Manager.
+      const cached = credentialManager()
+      if (cached) throw Error(cached)
     }
     if (expectedEmail !== undefined && verified.email?.toLowerCase() !== expectedEmail.toLowerCase()) {
       const actual = verified.email ? `Claude is signed in as ${verified.email}` : 'the signed-in email is unavailable'
