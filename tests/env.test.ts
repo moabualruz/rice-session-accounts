@@ -1,8 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { AccountConfig } from '../hooks/config'
-import { headerToken, MANAGED, oauthHeaders, planEnv } from '../hooks/env'
-import type { Originals } from '../hooks/env'
+import { BLOCKING_VARIABLES, headerToken, MANAGED, oauthHeaders, planEnv, SWITCH_BLOCKERS, switchBlocker } from '../hooks/env'
+import type { Originals, SwitchContext } from '../hooks/env'
 
 const none = Object.fromEntries(MANAGED.map(name => [name, null])) as Originals
 const launched: Originals = { ...none, AWS_PROFILE: 'personal', AWS_REGION: 'eu-central-1', ANTHROPIC_API_KEY: 'sk-launch', CLAUDE_CODE_USE_BEDROCK: '1' }
@@ -89,4 +89,41 @@ test('every supported OAuth account clears inherited native provider selectors a
       expect(plan[name]).toBe(undefined)
     }
   }
+})
+
+const clean: SwitchContext = { settings: {}, variables: {}, isOAuthLogin: true }
+
+test('a session signed in with a Claude subscription and no competing credential may switch', async () => {
+  expect(switchBlocker(clean)).toBe(undefined)
+  // The switch clears these itself, and the subscription login then carries the selected bearer.
+  expect(switchBlocker({ ...clean, settings: { env: { ANTHROPIC_API_KEY: 'fixture' }, apiKeyHelper: '' } })).toBe(undefined)
+})
+
+test('each measured credential source refuses the switch with its cause and its fix on one line', async () => {
+  const cases: [SwitchContext, string, string][] = [
+    [{ ...clean, settings: { apiKeyHelper: '/fixture/helper' } }, 'apiKeyHelper setting', 'Remove apiKeyHelper'],
+    [{ ...clean, variables: { CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '3' } }, 'through CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', 'Start Claude Code without CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'],
+    [{ ...clean, variables: { ANTHROPIC_FEDERATION_RULE_ID: 'fdrl_fixture', ANTHROPIC_ORGANIZATION_ID: 'fixture-org' } }, 'workload identity federation', 'Start Claude Code without them'],
+    [{ ...clean, isOAuthLogin: false }, 'not started signed in with a Claude subscription', 'claude auth login, or CLAUDE_CODE_OAUTH_TOKEN'],
+  ]
+  for (const [context, cause, fix] of cases) {
+    const refusal = switchBlocker(context) ?? ''
+    expect(refusal.startsWith('This session cannot switch accounts: ')).toBe(true)
+    expect(refusal).toContain(cause)
+    expect(refusal).toContain(fix)
+    expect(refusal).not.toContain('\n')
+  }
+  expect(cases.length).toBe(SWITCH_BLOCKERS.length)
+})
+
+test('the first source in the table is reported, and an unknown input refuses nothing', async () => {
+  expect(switchBlocker({ settings: { apiKeyHelper: 'helper' }, variables: { CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '3' }, isOAuthLogin: false }) ?? '').toContain('apiKeyHelper')
+  expect(switchBlocker({ ...clean, settings: undefined })).toBe(undefined)
+  expect(switchBlocker({ ...clean, isOAuthLogin: undefined })).toBe(undefined)
+  // Federation is in effect only with both variables.
+  expect(switchBlocker({ ...clean, variables: { ANTHROPIC_FEDERATION_RULE_ID: 'fdrl_fixture' } })).toBe(undefined)
+})
+
+test('the variables the switch reads are exactly those the table names', async () => {
+  expect([...BLOCKING_VARIABLES].sort()).toEqual(['ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'])
 })
