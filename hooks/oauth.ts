@@ -3,7 +3,7 @@
 // Modified: kept the endpoint constants, refresh, usage and profile parsing; pane-specific
 // readings, spend and healing removed; LimitView declared here; refresh responses and
 // token-endpoint failures validated and classified without echoing bodies.
-import type { HttpInit, HttpResponse } from 'claude-code'
+import type { HttpInit, HttpResponse, SessionRateLimit } from 'claude-code'
 
 import type { Credential } from './keychain'
 
@@ -88,6 +88,40 @@ export function parseUsage(body: unknown): LimitView[] {
   return windows.flatMap(([label, window]) =>
     typeof window?.utilization === 'number' ? [{ label, percent: window.utilization, resetsAt: window.resets_at ?? undefined }] : [],
   )
+}
+
+/** The window kinds the engine's `SessionRateLimit` declares. */
+const ENGINE_LIMIT_KINDS = new Set(['five_hour', 'seven_day', 'spend_limit'])
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/
+
+/**
+ * Usage windows as the engine's `SessionRateLimit` declares them (2.1.302):
+ * kind `five_hour`, `seven_day` or `spend_limit`; `percentUsed` 0 to 100 with
+ * at most one decimal, past 100 only on an exceeded spend limit; `resetsAt` an
+ * ISO 8601 timestamp. A model's own weekly window has no engine kind and is
+ * left out here; this module's own text still shows it.
+ */
+export function sessionRateLimits(limits: readonly { kind: string; percentUsed: number; resetsAt?: string }[]): SessionRateLimit[] {
+  return limits.flatMap(limit => {
+    if (!ENGINE_LIMIT_KINDS.has(limit.kind) || !Number.isFinite(limit.percentUsed)) return []
+    const percent = Math.max(0, limit.kind === 'spend_limit' ? limit.percentUsed : Math.min(100, limit.percentUsed))
+    return [{ kind: limit.kind, percentUsed: Math.round(percent * 10) / 10, ...(limit.resetsAt !== undefined && ISO_TIME.test(limit.resetsAt) ? { resetsAt: limit.resetsAt } : {}) }]
+  })
+}
+
+/**
+ * The User-Agent Claude Code 2.1.302 sends from its API client, which makes its
+ * GET /api/oauth/usage request: `claude-cli/<version> (external, cli)`, `cli`
+ * being its entry point in a terminal session. A version that is not one
+ * header token is sent as `unknown`.
+ */
+export function userAgent(version: string | undefined): string {
+  return `claude-cli/${version !== undefined && /^[\x21-\x7e]{1,128}$/.test(version) ? version : 'unknown'} (external, cli)`
+}
+
+/** `init` with that User-Agent, so usage, profile and token requests identify as Claude Code. */
+export function withUserAgent(init: HttpInit | undefined, version: string | undefined): HttpInit {
+  return { ...init, headers: { ...init?.headers, 'User-Agent': userAgent(version) } }
 }
 
 /** A usage or profile request: with a bearer token, or with the session's own credential handle. */

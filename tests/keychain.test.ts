@@ -6,7 +6,7 @@ import type { Io } from '../hooks/io'
 import { runFailure, trustedRun } from '../hooks/io'
 import type { Credential } from '../hooks/keychain'
 import { addLine, addLineLength, fitCredential, itemText, keychainAccountName, KeychainLimitError, LIVE_SERVICE, liveServiceName, parseCredential, readItem, resolveKeychainAccount, SECURITY_LINE_LIMIT, writeItem } from '../hooks/keychain'
-import { applyRefresh, MAX_TOKEN_LIFETIME_S, needsRefresh, parseUsage, RefreshResponseError, refreshFailure, refreshInit, tokenErrorCode, UNKNOWN_TOKEN_LIFETIME_S } from '../hooks/oauth'
+import { applyRefresh, MAX_TOKEN_LIFETIME_S, needsRefresh, oauthInit, parseUsage, RefreshResponseError, refreshFailure, refreshInit, sessionRateLimits, tokenErrorCode, UNKNOWN_TOKEN_LIFETIME_S, userAgent, withUserAgent } from '../hooks/oauth'
 
 test('the keychain service is named as Claude Code names it for its config directory', async () => {
   const home = '/home/me/.claude'
@@ -241,6 +241,37 @@ test('token endpoint failures say whether to sign in again and never echo the bo
   expect(tokenErrorCode(body('made-up-code'))).toBe(undefined)
   expect(tokenErrorCode(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'x' } }))).toBe('rate_limit_error')
   expect(tokenErrorCode(`{"error":"invalid_grant","pad":"${'p'.repeat(70_000)}"}`)).toBe(undefined)
+})
+
+test('requests identify as Claude Code exactly as its API client does: claude-cli/<version> (external, cli)', async () => {
+  expect(userAgent('2.1.302')).toBe('claude-cli/2.1.302 (external, cli)')
+  expect(userAgent('2.1.280-dev.20260920.t101500.sha1a2b3c4')).toBe('claude-cli/2.1.280-dev.20260920.t101500.sha1a2b3c4 (external, cli)')
+  for (const unusable of [undefined, '', '2.1 302', '2.1.302\r\nX-Injected: 1']) expect(userAgent(unusable)).toBe('claude-cli/unknown (external, cli)')
+  const init = withUserAgent(oauthInit({ token: 'fixture-token' }), '2.1.302')
+  expect(init.headers).toEqual({ 'anthropic-beta': 'oauth-2025-04-20', Authorization: 'Bearer fixture-token', 'User-Agent': 'claude-cli/2.1.302 (external, cli)' })
+  const refresh = withUserAgent(refreshInit(parseCredential('{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}')), '2.1.302')
+  expect(refresh.method).toBe('POST')
+  expect(refresh.headers).toEqual({ 'Content-Type': 'application/json', 'User-Agent': 'claude-cli/2.1.302 (external, cli)' })
+  expect(withUserAgent(undefined, '2.1.302')).toEqual({ headers: { 'User-Agent': 'claude-cli/2.1.302 (external, cli)' } })
+})
+
+test('usage handed to the engine has only its declared kinds, one decimal and ISO reset times', async () => {
+  expect(sessionRateLimits([
+    { kind: 'five_hour', percentUsed: 7.000000000000001, resetsAt: '2026-10-18T15:00:00.123456+00:00' },
+    { kind: 'seven_day', percentUsed: 23.46 },
+    { kind: 'Opus', percentUsed: 12 },
+    { kind: 'weekly_opus', percentUsed: 12 },
+    { kind: 'five_hour', percentUsed: Number.NaN },
+    { kind: 'seven_day', percentUsed: 104.4, resetsAt: 'next Tuesday' },
+    { kind: 'spend_limit', percentUsed: 104.44 },
+    { kind: 'five_hour', percentUsed: -3 },
+  ])).toEqual([
+    { kind: 'five_hour', percentUsed: 7, resetsAt: '2026-10-18T15:00:00.123456+00:00' },
+    { kind: 'seven_day', percentUsed: 23.5 },
+    { kind: 'seven_day', percentUsed: 100 },
+    { kind: 'spend_limit', percentUsed: 104.4 },
+    { kind: 'five_hour', percentUsed: 0 },
+  ])
 })
 
 test('usage windows read both response shapes', async () => {

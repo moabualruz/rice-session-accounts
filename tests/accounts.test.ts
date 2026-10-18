@@ -1,8 +1,10 @@
-import type { ProcessRunInit } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import type { CommandRunInput, On, ProcessRunInit } from 'claude-code'
+import { expect, mock, test } from 'claude-code/testing'
+
+import { fixturePath } from './fixture-path'
 
 import { freshLogin, LOCK_HEARTBEAT_LIMIT_MS, LOCK_HEARTBEAT_MS, RENEWAL_LOCK } from '../hooks/accounts'
-import { pathsFor } from '../hooks/config'
+import { defaultConfig, pathsFor, serializeConfig } from '../hooks/config'
 import { bestLogin, forgetHostPlatform, forgetUnsavedLogins, hasUnsavedLogin, hostPlatform, nativeCredentialPath, parsePendingLogin, pendingState, readLogin, readSecret, writeLogin } from '../hooks/credentials'
 import type { LoginLocation, PendingLogin } from '../hooks/credentials'
 import type { Io } from '../hooks/io'
@@ -1290,4 +1292,119 @@ test('macOS without a known login name reads, compares and reads back the same i
   expect((world.state.lines[0] ?? '').startsWith(`add-generic-password -U -a "claude-code-user" -s "${world.service}" -X "`)).toBe(true)
   expect(world.state.items.length).toBe(1)
   expect(JSON.parse(world.item()?.text ?? '{}').claudeAiOauth.refreshToken).toBe('rotated-grant')
+})
+
+// The plugin in a Linux host: what its requests carry, and the usage it hands the engine.
+const HOST_HOME = '/fixture/identity-host'
+const HOST_CONFIG = `${HOST_HOME}/.claude`
+const HOST_PATHS = pathsFor(HOST_CONFIG)
+const HOST_NOW = 1_800_000_000_000
+const HOST_LOCK = { make: 'mkdir -p "$(dirname "$0")" && mkdir "$0"', touch: '[ -d "$0" ] && touch -c "$0"', remove: '[ ! -d "$0" ] || rmdir "$0"' }
+const USAGE_DRIVER = { plugins: [{ name: 'usage-driver', register(on: On) {
+  on('command.run', { command: 'usage-probe' }, async $ => ({ text: JSON.stringify((await $.session.usage()).rateLimits) }))
+} }] }
+
+function hostCommand(args: string, name = 'rice-account'): CommandRunInput {
+  return { command: name, args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } }
+}
+
+function identityHost(on: On) {
+  const work = HOST_PATHS.loginDir('work')
+  const documents = new Map<string, string>([
+    [HOST_PATHS.config, serializeConfig({ ...defaultConfig(), accounts: { ...defaultConfig().accounts, work: { kind: 'claudeai', loginDir: work } } })],
+    [`${work}/.credentials.json`, JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-work', refreshToken: 'fixture-refresh-work', expiresAt: 1 } })],
+    [`${work}/.claude.json`, JSON.stringify({ oauthAccount: { emailAddress: 'work@example.test' } })],
+    [`${HOST_CONFIG}/.credentials.json`, JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-access-machine', refreshToken: 'fixture-refresh-machine', expiresAt: HOST_NOW + 3_600_000 } })],
+  ])
+  const environment = new Map([['HOME', HOST_HOME], ['USER', 'fixture'], ['CLAUDE_CONFIG_DIR', HOST_CONFIG]])
+  const kept = new Map<string, { value: unknown; version: number }>()
+  const locks = new Map<string, number>()
+  const requests: { url: string; agent: string | undefined }[] = []
+  const status: (string | undefined)[] = []
+  const answer = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const json = (body: unknown) => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify(body) } })
+  mock.clock(on, { now: HOST_NOW })
+  mock.store(on)
+  on('state.get', (_host, input) => ({ value: (kept.get(String(input.key)) ?? { value: undefined, version: 0 }) as never }))
+  on('state.set', (_host, input) => {
+    const version = (kept.get(String(input.key))?.version ?? 0) + 1
+    kept.set(String(input.key), { value: input.value, version })
+    return { value: { isSet: true, version } }
+  })
+  on('env.get', (_host, input) => ({ value: environment.get(input.name) }))
+  on('env.set', (_host, input) => {
+    if (input.value === undefined) environment.delete(input.name)
+    else environment.set(input.name, input.value)
+    return { value: {} }
+  })
+  on('fs.exists', (_host, input) => ({ value: documents.has(fixturePath(input.path)) }))
+  on('fs.read', (_host, input) => {
+    const text = documents.get(fixturePath(input.path))
+    if (text === undefined) throw new Error('ENOENT: isolated fixture file')
+    return { value: text }
+  })
+  on('fs.write', (_host, input) => { documents.set(fixturePath(input.path), input.text); return { value: undefined } })
+  on('fs.stat', (_host, input) => {
+    const modified = locks.get(fixturePath(input.path))
+    if (modified === undefined) throw new Error('ENOENT: isolated fixture file')
+    return { value: { kind: 'dir' as const, size: 0, mtimeMs: modified, isLink: false } }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', (_host, input) => {
+    const [program, , script, operation, path = ''] = input.argv
+    if (program === '/usr/bin/uname') return answer(0, 'Linux\n')
+    if (program === '/bin/sh' && script === HOST_LOCK.make) { locks.set(fixturePath(operation ?? ''), HOST_NOW); return answer(0) }
+    if (program === '/bin/sh' && script === HOST_LOCK.touch) { locks.set(fixturePath(operation ?? ''), HOST_NOW + 1); return answer(0) }
+    if (program === '/bin/sh' && script === HOST_LOCK.remove) { locks.delete(fixturePath(operation ?? '')); return answer(0) }
+    if (program !== 'node') return answer(127)
+    const text = documents.get(path)
+    if (operation === 'read') return text === undefined ? answer(44) : answer(0, text)
+    if (operation === 'examine') return answer(0, JSON.stringify({ stored: text === undefined ? null : JSON.parse(text), pending: null }))
+    if (operation === 'write') {
+      const current = JSON.parse(text ?? '{}') as Credential
+      const request = JSON.parse(input.init?.stdin ?? '{}') as { oauth: Credential['claudeAiOauth'] }
+      const saved = { ...current, claudeAiOauth: { ...current.claudeAiOauth, ...request.oauth } }
+      documents.set(path, JSON.stringify(saved))
+      return answer(0, JSON.stringify(saved))
+    }
+    return answer(0)
+  })
+  on('http.fetch', (_host, input) => {
+    requests.push({ url: input.url, agent: input.init?.headers?.['User-Agent'] })
+    if (input.url === 'https://platform.claude.com/v1/oauth/token') return json({ access_token: 'fixture-access-work-renewed', refresh_token: 'fixture-refresh-work-2', expires_in: 3600 })
+    if (input.url === 'https://api.anthropic.com/api/oauth/profile') return json({ account: { email: 'machine@example.test' } })
+    return json({ limits: [
+      { kind: 'session', percent: 12.345, resets_at: '2026-10-18T15:00:00+00:00' },
+      { kind: 'weekly_all', percent: 40 },
+      { kind: 'weekly_opus', percent: 7.000000000000001, scope: { model: { display_name: 'Opus' } } },
+    ] })
+  })
+  on('session.version', () => ({ value: { version: '2.1.302' } }))
+  on('session.start', (_host, input) => ({ cwd: input.cwd }))
+  on('session.usage', () => ({ value: { startedAt: HOST_NOW, context: { window: 200_000 }, rateLimits: [] } }))
+  on('command.register', (_host, input) => ({ value: { command: input.name } }))
+  on('ui.status', (_host, input) => { status.push(input.text); return { value: undefined } })
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.log', () => ({ value: undefined }))
+
+  return { requests, status }
+}
+
+test('usage, profile and token requests carry Claude Code\'s User-Agent, and session.usage gets only the windows the engine declares', USAGE_DRIVER, async ($, on) => {
+  const host = identityHost(on)
+  await $.session.start({ cwd: HOST_HOME, surface: 'terminal', isInteractive: true })
+  expect((await $.command.run(hostCommand('check'))).text ?? '').toContain('login: signed in as machine@example.test')
+  expect((await $.command.run(hostCommand('work'))).text ?? '').toContain('now uses work')
+  expect(JSON.parse((await $.command.run(hostCommand('', 'usage-probe'))).text ?? '[]')).toEqual([
+    { kind: 'five_hour', percentUsed: 12.3, resetsAt: '2026-10-18T15:00:00+00:00' },
+    { kind: 'seven_day', percentUsed: 40 },
+  ])
+  // The plugin's own status line still shows the model's window.
+  expect(host.status.at(-1) ?? '').toContain('5h 12%, wk 40%, Opus 7%')
+  expect(host.requests.map(request => request.url)).toEqual([
+    'https://api.anthropic.com/api/oauth/profile',
+    'https://platform.claude.com/v1/oauth/token',
+    'https://api.anthropic.com/api/oauth/usage',
+  ])
+  for (const request of host.requests) expect(request.agent).toBe('claude-cli/2.1.302 (external, cli)')
 })
