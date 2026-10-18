@@ -9,8 +9,8 @@ import { ADD_OPTIONS, addAccount, defaultConfig, describeAccount, KINDS, LOGIN_N
 import type { AccountConfig, Config, Kind } from './config'
 import { readLogin } from './credentials'
 import { argvInvokesClaude, commandInvokesClaude, GUARD_FAILED } from './descendants'
-import { headerToken, MANAGED, oauthHeaders, planEnv, withoutAuthHeaders } from './env'
-import type { Managed, Originals } from './env'
+import { BLOCKING_VARIABLES, headerToken, MANAGED, oauthHeaders, planEnv, switchBlocker, withoutAuthHeaders } from './env'
+import type { Managed, Originals, SwitchContext } from './env'
 import { accountIdentity } from './identity'
 import type { EnvName, Io } from './io'
 import { message } from './io'
@@ -121,6 +121,12 @@ async function variable($: EngineInterface, name: EnvName): Promise<string | und
       return $.env.get('CLAUDE_CONFIG_DIR')
     case 'CLAUDE_SECURESTORAGE_CONFIG_DIR':
       return $.env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+    case 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR':
+      return $.env.get('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')
+    case 'ANTHROPIC_FEDERATION_RULE_ID':
+      return $.env.get('ANTHROPIC_FEDERATION_RULE_ID')
+    case 'ANTHROPIC_ORGANIZATION_ID':
+      return $.env.get('ANTHROPIC_ORGANIZATION_ID')
   }
 }
 
@@ -596,6 +602,34 @@ async function renewIfActive($: EngineInterface, name: string): Promise<void> {
 }
 
 /**
+ * What a switch is checked against (`SWITCH_BLOCKERS`), read without changing
+ * anything. A read that fails is logged and left unknown, which refuses nothing.
+ */
+async function switchContext($: EngineInterface): Promise<SwitchContext> {
+  let settings: SwitchContext['settings']
+  try { settings = await $.settings.read() } catch (error) { $.ui.log(`The settings were not read before the switch: ${message(error)}`, { to: 'debug' }) }
+  const variables: Partial<Record<EnvName, string>> = {}
+  for (const name of BLOCKING_VARIABLES) {
+    const value = await variable($, name)
+    if (value) variables[name] = value
+  }
+  // Claude Code's own login as the process started: a launch OAuth token, else the stored /login.
+  const kept = ((await read($, originalsAtom)) ?? local.mirror.originals) as Originals | null
+  const launched = async (name: 'CLAUDE_CODE_OAUTH_TOKEN' | 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR') => kept ? kept[name] ?? undefined : await getManaged($, name)
+  let isOAuthLogin: boolean | undefined = Boolean(await launched('CLAUDE_CODE_OAUTH_TOKEN') || await launched('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'))
+  if (!isOAuthLogin) {
+    try {
+      const machine = await machineOf($)
+      isOAuthLogin = Boolean((await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken)
+    } catch (error) {
+      isOAuthLogin = undefined
+      $.ui.log(`The machine login was not read before the switch: ${message(error)}`, { to: 'debug' })
+    }
+  }
+  return { settings, variables, isOAuthLogin }
+}
+
+/**
  * Puts this process on an account: its secret read, the managed variables
  * set, the state and status updated. `isQuiet` renews or restores the
  * account the session holds, from the copy taken when it was selected.
@@ -612,6 +646,12 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false, expec
     }
   }
   if (!(KINDS as readonly string[]).includes(account.kind)) throw new Error('Rice Accounts switches Anthropic OAuth accounts only. Configure provider accounts in rice-multi-models. This saved entry was kept.')
+  // A new selection that Claude Code's own credential would override is refused
+  // before anything changes; a selection already in effect keeps renewing.
+  if (!isQuiet && account.kind !== 'login') {
+    const blocker = switchBlocker(await switchContext($))
+    if (blocker) throw new Error(blocker)
+  }
   const machine = await machineOf($)
   const originals = await originalsOf($)
   const material = await materialFor(machineIo($), name, account, pathsFor(machine.claudeDir), machine)

@@ -22,9 +22,11 @@ const storageBaseline=process.argv.includes('--baseline-storage')
 const started=Date.now(), requests=[], results=[]
 const tokenA='owned-public-oauth-a', tokenB='owned-public-oauth-b'
 const rotatedTokenA='owned-public-oauth-a-renewed'
+// An apiKeyHelper's key, which Claude Code sends in place of any selected bearer.
+const helperKey='owned-public-helper-key'
 const waitMs=process.platform==='win32'?45000:15000
 const childMs=process.platform==='win32'?120000:60000
-let child, baseline, timedOut=false
+let child, baseline, helper, timedOut=false
 
 function stop(process) {
   if(!process||process.exitCode!==null)return
@@ -57,11 +59,11 @@ const server=createServer(async(request,response)=>{
   if(request.method!=='POST'||!request.url?.startsWith('/v1/messages')){response.writeHead(404);response.end();return}
   let text='';for await(const bytes of request)text+=bytes
   const body=JSON.parse(text), messages=JSON.stringify(body.messages)
-  const role=['FRESH','RESTORED','CHILD_STREAM','CHILD','LATE_A','EXISTING_A','B_AFTER_LATE'].find(name=>messages.includes('OWNED_'+name))||'MAIN'
+  const role=['FRESH','RESTORED','CHILD_STREAM','CHILD','LATE_A','EXISTING_A','B_AFTER_LATE','HELPER'].find(name=>messages.includes('OWNED_'+name))||'MAIN'
   const bearer=request.headers.authorization
-  const account=[`Bearer ${tokenA}`,`Bearer ${rotatedTokenA}`].includes(bearer)?'a':bearer===`Bearer ${tokenB}`?'b':'unexpected'
+  const account=[`Bearer ${tokenA}`,`Bearer ${rotatedTokenA}`].includes(bearer)?'a':bearer===`Bearer ${tokenB}`?'b':bearer===`Bearer ${helperKey}`?'helper':'unexpected'
   const index=requests.filter(row=>row.role===role).length
-  requests.push({role,index,account,renewedBaseline:bearer===`Bearer ${rotatedTokenA}`,elapsedMs:Date.now()-started})
+  requests.push({role,index,account,apiKey:request.headers['x-api-key']!==undefined,renewedBaseline:bearer===`Bearer ${rotatedTokenA}`,elapsedMs:Date.now()-started})
   writeFileSync(join(fixture,'request-'+role),'observed')
   if(role==='LATE_A'&&index===0){
     const until=Date.now()+childMs-5000
@@ -220,10 +222,34 @@ export const register:Register=on=>{
   let freshOutput='';baseline.stdout.on('data',bytes=>freshOutput+=bytes);baseline.stderr.resume()
   const freshTimer=setTimeout(()=>stop(baseline),waitMs)
   const [freshExitCode]=await once(baseline,'close');clearTimeout(freshTimer)
+  // A session whose apiKeyHelper (here from --settings) would carry its requests:
+  // /rice-account must refuse before anything changes, and nothing may go out on B.
+  writeFileSync(join(fixture,'helper-settings.json'),JSON.stringify({apiKeyHelper:'echo '+helperKey}))
+  const helperResults=[]
+  helper=spawn(native,['-p','--input-format','stream-json','--output-format','stream-json','--verbose','--plugin-dir',plugin,'--setting-sources','user','--settings',join(fixture,'helper-settings.json'),'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--no-session-persistence'],{cwd:fixture,env:{...env,RICE_ACCOUNTS_PROOF_ROLE:'helper'},stdio:['pipe','pipe','pipe'],detached:process.platform!=='win32',windowsHide:true})
+  console.error(JSON.stringify({phase:'owned-helper-native-started',pid:helper.pid}))
+  const sendHelper=text=>helper.stdin.write(JSON.stringify({type:'user',message:{role:'user',content:text}})+'\n')
+  let helperPending=''
+  helper.stderr.resume()
+  helper.stdout.on('data',bytes=>{
+    helperPending+=bytes
+    let newline
+    while((newline=helperPending.indexOf('\n'))!==-1){
+      const line=helperPending.slice(0,newline);helperPending=helperPending.slice(newline+1)
+      let event;try{event=JSON.parse(line)}catch{continue}
+      if(event.type!=='result')continue
+      helperResults.push({subtype:event.subtype,isError:event.is_error,text:event.result})
+      if(helperResults.length===1)sendHelper('OWNED_HELPER: answer briefly.')
+      else helper.stdin.end()
+    }
+  })
+  sendHelper('/rice-account account-b')
+  const helperTimer=setTimeout(()=>stop(helper),childMs)
+  const [helperExitCode]=await once(helper,'close');clearTimeout(helperTimer)
   const read=name=>existsSync(join(fixture,name))?JSON.parse(readFileSync(join(fixture,name),'utf8')):null
   const observations=read('observations.json'),failure=read('failure.json')
   const settingsUnchanged=protectedFiles.every((file,index)=>readFileSync(file,'utf8')===(index===2?expectedMachineCredential:before[index]))
-  const receipt={scope:'production hooks in ordinary unmodified Claude; local synthetic native SDK',platform:process.platform,baseline:storageBaseline?'native-storage':'environment-token',exitCode,freshExitCode,timedOut,elapsedMs:Date.now()-started,requests,observations,failure,results,settingsUnchanged,preload:false,launchers:false,stderrChars:stderr.length,freshAnswer:freshOutput.includes('OWNED_PUBLIC_AUTH_OK')}
+  const receipt={scope:'production hooks in ordinary unmodified Claude; local synthetic native SDK',platform:process.platform,baseline:storageBaseline?'native-storage':'environment-token',exitCode,freshExitCode,helperExitCode,helperResults,timedOut,elapsedMs:Date.now()-started,requests,observations,failure,results,settingsUnchanged,preload:false,launchers:false,stderrChars:stderr.length,freshAnswer:freshOutput.includes('OWNED_PUBLIC_AUTH_OK')}
   console.log(JSON.stringify(receipt))
   assert.equal(failure,null,'owned public production fixture must complete')
   assert.equal(exitCode,0);assert.equal(freshExitCode,0)
@@ -250,8 +276,15 @@ export const register:Register=on=>{
   const restoredText=results[5].text,restoredAuth=JSON.parse(restoredText.slice(restoredText.indexOf('{')))
   assert.deepEqual(restoredAuth.profile,{selectedA:true,selectedB:false,nativeHandleRemoved:true,oauthBeta:true},'the same cached session handle must return to restored A after /login')
   assert.equal(settingsUnchanged,true,'switches must not write machine settings or account configuration')
+  assert.equal(helperExitCode,0)
+  assert.match(helperResults[0]?.text??'',/This session cannot switch accounts: .*apiKeyHelper/,'an apiKeyHelper session must refuse the switch up front')
+  assert.doesNotMatch(helperResults[0]?.text??'',/now uses/,'the refused switch must not be reported as in effect')
+  const helperRequests=requests.filter(row=>row.role==='HELPER')
+  assert.equal(helperRequests.length>0,true,'the apiKeyHelper session must still answer on its own key')
+  assert.deepEqual([...new Set(helperRequests.map(row=>row.account))],['helper'],'the apiKeyHelper session must never send the B bearer')
+  assert.equal(helperRequests.every(row=>row.apiKey),true,"the apiKeyHelper key goes out as x-api-key, which is why a header bearer cannot win")
 } finally {
-  for(const process of [child,baseline])if(process&&process.exitCode===null){stop(process);await once(process,'close').catch(()=>{})}
+  for(const process of [child,baseline,helper])if(process&&process.exitCode===null){stop(process);await once(process,'close').catch(()=>{})}
   server.closeAllConnections();await new Promise(resolve=>server.close(resolve))
   rmSync(fixture,{recursive:true,force:true})
 }

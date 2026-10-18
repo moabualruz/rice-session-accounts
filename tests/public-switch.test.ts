@@ -80,7 +80,9 @@ function fixture(on: On) {
   let refuseB = false
   let failState = false, refuseRollback = false
   const activeWrites: (string | null)[] = []
+  let settings: Record<string, unknown> = {}
   mock.clock(on, { now }); mock.store(on)
+  on('settings.read', () => ({ value: settings }))
   on('env.get', async (_host, e) => {
     const value = environment.get(e.name)
     if (e.name === 'ANTHROPIC_CUSTOM_HEADERS' && refuseTokenRead) { refuseTokenRead = false; return { deny: 'Owned token read refusal' } }
@@ -129,7 +131,7 @@ function fixture(on: On) {
   on('ui.status', (_host, e) => { status.push(e.text); return { value: undefined } })
   on('ui.log', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
-  return { environment, documents, writes, processes, status, activeWrites, cachedRequests, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
+  return { environment, documents, writes, processes, status, activeWrites, cachedRequests, useSettings(value: Record<string, unknown>) { settings = value }, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
     let started = () => {}, release = () => {}
     const seen = new Promise<void>(resolve => { started = resolve })
     const wait = new Promise<void>(resolve => { release = resolve })
@@ -334,4 +336,52 @@ test('a refused rollback blocks every account-bearing dispatch until an explicit
   expect(afterRecovery.authorized).toBe(true)
   expect(afterRecovery.exitCode).toBe(44)
   expect(world.status.at(-1) ?? '').toContain('account-b')
+})
+
+test('a credential Claude Code sends in place of the selected bearer refuses the switch before anything changes', async ($, on) => {
+  const world = fixture(on)
+  await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
+  expect((await $.command.run(command('account-a'))).text ?? '').toContain('now uses account-a')
+  const sources: [string, () => void, () => void][] = [
+    ['apiKeyHelper', () => world.useSettings({ apiKeyHelper: '/fixture/owned-helper' }), () => world.useSettings({})],
+    ['CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', () => world.environment.set('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', '3'), () => world.environment.delete('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')],
+    ['workload identity federation', () => { world.environment.set('ANTHROPIC_FEDERATION_RULE_ID', 'fdrl_owned'); world.environment.set('ANTHROPIC_ORGANIZATION_ID', 'owned-org') }, () => { world.environment.delete('ANTHROPIC_FEDERATION_RULE_ID'); world.environment.delete('ANTHROPIC_ORGANIZATION_ID') }],
+  ]
+  for (const [cause, apply, remove] of sources) {
+    apply()
+    const environment = [...world.environment.entries()].sort()
+    const [activeWrites, statuses, processes] = [world.activeWrites.length, world.status.length, world.processes.length]
+    const refused = (await $.command.run(command('account-b'))).text ?? ''
+    expect(refused).toContain('This session cannot switch accounts: ')
+    expect(refused).toContain(cause)
+    expect(refused).not.toContain('now uses')
+    // Nothing was read for account-b, written, or put back: the selection in effect is untouched.
+    expect([...world.environment.entries()].sort()).toEqual(environment)
+    expect([world.activeWrites.length, world.status.length, world.processes.length]).toEqual([activeWrites, statuses, processes])
+    expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-a')
+    expect((await $.command.run({ ...command(''), command: 'usage' })).text ?? '').toContain('account-a usage:')
+    remove()
+  }
+  expect(world.writes).toEqual([])
+  expect((await $.command.run(command('account-b'))).text ?? '').toContain('now uses account-b')
+})
+
+test('while a switch would be refused, login, list, check, usage, default and the listing keep working', async ($, on) => {
+  const world = fixture(on)
+  world.useSettings({ apiKeyHelper: '/fixture/owned-helper' })
+  await $.session.start({ cwd: '/fixture/public-accounts', surface: 'terminal', isInteractive: true })
+  const list = (await $.command.run(command('list'))).text ?? ''
+  expect(list).toContain('account-b@example.test')
+  expect(list).toContain('[this session]')
+  // This fixture answers no profile endpoint: the lookup ran, and nothing refused it.
+  const check = (await $.command.run(command('check account-b'))).text ?? ''
+  expect(check).toContain('profile')
+  expect(check).not.toContain('cannot switch')
+  expect((await $.command.run(command('usage'))).text ?? '').toContain('login usage:')
+  expect((await $.command.run(command('default'))).text ?? '').toContain("back on this machine's /login")
+  expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
+  expect((await $.command.run(command('account-b'))).text ?? '').toContain('apiKeyHelper')
+  expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe(undefined)
+  expect(world.environment.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe('fixture-machine-token')
+  expect(world.writes).toEqual([])
 })

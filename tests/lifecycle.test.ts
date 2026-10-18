@@ -60,9 +60,11 @@ function fixture(on: On, options: Options = {}) {
   let refusedActive: string | undefined, refusedHeader: string | undefined
   let active: ActiveAccount | null | undefined, activeVersion = 0
   let originals: EnvSnapshot | null | undefined, originalsVersion = 0
+  let settings: Record<string, unknown> = {}
 
   const clock = mock.clock(on, { now })
   mock.store(on)
+  on('settings.read', () => ({ value: settings }))
   on('state.get', { plugin: 'rice-session-accounts', key: 'active' }, () => ({ value: { value: active, version: activeVersion } }))
   on('state.set', { plugin: 'rice-session-accounts', key: 'active' }, (_host, input) => {
     if (input.ifVersion !== undefined && input.ifVersion !== activeVersion) return { value: { isSet: false, version: activeVersion } }
@@ -168,6 +170,7 @@ function fixture(on: On, options: Options = {}) {
     tokenRequests: () => tokenRequests,
     /** /clear: the host empties the state while this process keeps its environment and module. */
     clearState() { active = undefined; originals = undefined },
+    useSettings(value: Record<string, unknown>) { settings = value },
     failRefresh(isFailing: boolean) { isRefreshFailing = isFailing },
     failUsage(isFailing: boolean) { isUsageFailing = isFailing },
     /** The next state write for `name` is refused and a rollback to `header` is refused too: a lockout. */
@@ -487,4 +490,50 @@ test('an explicit selection made while a restore is waiting is not undone by it'
   await switching
   expect(world.active()?.name).toBe('account-b')
   expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-access-account-b')
+})
+
+test('a session not signed in with a Claude subscription refuses a switch before anything changes, and the login stays', async ($, on) => {
+  const world = fixture(on)
+  world.documents.delete(`${configDir}/.credentials.json`)
+  world.environment.set('ANTHROPIC_API_KEY', 'fixture-launch-api-key')
+  await $.session.start(START)
+  const statuses = world.status.length
+  const refused = (await $.command.run(command('account-b'))).text ?? ''
+  expect(refused).toContain('This session cannot switch accounts: Claude Code was not started signed in with a Claude subscription')
+  expect(refused).toContain('claude auth login')
+  expect(world.header()).toBe(undefined)
+  expect(world.environment.get('ANTHROPIC_API_KEY')).toBe('fixture-launch-api-key')
+  expect(world.active()).toBe(undefined)
+  expect(world.status.length).toBe(statuses)
+  expect(world.locks).toEqual([])
+  expect(world.usageCount('fixture-access-account-b')).toBe(0)
+  expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
+})
+
+test('an API key at launch beside a stored subscription login still switches: the switch clears the key', async ($, on) => {
+  const world = fixture(on)
+  world.environment.set('ANTHROPIC_API_KEY', 'fixture-launch-api-key')
+  await $.session.start(START)
+  expect((await $.command.run(command('account-b'))).text ?? '').toContain('now uses account-b')
+  expect(world.header()).toBe('fixture-access-account-b')
+  expect(world.environment.get('ANTHROPIC_API_KEY')).toBe(undefined)
+  expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
+  expect(world.environment.get('ANTHROPIC_API_KEY')).toBe('fixture-launch-api-key')
+})
+
+test('a selection in effect is kept across a reload and renewals when a refusing source appears later', async ($, on) => {
+  const world = fixture(on, { expiresInMs: { 'account-b': 360_000 } })
+  await $.session.start(START)
+  expect((await $.command.run(command('account-b'))).text ?? '').toContain('now uses account-b')
+  world.useSettings({ apiKeyHelper: '/fixture/owned-helper' })
+  await $.session.start(START)
+  expect(world.header()).toBe('fixture-access-account-b')
+  expect(world.status.at(-1) ?? '').not.toContain('account not confirmed')
+  await world.clock.advance(60_000)
+  await world.clock.settle()
+  expect(world.header()).toBe('fixture-access-account-b-renewed')
+  // A new selection is refused and leaves the one in effect as it was.
+  expect((await $.command.run(command('account-a'))).text ?? '').toContain('apiKeyHelper')
+  expect(world.header()).toBe('fixture-access-account-b-renewed')
+  expect(world.active()?.name).toBe('account-b')
 })
