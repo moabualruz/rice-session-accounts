@@ -168,6 +168,13 @@ account.
 
 ### Limits
 
+- The engine has no seam for switching its own account, so a few things still follow
+  the machine login while another account is selected: the account id each request
+  carries in its metadata, plan gating and upgrade prompts, telemetry, and the native
+  panels other than `/usage` and `/status`.
+- While the session is locked, a request that no plugin hook sees (the permission
+  classifier, titles, MCP servers) fails with Claude Code's own "invalid bearer token"
+  error, which can read like a reason to run `/login`. Run `/rice-account login`.
 - Anthropic requests identify as `claude-cli/<version> (external, cli)`. `session.usage`
   lists only the five-hour and weekly windows the engine declares; a model's own
   window appears in `/rice-account usage` and the status entry.
