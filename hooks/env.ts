@@ -1,4 +1,5 @@
 import type { AccountConfig } from './config'
+import type { EnvName } from './io'
 
 /**
  * The environment variables a switch owns. Native OAuth credentials are
@@ -119,6 +120,54 @@ export function planEnv(account: AccountConfig, secret: string | undefined, orig
   }
 
   return plan
+}
+
+/**
+ * What a switch is checked against before anything changes: the settings
+ * merged over every source, the variables the blockers name, and whether
+ * Claude Code itself signs in with a Claude subscription. A read that failed
+ * leaves `settings` or `isOAuthLogin` undefined.
+ */
+export type SwitchContext = {
+  settings: Readonly<Record<string, unknown>> | undefined
+  variables: Readonly<Partial<Record<EnvName, string>>>
+  isOAuthLogin: boolean | undefined
+}
+
+/** A credential source, how it is detected, and what to change; `message` names the cause and the fix. */
+export type SwitchBlocker =
+  | { setting: string; message: string }
+  | { variables: readonly EnvName[]; message: string }
+  | { login: 'not-oauth'; message: string }
+
+/**
+ * The sources that beat or break the selected account's bearer on the wire,
+ * as measured against Claude Code 2.1.302: Claude Code's own credential wins
+ * over the request header, or its requests drop the OAuth beta header the
+ * bearer needs. An API key, an auth token or a provider selector does
+ * neither: the switch clears them. The first that applies is reported.
+ */
+export const SWITCH_BLOCKERS: readonly SwitchBlocker[] = [
+  { setting: 'apiKeyHelper', message: "Claude Code sends the key from the apiKeyHelper setting in place of the selected account's token. Remove apiKeyHelper from your settings, then restart Claude Code." },
+  { variables: ['CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'], message: "Claude Code sends the API key it read through CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR along with the selected account's token. Start Claude Code without CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR." },
+  { variables: ['ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID'], message: "Claude Code signs in through workload identity federation (ANTHROPIC_FEDERATION_RULE_ID and ANTHROPIC_ORGANIZATION_ID) and sends that token in place of the selected account's. Start Claude Code without them." },
+  { login: 'not-oauth', message: "Claude Code was not started signed in with a Claude subscription, so its requests drop the OAuth beta header the selected account's token needs. Start Claude Code signed in with your Claude subscription (claude auth login, or CLAUDE_CODE_OAUTH_TOKEN)." },
+]
+
+/** The variables the blockers name, for the switch to read by their literal names. */
+export const BLOCKING_VARIABLES: readonly EnvName[] = [...new Set(SWITCH_BLOCKERS.flatMap(blocker => 'variables' in blocker ? blocker.variables : []))]
+
+/** Why a switch to an account other than the login cannot work in this session, or undefined. Unknown inputs refuse nothing. */
+export function switchBlocker(context: SwitchContext): string | undefined {
+  const found = SWITCH_BLOCKERS.find(blocker => {
+    if ('setting' in blocker) {
+      const value = context.settings?.[blocker.setting]
+      return typeof value === 'string' && value.trim() !== ''
+    }
+    if ('variables' in blocker) return blocker.variables.every(name => Boolean(context.variables[name]))
+    return context.isOAuthLogin === false
+  })
+  return found && `This session cannot switch accounts: ${found.message}`
 }
 
 /** The names a plan changes from what the process holds now, for the switch to set. */

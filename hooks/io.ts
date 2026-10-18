@@ -6,6 +6,7 @@ import type { FsStat, HttpInit, HttpResponse, ProcessRunInit, ProcessRunResult }
 
 /** The environment variables the modules read, each read by its literal name in register.ts. */
 export type EnvName = 'HOME' | 'USER' | 'OS' | 'USERPROFILE' | 'USERNAME' | 'SystemRoot' | 'WINDIR' | 'FORCE_WINDOWS_CREDMAN' | 'CLAUDE_CONFIG_DIR' | 'CLAUDE_SECURESTORAGE_CONFIG_DIR'
+  | 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR' | 'ANTHROPIC_FEDERATION_RULE_ID' | 'ANTHROPIC_ORGANIZATION_ID'
 
 /**
  * What the modules reach the machine through; register.ts builds it over `$`.
