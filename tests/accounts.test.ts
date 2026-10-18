@@ -1321,6 +1321,8 @@ function identityHost(on: On) {
   const locks = new Map<string, number>()
   const requests: { url: string; agent: string | undefined }[] = []
   const status: (string | undefined)[] = []
+  // No settings override the account: a switch is checked against them.
+  on('settings.read', () => ({ value: {} }))
   const answer = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   const json = (body: unknown) => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify(body) } })
   mock.clock(on, { now: HOST_NOW })

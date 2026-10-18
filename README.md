@@ -168,6 +168,9 @@ account.
 
 ### Limits
 
+- Anthropic requests identify as `claude-cli/<version> (external, cli)`. `session.usage`
+  lists only the five-hour and weekly windows the engine declares; a model's own
+  window appears in `/rice-account usage` and the status entry.
 - A switch is refused, with the cause and the fix, when Claude Code's own credential
   would override the selected account: an `apiKeyHelper` setting from any settings
   source, an API key passed through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload
@@ -201,6 +204,14 @@ account.
 folders hold only the extra logins; your settings, plugins, skills, hooks and MCP
 servers are untouched.
 
+Claude Code can keep a login where Rice Accounts does not read it, and Rice Accounts
+then says so instead of reporting the account as signed out. On macOS it falls back to
+a plaintext `.credentials.json` in the login folder when the keychain cannot store a
+login; unlock the keychain and run the setup command again with `--login`. On Windows
+it uses Credential Manager when `CLAUDE_CODE_FORCE_WINDOWS_CREDMAN=1` is set or its
+cached `tengu_windows_credman` setting is on in that folder's `.claude.json`; use a
+`claudeai-token` account there.
+
 **A renewed login is never lost.** The server rotates the refresh token on every
 renewal, so the new login is first written to a private `.credentials.json.rice-pending`
 file (and kept in memory), then saved, then the file is removed. If saving fails
@@ -213,6 +224,8 @@ write-ahead and its save cannot cost a newer login: the newer renewal is saved
 over it. A renewal kept unsaved is saved again after a plugin reload as soon as
 the renewal lock is free. On macOS a login too large for the keychain's line
 limit is stored without optional keys such as `mcpOAuth`; it is never truncated.
+A renewal records the refresh token's expiry (`refreshTokenExpiresAt`) and uses the
+login's own OAuth client, as Claude Code does.
 
 Limits of that guarantee: the macOS keychain has no atomic compare-and-swap, so
 a sign-in that finishes within milliseconds of a renewal of the same account can

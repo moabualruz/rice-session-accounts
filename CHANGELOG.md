@@ -6,6 +6,15 @@ Closer to the native flow: what the engine already reports is no longer replaced
 and a refusal no longer leaves a made-up turn in the conversation.
 
 ### Fixed
+- **Windows:** the Credential Manager check uses Claude Code's
+  `CLAUDE_CODE_FORCE_WINDOWS_CREDMAN=1` (the old name did nothing) and its cached
+  `tengu_windows_credman` setting, in the plugin and in setup.
+- **macOS:** a login left in the plaintext fallback file is named with its fix, not
+  shown as signed out.
+- **Renewals** update `refreshTokenExpiresAt` and use a login's own `clientId`, as
+  Claude Code does.
+- **Usage, profile and token requests** send Claude Code's User-Agent;
+  `session.usage` matches the engine's declared kinds and precision.
 - **A switch that could not take effect is refused up front** instead of being
   reported as in effect. Under an `apiKeyHelper`, an API key from
   `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload identity federation, or a session
