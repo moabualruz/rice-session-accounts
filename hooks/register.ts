@@ -603,7 +603,7 @@ async function renewIfActive($: EngineInterface, name: string): Promise<void> {
 
 /**
  * What a switch is checked against (`SWITCH_BLOCKERS`), read without changing
- * anything. A read that fails is logged and left unknown, which refuses nothing.
+ * anything. Settings that cannot be read refuse the switch; a machine login that cannot be read does not.
  */
 async function switchContext($: EngineInterface): Promise<SwitchContext> {
   let settings: SwitchContext['settings']

@@ -100,6 +100,8 @@ function fixture(on: On) {
   })
   on('fs.stat', () => { throw new Error('No stat is required for unexpired fixture credentials') })
   on('fs.list', () => ({ value: [] }))
+  // No settings override the account: a switch is checked against them.
+  on('settings.read', () => ({ value: {} }))
   on('process.run', async (_host, input) => {
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {
       return { value: { exitCode: 0, stdout: 'Linux\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }

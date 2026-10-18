@@ -168,6 +168,16 @@ account.
 
 ### Limits
 
+- A switch is refused, with the cause and the fix, when Claude Code's own credential
+  would override the selected account: an `apiKeyHelper` setting from any settings
+  source, an API key passed through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload
+  identity federation (`ANTHROPIC_FEDERATION_RULE_ID` with `ANTHROPIC_ORGANIZATION_ID`),
+  or a session not started signed in with a Claude subscription. Settings that cannot
+  be read refuse it too. `login`, `list`, `check` and `usage` keep working, and an
+  account already selected stays in effect.
+- An `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or provider selector at launch does not
+  block a switch when the session is also signed in with a Claude subscription: the
+  switch clears them for this session, and `/rice-account login` restores them.
 - The values your session started with (an API key, a launch `CLAUDE_CODE_OAUTH_TOKEN`,
   provider settings) are kept in the session's plugin state so `/rice-account login`
   can restore them exactly, even after a reload. Plugin state is readable by every

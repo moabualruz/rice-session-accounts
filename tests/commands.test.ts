@@ -45,6 +45,8 @@ function fixture(on: On, initial?: Config, variables: Record<string, string> = {
   })
   on('fs.stat', () => { throw new Error('ENOENT: isolated fixture file') })
   on('fs.list', () => ({ value: [] }))
+  // No settings override the account: a switch is checked against them.
+  on('settings.read', () => ({ value: {} }))
   on('process.run', (_host, input) => {
     processes.push(input.argv)
     if (input.argv[0] === '/usr/bin/uname' && input.argv[1] === '-s') {

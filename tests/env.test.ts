@@ -116,9 +116,10 @@ test('each measured credential source refuses the switch with its cause and its 
   expect(cases.length).toBe(SWITCH_BLOCKERS.length)
 })
 
-test('the first source in the table is reported, and an unknown input refuses nothing', async () => {
+test('the first source in the table is reported; unreadable settings refuse, an unreadable machine login refuses nothing', async () => {
   expect(switchBlocker({ settings: { apiKeyHelper: 'helper' }, variables: { CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '3' }, isOAuthLogin: false }) ?? '').toContain('apiKeyHelper')
-  expect(switchBlocker({ ...clean, settings: undefined })).toBe(undefined)
+  // Settings that cannot be read: it cannot be told whether apiKeyHelper replaces the token, so the switch is refused.
+  expect(switchBlocker({ ...clean, settings: undefined }) ?? '').toContain('settings could not be read')
   expect(switchBlocker({ ...clean, isOAuthLogin: undefined })).toBe(undefined)
   // Federation is in effect only with both variables.
   expect(switchBlocker({ ...clean, variables: { ANTHROPIC_FEDERATION_RULE_ID: 'fdrl_fixture' } })).toBe(undefined)

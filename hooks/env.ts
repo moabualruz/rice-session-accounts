@@ -157,8 +157,13 @@ export const SWITCH_BLOCKERS: readonly SwitchBlocker[] = [
 /** The variables the blockers name, for the switch to read by their literal names. */
 export const BLOCKING_VARIABLES: readonly EnvName[] = [...new Set(SWITCH_BLOCKERS.flatMap(blocker => 'variables' in blocker ? blocker.variables : []))]
 
-/** Why a switch to an account other than the login cannot work in this session, or undefined. Unknown inputs refuse nothing. */
+/**
+ * Why a switch to an account other than the login cannot work in this session, or undefined. Settings that
+ * could not be read refuse the switch (it could not be told whether one replaces the token); a machine login
+ * that could not be read refuses nothing, since the stores it would be read from are the ones a switch needs anyway.
+ */
 export function switchBlocker(context: SwitchContext): string | undefined {
+  if (context.settings === undefined) return 'This session cannot switch accounts: your Claude Code settings could not be read, so it cannot be told whether one of them (apiKeyHelper) would replace the selected account\'s token. Try again.'
   const found = SWITCH_BLOCKERS.find(blocker => {
     if ('setting' in blocker) {
       // Set as Claude Code reads it: any non-empty text.

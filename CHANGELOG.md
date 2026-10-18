@@ -6,6 +6,12 @@ Closer to the native flow: what the engine already reports is no longer replaced
 and a refusal no longer leaves a made-up turn in the conversation.
 
 ### Fixed
+- **A switch that could not take effect is refused up front** instead of being
+  reported as in effect. Under an `apiKeyHelper`, an API key from
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload identity federation, or a session
+  not signed in with a Claude subscription, Claude Code's own credential replaced
+  the selected bearer or dropped the OAuth beta it needs (measured against the
+  shipped binary). The message names the cause and the fix and nothing is changed.
 - **Locked sessions leave no fake turn.** A prompt typed while the account is
   not confirmed is dropped at `prompt.submit` with the reason. Before, the refusal
   was written into the conversation as an assistant turn that the next real request
