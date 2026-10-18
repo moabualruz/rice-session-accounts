@@ -92,8 +92,10 @@ export function nativeCredentialPath(location: LoginLocation, home: string | und
  * grant, and never writes or removes anything; `examine` prints
  * `{"stored":document or null,"pending":{"base":B,"credential":...} or null}`
  * (null for a missing store; otherwise its exit codes are `read`'s), also
- * without writing; `write` replaces only the OAuth grant when the stored
- * refresh token is still the expected one, and leaves the pending file alone;
+ * without writing; `write` replaces only the OAuth grant (the two tokens,
+ * `expiresAt`, and `refreshTokenExpiresAt` when the renewal has one; a stored
+ * one stays otherwise) when the stored refresh token is still the expected
+ * one, and leaves the pending file alone;
  * `pending` writes `{base, credential}` from stdin as the pending file;
  * `readpending` prints `{"pending":...}` alone, for a store that cannot be
  * read; `clearpending` takes `{base, tokens}` and removes the pending file only
@@ -141,16 +143,22 @@ function copy(source) {
   }
   return target;
 }
+function grantOnly(oauth) {
+  var grant = { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt };
+  if (typeof oauth.refreshTokenExpiresAt === 'number' && isFinite(oauth.refreshTokenExpiresAt)) grant.refreshTokenExpiresAt = oauth.refreshTokenExpiresAt;
+  return grant;
+}
 function merged(document, oauth) {
   var next = copy(document);
   var inner = copy(document.claudeAiOauth);
-  inner.accessToken = oauth.accessToken;
-  inner.refreshToken = oauth.refreshToken;
-  inner.expiresAt = oauth.expiresAt;
+  var grant = grantOnly(oauth);
+  inner.accessToken = grant.accessToken;
+  inner.refreshToken = grant.refreshToken;
+  inner.expiresAt = grant.expiresAt;
+  if (grant.refreshTokenExpiresAt !== undefined) inner.refreshTokenExpiresAt = grant.refreshTokenExpiresAt;
   next.claudeAiOauth = inner;
   return next;
 }
-function grantOnly(oauth) { return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }; }
 function remove(file) { try { fs.unlinkSync(file); } catch (ignored) {} }
 function readJson(file, strict) {
   var fd;
@@ -344,7 +352,8 @@ if /bin/cat >> "$t" && /bin/sync && /bin/mv -f "$t" "$0"; then /bin/sync; exit 0
 exit 1
 `
 
-type OAuthGrant = Pick<Credential['claudeAiOauth'], 'accessToken' | 'refreshToken' | 'expiresAt'>
+/** What a renewal changes in a stored login; `refreshTokenExpiresAt` only when the server gave one. */
+type OAuthGrant = Pick<Credential['claudeAiOauth'], 'accessToken' | 'refreshToken' | 'expiresAt' | 'refreshTokenExpiresAt'>
 /** `filePath` is the credentials file Claude Code falls back to when the keychain cannot store a login. */
 type KeychainStore = { kind: 'keychain'; key: string; service: string; account: string | undefined; writeAccount: string; filePath: string | undefined; pendingPath: string | undefined; cwd: string }
 type FileStore = { kind: 'file'; key: string; path: string; pendingPath: string; cwd: string; platform: HostPlatform }
@@ -405,7 +414,7 @@ function invalidStore(): Error {
 function grantOf(value: unknown): OAuthGrant | null {
   const oauth = (value as { claudeAiOauth?: Partial<OAuthGrant> } | null)?.claudeAiOauth
   return typeof oauth?.accessToken === 'string' && typeof oauth.refreshToken === 'string' && typeof oauth.expiresAt === 'number' && Number.isFinite(oauth.expiresAt)
-    ? { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+    ? grantOnly(oauth as OAuthGrant)
     : null
 }
 
@@ -457,12 +466,14 @@ export function pendingState(stored: Credential | null, pending: PendingLogin): 
   return 'obsolete'
 }
 
+/** The stored document with a renewal's grant; a stored `refreshTokenExpiresAt` stays when the renewal gave none, as in Claude Code. */
 function merged(document: Credential, oauth: OAuthGrant): Credential {
-  return { ...document, claudeAiOauth: { ...document.claudeAiOauth, accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt } }
+  return { ...document, claudeAiOauth: { ...document.claudeAiOauth, ...grantOnly(oauth) } }
 }
 
 function grantOnly(oauth: OAuthGrant): OAuthGrant {
-  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+  const expiry = oauth.refreshTokenExpiresAt
+  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt, ...(typeof expiry === 'number' && Number.isFinite(expiry) ? { refreshTokenExpiresAt: expiry } : {}) }
 }
 
 /** Whether a usable pending renewal is later than a usable memory one: memory does not descend from it. */
@@ -1079,7 +1090,7 @@ export async function checkRenewable(io: Io, location: LoginLocation, current: C
   if (store.kind !== 'keychain') return
   const oauth = current.claudeAiOauth
   try {
-    fitCredential(merged(current, { accessToken: grown(oauth.accessToken), refreshToken: grown(oauth.refreshToken), expiresAt: Number.MAX_SAFE_INTEGER }), store.service, store.writeAccount)
+    fitCredential(merged(current, { accessToken: grown(oauth.accessToken), refreshToken: grown(oauth.refreshToken), expiresAt: Number.MAX_SAFE_INTEGER, refreshTokenExpiresAt: Number.MAX_SAFE_INTEGER }), store.service, store.writeAccount)
   } catch (error) {
     throw new Error(`This login is too large to store in the macOS keychain (${message(error)}). It was not renewed, so its refresh token was not spent; sign it in again with account setup.`)
   }

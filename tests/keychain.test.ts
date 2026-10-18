@@ -202,6 +202,27 @@ test('the refresh request carries the client id and scopes, and omits an empty s
   expect('scope' in bare).toBe(false)
 })
 
+test('a login signed in with another OAuth client is renewed with its own clientId, as Claude Code renews it', async () => {
+  const clientOf = (clientId: unknown) => (JSON.parse(String(refreshInit({ claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: 1, clientId } as Credential['claudeAiOauth'] }).body)) as Record<string, string>).client_id
+  expect(clientOf('fixture-custom-client')).toBe('fixture-custom-client')
+  for (const unusable of [undefined, '', 'two words', 42, 'x'.repeat(300)]) expect(clientOf(unusable)).toBe('9d1c250a-e61b-44d9-88ed-5944d1962f5e')
+})
+
+test('refresh_token_expires_in becomes refreshTokenExpiresAt as Claude Code records it; without one the stored value stays', async () => {
+  const login = parseCredential('{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1","expiresAt":1,"refreshTokenExpiresAt":77},"keep":"yes"}')
+  const renewed = applyRefresh(login, '{"access_token":"a2","refresh_token":"r2","expires_in":60,"refresh_token_expires_in":86400}', 5_000)
+  expect(renewed.claudeAiOauth.refreshTokenExpiresAt).toBe(5_000 + 86_400_000)
+  expect(renewed.keep).toBe('yes')
+  for (const body of ['{"access_token":"a2","expires_in":60}', '{"access_token":"a2","refresh_token_expires_in":"86400"}', '{"access_token":"a2","refresh_token_expires_in":null}']) {
+    expect(applyRefresh(login, body, 5_000).claudeAiOauth.refreshTokenExpiresAt).toBe(77)
+  }
+  const fresh = applyRefresh(parseCredential('{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1","expiresAt":1}}'), '{"access_token":"a2"}', 0)
+  expect('refreshTokenExpiresAt' in fresh.claudeAiOauth).toBe(false)
+  let salvage: Credential | undefined
+  try { applyRefresh(login, '{"refresh_token":"fixture-rotated-grant","refresh_token_expires_in":10}', 0) } catch (error) { if (error instanceof RefreshResponseError) salvage = error.salvage }
+  expect(salvage?.claudeAiOauth.refreshTokenExpiresAt).toBe(10_000)
+})
+
 test('token endpoint failures say whether to sign in again and never echo the body', async () => {
   const body = (error: string) => JSON.stringify({ error, error_description: 'fixture-echo-secret' })
   const revoked = refreshFailure('work', { status: 400, text: body('invalid_grant'), headers: {} })

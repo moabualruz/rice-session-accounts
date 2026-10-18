@@ -105,13 +105,15 @@ export function needsRefresh(credential: Credential, now: number, marginMs = EXP
 
 /**
  * The refresh request Claude Code sends: grant type, refresh token, client id
- * and the login's scopes. A login without scopes omits `scope`, which keeps
- * the scopes originally granted (RFC 6749 section 6); an empty `scope` would
- * ask for none.
+ * (the login's own `clientId` when it was signed in with another client, as
+ * Claude Code 2.1.302 sends it) and the login's scopes. A login without scopes
+ * omits `scope`, which keeps the scopes originally granted (RFC 6749 section
+ * 6); an empty `scope` would ask for none.
  */
 export function refreshInit(credential: Credential): HttpInit {
   const oauth = credential.claudeAiOauth
   const scopes = Array.isArray(oauth.scopes) ? oauth.scopes.filter(scope => typeof scope === 'string' && scope !== '') : []
+  const clientId = typeof oauth.clientId === 'string' && /^[\x21-\x7e]{1,256}$/.test(oauth.clientId) ? oauth.clientId : CLIENT_ID
 
   return {
     method: 'POST',
@@ -119,7 +121,7 @@ export function refreshInit(credential: Credential): HttpInit {
     body: JSON.stringify({
       grant_type: 'refresh_token',
       refresh_token: oauth.refreshToken,
-      client_id: CLIENT_ID,
+      client_id: clientId,
       ...(scopes.length > 0 ? { scope: scopes.join(' ') } : {}),
     }),
   }
@@ -134,6 +136,16 @@ function lifetimeOf(value: unknown): number {
   if (!Number.isFinite(seconds) || seconds <= 0) return UNKNOWN_TOKEN_LIFETIME_S
 
   return Math.min(seconds, MAX_TOKEN_LIFETIME_S)
+}
+
+/**
+ * When the refresh token of a response expires, as Claude Code 2.1.302 records
+ * it (`refreshTokenExpiresAt`, which its signed-in check reads): from a
+ * numeric `refresh_token_expires_in`, else not given, and the stored one stays.
+ */
+function refreshExpiryOf(fields: Record<string, unknown>, now: number): { refreshTokenExpiresAt?: number } {
+  const seconds = fields.refresh_token_expires_in
+  return typeof seconds === 'number' && Number.isFinite(seconds) ? { refreshTokenExpiresAt: now + seconds * 1000 } : {}
 }
 
 /**
@@ -156,7 +168,7 @@ export function applyRefresh(credential: Credential, responseText: string, now: 
   const accessToken = fields.access_token
   if (!isToken(accessToken)) {
     const salvage = rotated !== undefined && rotated !== oauth.refreshToken
-      ? { ...credential, claudeAiOauth: { ...oauth, refreshToken: rotated, expiresAt: 0 } }
+      ? { ...credential, claudeAiOauth: { ...oauth, refreshToken: rotated, expiresAt: 0, ...refreshExpiryOf(fields, now) } }
       : undefined
     throw new RefreshResponseError('the token refresh returned no access token', salvage)
   }
@@ -168,6 +180,7 @@ export function applyRefresh(credential: Credential, responseText: string, now: 
       accessToken,
       refreshToken: rotated ?? oauth.refreshToken,
       expiresAt: now + lifetimeOf(fields.expires_in) * 1000,
+      ...refreshExpiryOf(fields, now),
     },
   }
 }

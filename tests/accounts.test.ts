@@ -56,8 +56,9 @@ function spentBy(init: { body?: unknown } | undefined): string {
   return (JSON.parse(String(init?.body ?? '{}')) as { refresh_token?: string }).refresh_token ?? ''
 }
 
+/** The grant a renewal changes, as the native file program and the keychain path copy it. */
 function grantOf(oauth: Credential['claudeAiOauth']) {
-  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt }
+  return { accessToken: oauth.accessToken, refreshToken: oauth.refreshToken, expiresAt: oauth.expiresAt, ...(typeof oauth.refreshTokenExpiresAt === 'number' ? { refreshTokenExpiresAt: oauth.refreshTokenExpiresAt } : {}) }
 }
 
 function withGrant(document: Credential, oauth: Credential['claudeAiOauth']): Credential {
@@ -431,6 +432,32 @@ test('freshLogin renews an isolated Linux grant: written ahead with the stored t
     expect(call.init?.cwd).toBe('/')
     expect(call.init?.env).toEqual(TRUSTED_ENV)
   }
+})
+
+test('a renewal records refreshTokenExpiresAt as Claude Code does, and a later renewal without one keeps it through the pending file and the store', async () => {
+  const state = linuxState({ stored: { keep: 'unrelated', claudeAiOauth: { ...login.claudeAiOauth, expiresAt: 1, refreshTokenExpiresAt: 50, clientId: 'fixture-client', scopes: ['user:inference'] } } })
+  const world = linuxWorld(state)
+  const answers = [
+    JSON.stringify({ access_token: 'rotated-access', refresh_token: 'rotated-grant', expires_in: 3600, refresh_token_expires_in: 86_400 }),
+    JSON.stringify({ access_token: 'rotated-access-2', refresh_token: 'rotated-grant-2', expires_in: 3600 }),
+  ]
+  const bodies: Record<string, string>[] = []
+  world.io.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, string>)
+    state.order.push('fetch')
+    return { ok: true, status: 200, headers: {}, text: answers[bodies.length - 1] ?? '' }
+  }
+  const first = await renew(world.io)
+  expect(first.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  // Written ahead with the grant, then saved by compare-and-swap with it.
+  expect((JSON.parse(state.pendings[0] ?? '{}') as PendingLogin).credential.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  expect(JSON.parse(state.writes[0] ?? '{}').oauth.refreshTokenExpiresAt).toBe(86_400_000)
+  state.now = 4_000_000
+  const second = await renew(world.io)
+  expect(second.claudeAiOauth.refreshTokenExpiresAt).toBe(86_400_000)
+  expect(state.stored).toEqual({ keep: 'unrelated', claudeAiOauth: { accessToken: 'rotated-access-2', refreshToken: 'rotated-grant-2', expiresAt: 7_600_000, refreshTokenExpiresAt: 86_400_000, clientId: 'fixture-client', scopes: ['user:inference'] } })
+  // The login's own OAuth client renews it, as in Claude Code.
+  expect(bodies.map(body => body.client_id)).toEqual(['fixture-client', 'fixture-client'])
 })
 
 test('a program runner that cannot examine the store refuses to renew: no guess, no token request', async () => {
