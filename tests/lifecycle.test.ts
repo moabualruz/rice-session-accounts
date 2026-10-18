@@ -262,6 +262,47 @@ test('a reload keeps a lockout, and every account-bearing event stays refused un
   expect((await probe($, 'claude')).value).toBe(44)
 })
 
+test('a locked session refuses a typed prompt before it enters, and leaves slash commands and machine-made messages to their own handling', driver, async ($, on) => {
+  const world = fixture(on)
+  // The engine's side: a prompt that reaches the bottom enters as typed.
+  on('prompt.submit', (_host, e) => ({ text: e.text }))
+  await $.session.start(START)
+  await $.command.run(command('account-a'))
+  world.refuseSwitch('account-b', 'fixture-access-account-a')
+  await $.command.run(command('account-b'))
+  await $.session.start(START)
+  expect(world.status.at(-1) ?? '').toContain('account not confirmed')
+  // The person's own prompt: dropped with the reason, so no row is written into the conversation.
+  for (const origin of [{ kind: 'composer' }, { kind: 'bridge' }, { kind: 'sdk' }] as const) {
+    const typed = await $.prompt.submit({ text: 'keep going', origin, wait: false })
+    expect(typed.drop ?? '').toContain('not confirmed')
+    expect(typed.text).toBe(undefined)
+  }
+  // A slash command, a notification and a scheduled task are not dropped here (turn.step still refuses their model request).
+  const command_ = await $.prompt.submit({ text: '/rice-account login', origin: { kind: 'composer' }, wait: false, command: { name: 'rice-account', args: 'login' } })
+  expect(command_.drop).toBe(undefined)
+  for (const origin of [{ kind: 'task-notification' }, { kind: 'scheduled-trigger' }] as const) {
+    expect((await $.prompt.submit({ text: 'machine-made', origin, wait: false })).drop).toBe(undefined)
+  }
+  world.allow()
+  expect((await $.command.run(command('login'))).text ?? '').toContain("back on this machine's /login")
+  expect((await $.prompt.submit({ text: 'keep going', origin: { kind: 'composer' }, wait: false })).drop).toBe(undefined)
+})
+
+test('back on the machine login, /usage and /status are the engine\'s own again; with an account selected they are not', async ($, on) => {
+  const world = fixture(on)
+  on('command.run', { command: 'usage' }, () => ({ text: 'NATIVE_USAGE' }))
+  on('command.run', { command: 'status' }, () => ({ text: 'NATIVE_STATUS' }))
+  await $.session.start(START)
+  expect(world.status.at(-1) ?? '').not.toContain('account-b')
+  await $.command.run(command('account-b'))
+  expect((await $.command.run(command('', 'usage'))).text ?? '').not.toBe('NATIVE_USAGE')
+  expect((await $.command.run(command('', 'status'))).text ?? '').not.toBe('NATIVE_STATUS')
+  await $.command.run(command('login'))
+  expect((await $.command.run(command('', 'usage'))).text).toBe('NATIVE_USAGE')
+  expect((await $.command.run(command('', 'status'))).text).toBe('NATIVE_STATUS')
+})
+
 test('a kept account that cannot be put back after a reload locks the session instead of reporting the machine login', driver, async ($, on) => {
   const world = fixture(on)
   await $.session.start(START)

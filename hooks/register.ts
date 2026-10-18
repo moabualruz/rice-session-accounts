@@ -999,9 +999,18 @@ function whenFailed(failure: HookFailure): string | undefined {
   return String(failure.kind) === 're-entry' ? local.transitionProblem : local.transitionProblem ?? ACCOUNT_RECOVERY
 }
 
-/** Whether /usage and /status answer for the session selection rather than natively. */
+/**
+ * Whether /usage and /status answer for the session selection rather than natively. They do while an account
+ * is selected (the engine would report the machine account) or the session is locked; back on the machine
+ * login the engine's own panels are right, with the fields this module cannot reproduce.
+ */
 async function reportsSelection($: EngineInterface): Promise<boolean> {
-  return Boolean(local.accountReport || await lockoutProblem($) || await activeAccount($))
+  return Boolean(await lockoutProblem($) || await activeAccount($))
+}
+
+/** A prompt a person typed (or an SDK host sent) that would start a model turn: not a slash command, not a machine-made message. */
+function typedPrompt(e: { command?: unknown; isMeta?: true; origin: { kind: string; asUser?: true } }): boolean {
+  return e.command === undefined && !e.isMeta && (e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'sdk' || (e.origin.kind === 'plugin' && e.origin.asUser === true))
 }
 
 /**
@@ -1233,6 +1242,17 @@ export const register: Register = on => {
   }).catch((_host, e, next) => {
     const problem = next.called ? undefined : whenFailed(next.error)
     return problem ? { deny: problem } : next(e)
+  })
+
+  // A typed prompt is refused before it enters, so the refusal leaves no row in the conversation. Requests that no
+  // typed prompt starts (notifications, scheduled tasks, agents) are answered by turn.step below.
+  on('prompt.submit', async ($, e, next) => {
+    if (!typedPrompt(e)) return next(e)
+    const problem = await lockoutProblem($)
+    return problem ? { drop: problem } : next(e)
+  }).catch((_host, e, next) => {
+    const problem = next.called || !typedPrompt(e) ? undefined : whenFailed(next.error)
+    return problem ? { drop: problem } : next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
