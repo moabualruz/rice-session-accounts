@@ -119,8 +119,10 @@ already had a now-reserved name keeps working: reach it with
 | `/rice-account setup-native` | Withdrawn. Prints how to delete 0.3.0 launcher files by hand. |
 | `/rice-account help` | Every subcommand. |
 
-`/usage` and interactive `/status` report the session account once you have
-selected one. The status entry shows its name, email, plan and usage windows.
+`/usage` and interactive `/status` report the session account while you have
+selected one (the engine would report the machine account). Back on the machine
+login they are the engine's own again. The status entry shows the session
+account's name, email, plan and usage windows.
 
 ## What the selected account does
 
@@ -145,7 +147,10 @@ selected one. The status entry shows its name, email, plan and usage windows.
   `/rice-account login` or select an account again. The unconfirmed token is
   replaced by one no server accepts, so requests that no plugin hook sees (the
   permission classifier, titles, MCP servers) fail instead of using the wrong
-  account. The lockout survives a plugin reload and `/clear`.
+  account. The lockout survives a plugin reload and `/clear`. A prompt you type
+  while locked is refused at once with the reason and leaves no row in the
+  conversation; messages the engine generates itself (task notifications,
+  scheduled runs) are answered with the same reason.
 - **`/clear` plus a reload.** When you clear a conversation that has a selected
   account, the plugin keeps a short-lived, non-secret note of the account name in
   its own store (never in the environment, so children cannot inherit it). A

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0
+
+Closer to the native flow: what the engine already reports is no longer replaced,
+and a refusal no longer leaves a made-up turn in the conversation.
+
+### Fixed
+- **Locked sessions leave no fake turn.** A prompt typed while the account is
+  not confirmed is dropped at `prompt.submit` with the reason. Before, the refusal
+  was written into the conversation as an assistant turn that the next real request
+  carried. Requests no typed prompt starts are still answered by `turn.step`.
+- **`/usage` and `/status` are the engine's own again on the machine login.**
+  They stayed replaced for the rest of the session once any account had been
+  reported, including after `/rice-account login`, where the engine's panels are
+  right and carry fields the replacement dropped (login method, setting sources,
+  session id, base URL, provider).
+
 ## 0.5.0
 
 Behaves like native Claude flows: nothing about a tool call or a child process is
