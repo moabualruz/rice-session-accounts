@@ -160,8 +160,11 @@ export const BLOCKING_VARIABLES: readonly EnvName[] = [...new Set(SWITCH_BLOCKER
 /** Why a switch to an account other than the login cannot work in this session, or undefined. Unknown inputs refuse nothing. */
 export function switchBlocker(context: SwitchContext): string | undefined {
   const found = SWITCH_BLOCKERS.find(blocker => {
-    // Set as Claude Code reads it: any non-empty text.
-    if ('setting' in blocker) return Boolean(context.settings?.[blocker.setting]) && typeof context.settings?.[blocker.setting] === 'string'
+    if ('setting' in blocker) {
+      // Set as Claude Code reads it: any non-empty text.
+      const value = context.settings?.[blocker.setting]
+      return typeof value === 'string' && value !== ''
+    }
     if ('variables' in blocker) return blocker.variables.every(name => Boolean(context.variables[name]))
     return context.isOAuthLogin === false
   })
