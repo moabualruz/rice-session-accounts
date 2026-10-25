@@ -1,0 +1,48 @@
+{
+  "product": "rice-session-accounts",
+  "profile": {
+    "id": "api-standard/v1",
+    "version": null,
+    "digest": null
+  },
+  "inventory": {
+    "reviewed": ["hooks/picker.tsx:renderAccountPicker", "hooks/register.ts:runCommand", "hooks/register.ts:register"],
+    "httpRoutes": [],
+    "mcpOperations": [],
+    "testOnlyHttpServers": "temporary local fixtures in proof scripts; no served product route",
+    "binding": "Claude Code host-native plugin UI through ui.open and ui.render for Pane",
+    "protocolReference": "Claude Code host plugin API type contract for ui.open, ui.render, ui.close, InputProps, SelectProps, ButtonProps, and ui.input"
+  },
+  "picker": {
+    "elements": ["Input", "Select", "Button"],
+    "pageSizeDefault": 50,
+    "pageSizeIncrement": 50,
+    "pageSizeMaximum": 200,
+    "selectOptionsMaximum": 64,
+    "selectPageSizeMaximum": 64,
+    "buttonPageSizeMaximum": 200,
+    "search": "case-insensitive account-name substring, applied after a 250 ms debounce",
+    "ordering": "account name ascending",
+    "metadataLoading": "current filtered page only, after picker render",
+    "rowCache": "in-memory for the current bounded page only",
+    "serverSideCaching": "not-applicable-no-server",
+    "virtualization": "host Select has no virtualized list API and accepts at most 64 options; Select windows cap at 64 and Button fallback windows cap at 200",
+    "routeCodeSplitting": "not-applicable-plugin-host; picker rendering and account metadata reads are deferred until the pane opens",
+    "sessionBoundary": "session.end and session.start reset transient picker state"
+  },
+  "conformance": {
+    "errorBinding": "local loading, retry and terminal states; HTTP problem responses do not apply",
+    "behaviorTests": [
+      "tests/picker.test.tsx: large account lists load and render bounded local windows without eager identity reads",
+      "tests/picker.test.tsx: large mobile account inventories render bounded Button windows",
+      "tests/picker.test.tsx: failed metadata loading stays visible until retry refreshes the account inventory",
+      "tests/picker.test.tsx: failed command-line switches preserve pending picker metadata loads",
+      "tests/picker.test.tsx: retry resets an out-of-range picker window when the account inventory shrinks",
+      "tests/picker.test.tsx: closing a picker ignores account details still loading for its old render",
+      "tests/picker.test.tsx: clearing and resuming a session reloads picker rows without stale metadata",
+      "tests/picker.test.tsx: selecting an account supersedes metadata loads from the prior picker render",
+      "tests/picker.test.tsx: closing and reopening during an account switch keeps the selection guard active",
+      "tests/picker.test.tsx: on a surface without a Select each account is one Button"
+    ]
+  }
+}

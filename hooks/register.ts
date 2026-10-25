@@ -18,8 +18,8 @@ import { withLock } from './lock'
 import { loginSourceOf, NOT_OAUTH_LOGIN } from './login'
 import type { LoginSource } from './login'
 import { EXPIRY_MARGIN_MS, oauthInit, parseProfile, parseUsage, PROFILE_URL, sessionRateLimits, USAGE_URL, withUserAgent } from './oauth'
-import { ACCOUNT_PICKER_ID, openAccountPicker, renderAccountPicker } from './picker'
-import type { AccountRow } from './picker'
+import { ACCOUNT_PICKER_ID, openAccountPicker, refreshAccountPicker, renderAccountPicker, resetAccountPicker } from './picker'
+import type { AccountRow, PickerEntry } from './picker'
 import { refusalText, SessionAuthorizations, UNKNOWN_HANDLE } from './session-auth'
 import { legacyCleanupText, setupText, signOutHint } from './setup'
 
@@ -739,7 +739,10 @@ async function switchTo($: EngineInterface, name: string, isQuiet = false, expec
       : { name, generation: taken.generation, email: 'Loading account', tier: 'Unknown', rateLimits: [], problem: LOADING_USAGE }
     $.ui.status(reportStatus(local.accountReport))
   } finally { local.committingAccount = false; releaseCommit() }
-  if (!isQuiet) local.renewalFailures.delete(name)
+  if (!isQuiet) {
+    local.renewalFailures.delete(name)
+    refreshAccountPicker()
+  }
   if (!keepsReport) await refreshReport($, taken, account, material.secret)
   if (isQuiet) return ''
   if (local.committedSelection !== sequence) return 'A newer account choice superseded this selection. The newer account was kept.'
@@ -886,15 +889,30 @@ async function listText($: EngineInterface): Promise<string> {
   return `${lines.join('\n')}${notes}\n\n/rice-account <name> switches this session only. /rice-account add <name> [kind] saves another (default: claudeai). /rice-account help lists every subcommand.`
 }
 
-async function accountRows($: EngineInterface): Promise<AccountRow[]> {
+function entriesFrom(config: Config): PickerEntry[] {
+  return Object.entries(config.accounts)
+    .filter(([, account]) => (KINDS as readonly string[]).includes(account.kind))
+    .map(([name, account]) => ({ name, kind: account.kind }))
+    .sort((left, right) => left.name.localeCompare(right.name))
+}
+
+async function accountEntries($: EngineInterface): Promise<PickerEntry[]> {
+  const { config } = await loadConfig($)
+  return entriesFrom(config)
+}
+
+async function accountRows($: EngineInterface, page?: readonly PickerEntry[]): Promise<AccountRow[]> {
   const { config } = await loadConfig($)
   const machine = await machineOf($)
   const io = machineIo($)
   const source = await loginSource($)
   const current = local.mirror.active?.name ?? LOGIN_NAME
-  return Promise.all(Object.entries(config.accounts).filter(([, account]) => (KINDS as readonly string[]).includes(account.kind)).map(async ([name, account]) => ({
-    name, kind: account.kind, selected: name === current, ...await accountIdentity(io, account, machine, source),
-  })))
+  const entries = page ?? entriesFrom(config)
+  return Promise.all(entries.map(async ({ name, kind }) => {
+    const account = config.accounts[name]
+    if (!account || account.kind !== kind || !(KINDS as readonly string[]).includes(account.kind)) throw new Error('Saved accounts changed while the picker was loading. Retry to refresh the list.')
+    return { name, kind, selected: name === current, ...await accountIdentity(io, account, machine, source) }
+  }))
 }
 
 function parseOptions(words: readonly string[]): Record<string, string> {
@@ -1096,15 +1114,28 @@ export const register: Register = on => {
   registerLockoutGuard(on)
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== ACCOUNT_PICKER_ID) return next(e)
-    return renderAccountPicker($.ui.resolve(e), () => accountRows($), name => switchTo($, name), {
-      invalidate: () => $.ui.invalidate('ui.render'),
-      log: text => $.ui.log(text),
-      close: () => $.ui.close({ id: ACCOUNT_PICKER_ID }),
-      surface: e.surface,
-    })
+    return renderAccountPicker(
+      $.ui.resolve(e),
+      () => accountEntries($),
+      page => accountRows($, page),
+      local.mirror.active?.name ?? LOGIN_NAME,
+      name => switchTo($, name),
+      {
+        invalidate: () => $.ui.invalidate('ui.render'),
+        log: text => $.ui.log(text),
+        close: () => $.ui.close({ id: ACCOUNT_PICKER_ID }),
+        after: (ms, fn) => $.clock.after(ms, fn),
+        surface: e.surface,
+      },
+    )
+  })
+  on('ui.close', { id: ACCOUNT_PICKER_ID }, (_$, e, next) => {
+    resetAccountPicker()
+    return next(e)
   })
 
   on('session.start', async ($, e, next) => {
+    resetAccountPicker()
     // Reached only by a fresh load of this module (first start, reload,
     // respawn, enable; never /clear): start from nothing held in memory, then
     // take the safety state back from `$.state` before anything else runs.
@@ -1158,6 +1189,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    resetAccountPicker()
     if (e.reason === 'clear' && local.mirror.active) {
       await $.store.set(CLEAR_KEY, { name: local.mirror.active.name, at: await $.clock.now() }).catch(error => $.ui.log(`The /clear record was not kept: ${message(error)}`, { to: 'debug' }))
     }
