@@ -1,8 +1,9 @@
 # Limits
 
-Rice Accounts switches the account used by a Claude Code session. It does not change the machine
-login or make an account selection for other or newly started sessions. Each new session starts on
-the machine login and must select an account explicitly.
+Rice Accounts switches the account used by the current Claude Code session. It does not change the
+machine login or another independently running session. A new top-level session starts with the
+machine login and must select an account explicitly. A Claude process launched as a child of a
+selected session inherits that session's environment, including the selected bearer header.
 
 ## Claude Code behavior
 
@@ -55,13 +56,13 @@ the machine login and must select an account explicitly.
 
 ## Native account picker
 
-The picker is host-native, not an HTTP or MCP API; it adds no OpenAPI server or React runtime. Its
-local page defaults to 50 accounts and is capped at 200. It renders only the visible bounded page on
-hosts without a virtualized picker, with user-driven loading and search, filtering or sorting where
-useful. Account metadata and usage lookups wait until the picker opens and rows become visible;
-superseded loads are cancelled or ignored so stale data does not cross sessions. Large synthetic
-fixtures establish this bound, but do not qualify physical keyboard or Escape behavior on every
-host surface.
+The picker is a host-native pane, not an HTTP or MCP API; it adds no OpenAPI server or React runtime.
+It loads account names when opened and account details and usage only for the visible page. The page
+starts at 50 accounts, grows to at most 64 on surfaces with a native Select control and 200 on
+Button surfaces, then moves through larger inventories in user-requested windows. Search filters
+the names. Results from a superseded picker revision are ignored, although an in-flight read may
+finish. Large synthetic fixtures cover a 500-account inventory and bounded detail reads; they do
+not qualify physical keyboard or Escape behavior on every host surface.
 
 ## Release contract gap
 
