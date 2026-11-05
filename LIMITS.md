@@ -63,10 +63,3 @@ Button surfaces, then moves through larger inventories in user-requested windows
 the names. Results from a superseded picker revision are ignored, although an in-flight read may
 finish. Large synthetic fixtures cover a 500-account inventory and bounded detail reads; they do
 not qualify physical keyboard or Escape behavior on every host surface.
-
-## Release contract gap
-
-The current rice-mods release limits table has rows for Catalog, Review, Index and Edit, but no
-Session Accounts row. This file cannot yet supply the product row required by that contract. Full
-compliance remains pending resolution by the rice-mods owner; this draft does not define or infer
-the missing row.
