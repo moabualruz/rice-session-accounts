@@ -949,19 +949,22 @@ if (basename(process.argv[1] ?? '') === 'auth') { module.exports(['auth', ...pro
     assert.equal(probe.status, 1, probe.stderr)
     assert.equal(JSON.parse(probe.stdout).loggedIn, false)
     const args = [resolve('scripts/account-setup.mjs'), '--config-dir', configDir, 'personal']
-    const first = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 10_000 })
-    assert.equal(first.status, 0, first.stderr)
+    // Windows setup may run three 30-second-bounded child commands before returning.
+    const setupTimeout = process.platform === 'win32' ? 100_000 : 10_000
+    const processResult = result => `status=${result.status ?? 'null'}; signal=${result.signal ?? 'none'}; error=${result.error?.code ?? 'none'}`
+    const first = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: setupTimeout })
+    assert.equal(first.status, 0, processResult(first))
     assert.match(first.stdout, /fixture native login/)
     assert.equal(existsSync(join(configDir, 'fixture-auth-ready')), false)
     assert.equal(existsSync(join(loginDir, 'fixture-auth-ready')), true)
     if (process.platform !== 'win32') assert.equal(statSync(loginDir).mode & 0o777, 0o700)
     assert.equal(readFileSync(configPath, 'utf8'), config)
-    const second = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 10_000 })
-    assert.equal(second.status, 0, second.stderr)
+    const second = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: setupTimeout })
+    assert.equal(second.status, 0, processResult(second))
     assert.equal(second.stdout.includes('fixture native login'), false)
     assert.equal(readFileSync(configPath, 'utf8'), config)
-    const mismatch = spawnSync(process.execPath, [...args, '--login', '--email', 'personal@example.com'], { env, encoding: 'utf8', timeout: 10_000 })
-    assert.equal(mismatch.status, 1, mismatch.stderr)
+    const mismatch = spawnSync(process.execPath, [...args, '--login', '--email', 'personal@example.com'], { env, encoding: 'utf8', timeout: setupTimeout })
+    assert.equal(mismatch.status, 1, processResult(mismatch))
     assert.match(mismatch.stdout, /fixture native login/)
     assert.equal(/is ready|Then switch/.test(mismatch.stdout), false)
     assert.match(mismatch.stderr, /Expected personal@example\.com, but Claude is signed in as other@example\.com[\s\S]*--login/)
@@ -969,8 +972,8 @@ if (basename(process.argv[1] ?? '') === 'auth') { module.exports(['auth', ...pro
     // A loginDir edited to point elsewhere is refused without creating or changing that folder.
     const elsewhere = join(root, 'elsewhere')
     writeFileSync(configPath, JSON.stringify({ accounts: { personal: { kind: 'claudeai', loginDir: elsewhere } } }))
-    const refused = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 10_000 })
-    assert.equal(refused.status, 1)
+    const refused = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: setupTimeout })
+    assert.equal(refused.status, 1, processResult(refused))
     assert.match(refused.stderr, /setup only prepares the folder it derives/)
     assert.equal(existsSync(elsewhere), false)
   } finally { rmSync(root, { recursive: true, force: true }) }
