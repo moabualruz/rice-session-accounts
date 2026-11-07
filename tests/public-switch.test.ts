@@ -71,7 +71,7 @@ function fixture(on: On) {
     } }))
     documents.set(`${paths.loginDir(name)}/.claude.json`, JSON.stringify({ oauthAccount: { emailAddress: `${name}@example.test` } }))
   }
-  const writes: string[] = [], processes: (readonly string[])[] = [], status: (string | undefined)[] = []
+  const writes: string[] = [], envWrites: string[] = [], processes: (readonly string[])[] = [], status: (string | undefined)[] = []
   let held: { started: () => void; wait: Promise<void> } | undefined
   let heldTokenRead: { started: () => void; wait: Promise<void> } | undefined
   let refuseTokenRead = false
@@ -91,6 +91,7 @@ function fixture(on: On) {
   })
   // The SDK's own shapes: `{ deny }` refuses the write, `{ value: undefined }` made it.
   on('env.set', (_host, e) => {
+    envWrites.push(e.name)
     if (refuseRollback && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-a') return { deny: 'Owned rollback refusal' }
     if (refuseB && e.name === 'ANTHROPIC_CUSTOM_HEADERS' && headerToken(e.value) === 'fixture-account-b') return { deny: 'Owned policy refusal' }
     if (e.value === undefined) environment.delete(e.name); else environment.set(e.name, e.value)
@@ -131,7 +132,7 @@ function fixture(on: On) {
   on('ui.status', (_host, e) => { status.push(e.text); return { value: undefined } })
   on('ui.log', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
-  return { environment, documents, writes, processes, status, activeWrites, cachedRequests, useSettings(value: Record<string, unknown>) { settings = value }, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
+  return { environment, documents, writes, envWrites, processes, status, activeWrites, cachedRequests, useSettings(value: Record<string, unknown>) { settings = value }, refuseCachedProbe() { refuseCachedProbe = true }, refuseTokenRead() { refuseTokenRead = true }, holdTokenRead() {
     let started = () => {}, release = () => {}
     const seen = new Promise<void>(resolve => { started = resolve })
     const wait = new Promise<void>(resolve => { release = resolve })
@@ -345,18 +346,32 @@ test('a credential Claude Code sends in place of the selected bearer refuses the
   const sources: [string, () => void, () => void][] = [
     ['apiKeyHelper', () => world.useSettings({ apiKeyHelper: '/fixture/owned-helper' }), () => world.useSettings({})],
     ['CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', () => world.environment.set('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', '3'), () => world.environment.delete('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')],
+    ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', () => world.environment.set('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'fixture-descriptor-present'), () => world.environment.delete('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')],
+    ['CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', () => world.environment.set('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', 'fixture-descriptor-present'), () => world.environment.delete('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')],
+    ['CLAUDE_BG_AUTH_SNAPSHOT_PATH', () => world.environment.set('CLAUDE_BG_AUTH_SNAPSHOT_PATH', '/fixture/background-auth'), () => world.environment.delete('CLAUDE_BG_AUTH_SNAPSHOT_PATH')],
+    ['CLAUDE_CODE_HOST_CREDS_FILE', () => world.environment.set('CLAUDE_CODE_HOST_CREDS_FILE', '/fixture/host-credentials'), () => world.environment.delete('CLAUDE_CODE_HOST_CREDS_FILE')],
+    ['CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', () => world.environment.set('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', '1'), () => world.environment.delete('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST')],
+    ['CLAUDE_CODE_HOST_AUTH_ENV_VAR', () => world.environment.set('CLAUDE_CODE_HOST_AUTH_ENV_VAR', 'FIXTURE_HOST_AUTH'), () => world.environment.delete('CLAUDE_CODE_HOST_AUTH_ENV_VAR')],
     ['workload identity federation', () => { world.environment.set('ANTHROPIC_FEDERATION_RULE_ID', 'fdrl_owned'); world.environment.set('ANTHROPIC_ORGANIZATION_ID', 'owned-org') }, () => { world.environment.delete('ANTHROPIC_FEDERATION_RULE_ID'); world.environment.delete('ANTHROPIC_ORGANIZATION_ID') }],
+  ]
+  const hostManagedAuth = [
+    'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR',
+    'CLAUDE_BG_AUTH_SNAPSHOT_PATH', 'CLAUDE_CODE_HOST_CREDS_FILE',
+    'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', 'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   ]
   for (const [cause, apply, remove] of sources) {
     apply()
-    const environment = [...world.environment.entries()].sort()
-    const [activeWrites, statuses, processes] = [world.activeWrites.length, world.status.length, world.processes.length]
+    const environment = [...world.environment.entries()].filter(([name]) => !hostManagedAuth.includes(name)).sort()
+    const hostAuthPresence = hostManagedAuth.map(name => world.environment.has(name))
+    const [environmentWrites, activeWrites, statuses, processes] = [world.envWrites.length, world.activeWrites.length, world.status.length, world.processes.length]
     const refused = (await $.command.run(command('account-b'))).text ?? ''
     expect(refused).toContain('This session cannot switch accounts: ')
     expect(refused).toContain(cause)
     expect(refused).not.toContain('now uses')
     // Nothing was read for account-b, written, or put back: the selection in effect is untouched.
-    expect([...world.environment.entries()].sort()).toEqual(environment)
+    expect([...world.environment.entries()].filter(([name]) => !hostManagedAuth.includes(name)).sort()).toEqual(environment)
+    expect(hostManagedAuth.map(name => world.environment.has(name))).toEqual(hostAuthPresence)
+    expect(world.envWrites.length).toBe(environmentWrites)
     expect([world.activeWrites.length, world.status.length, world.processes.length]).toEqual([activeWrites, statuses, processes])
     expect(headerToken(world.environment.get('ANTHROPIC_CUSTOM_HEADERS'))).toBe('fixture-account-a')
     expect((await $.command.run({ ...command(''), command: 'usage' })).text ?? '').toContain('account-a usage:')

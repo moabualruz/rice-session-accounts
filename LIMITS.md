@@ -16,9 +16,12 @@ selected session inherits that session's environment, including the selected bea
   confirmed or restored, those requests fail with Claude Code's invalid bearer token response.
   Select an account again with `/rice-account login` or another saved account.
 - A switch is refused if Claude Code's own credential sources would override it, including an
-  `apiKeyHelper`, an API key provided through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload
-  identity federation, an unreadable settings source, or a session not signed in with a Claude
-  subscription.
+  `apiKeyHelper`, an API key provided through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, host-managed
+  credential sources (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+  `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_BG_AUTH_SNAPSHOT_PATH`,
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, and
+  `CLAUDE_CODE_HOST_AUTH_ENV_VAR`), workload identity federation, an unreadable settings source, or
+  a session not signed in with a Claude subscription.
 - Anthropic requests identify as `claude-cli/<version> (external, cli)`. `session.usage` exposes the
   five-hour and weekly windows Claude Code declares; model-specific usage windows are available
   through `/rice-account usage` and the status entry.
@@ -57,7 +60,8 @@ selected session inherits that session's environment, including the selected bea
 ## Native account picker
 
 The picker is a host-native pane, not an HTTP or MCP API; it adds no OpenAPI server or React runtime.
-It loads account names when opened and account details and usage only for the visible page. The page
+It loads account names when opened and cached identity details only for the visible page. Usage is
+fetched separately for the selected session account. The page
 starts at 50 accounts, grows to at most 64 on surfaces with a native Select control and 200 on
 Button surfaces, then moves through larger inventories in user-requested windows. Search filters
 the names. Results from a superseded picker revision are ignored, although an in-flight read may

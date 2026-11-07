@@ -123,6 +123,18 @@ async function variable($: EngineInterface, name: EnvName): Promise<string | und
       return $.env.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')
     case 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR':
       return $.env.get('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')
+    case 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR':
+      return $.env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')
+    case 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR':
+      return $.env.get('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')
+    case 'CLAUDE_BG_AUTH_SNAPSHOT_PATH':
+      return $.env.get('CLAUDE_BG_AUTH_SNAPSHOT_PATH')
+    case 'CLAUDE_CODE_HOST_CREDS_FILE':
+      return $.env.get('CLAUDE_CODE_HOST_CREDS_FILE')
+    case 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST':
+      return $.env.get('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST')
+    case 'CLAUDE_CODE_HOST_AUTH_ENV_VAR':
+      return $.env.get('CLAUDE_CODE_HOST_AUTH_ENV_VAR')
     case 'ANTHROPIC_FEDERATION_RULE_ID':
       return $.env.get('ANTHROPIC_FEDERATION_RULE_ID')
     case 'ANTHROPIC_ORGANIZATION_ID':
@@ -158,18 +170,6 @@ async function getManaged($: EngineInterface, name: Managed): Promise<string | u
       return $.env.get('CLAUDE_CODE_USE_MANTLE')
     case 'CLAUDE_CODE_USE_GATEWAY':
       return $.env.get('CLAUDE_CODE_USE_GATEWAY')
-    case 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR':
-      return $.env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')
-    case 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR':
-      return $.env.get('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')
-    case 'CLAUDE_BG_AUTH_SNAPSHOT_PATH':
-      return $.env.get('CLAUDE_BG_AUTH_SNAPSHOT_PATH')
-    case 'CLAUDE_CODE_HOST_CREDS_FILE':
-      return $.env.get('CLAUDE_CODE_HOST_CREDS_FILE')
-    case 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST':
-      return $.env.get('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST')
-    case 'CLAUDE_CODE_HOST_AUTH_ENV_VAR':
-      return $.env.get('CLAUDE_CODE_HOST_AUTH_ENV_VAR')
     case 'AWS_PROFILE':
       return $.env.get('AWS_PROFILE')
     case 'AWS_REGION':
@@ -221,18 +221,6 @@ async function setManaged($: EngineInterface, name: Managed, value: string | und
       return $.env.set('CLAUDE_CODE_USE_MANTLE', value)
     case 'CLAUDE_CODE_USE_GATEWAY':
       return $.env.set('CLAUDE_CODE_USE_GATEWAY', value)
-    case 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR':
-      return $.env.set('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', value)
-    case 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR':
-      return $.env.set('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', value)
-    case 'CLAUDE_BG_AUTH_SNAPSHOT_PATH':
-      return $.env.set('CLAUDE_BG_AUTH_SNAPSHOT_PATH', value)
-    case 'CLAUDE_CODE_HOST_CREDS_FILE':
-      return $.env.set('CLAUDE_CODE_HOST_CREDS_FILE', value)
-    case 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST':
-      return $.env.set('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', value)
-    case 'CLAUDE_CODE_HOST_AUTH_ENV_VAR':
-      return $.env.set('CLAUDE_CODE_HOST_AUTH_ENV_VAR', value)
     case 'AWS_PROFILE':
       return $.env.set('AWS_PROFILE', value)
     case 'AWS_REGION':
@@ -619,11 +607,17 @@ async function switchContext($: EngineInterface): Promise<SwitchContext> {
     const value = await variable($, name)
     if (value) variables[name] = value
   }
-  // Claude Code's own login as the process started: a launch OAuth token, else the stored /login.
+  // Host-managed auth sources are already blockers; do not read a fallback machine login for them.
   const kept = ((await read($, originalsAtom)) ?? local.mirror.originals) as Originals | null
-  const launched = async (name: 'CLAUDE_CODE_OAUTH_TOKEN' | 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR') => kept ? kept[name] ?? undefined : await getManaged($, name)
-  let isOAuthLogin: boolean | undefined = Boolean(await launched('CLAUDE_CODE_OAUTH_TOKEN') || await launched('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'))
-  if (!isOAuthLogin) {
+  const launched = async () => kept ? kept.CLAUDE_CODE_OAUTH_TOKEN ?? undefined : await getManaged($, 'CLAUDE_CODE_OAUTH_TOKEN')
+  const hasHostAuth = Boolean(variables.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
+    || variables.CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR
+    || variables.CLAUDE_BG_AUTH_SNAPSHOT_PATH
+    || variables.CLAUDE_CODE_HOST_CREDS_FILE
+    || variables.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    || variables.CLAUDE_CODE_HOST_AUTH_ENV_VAR)
+  let isOAuthLogin: boolean | undefined = hasHostAuth ? undefined : Boolean(await launched())
+  if (!hasHostAuth && !isOAuthLogin) {
     try {
       const machine = await machineOf($)
       isOAuthLogin = Boolean((await readLogin(machineIo($), { storage: machine.storage, defaultConfigDir: machine.claudeDir, user: machine.user }))?.claudeAiOauth.accessToken)

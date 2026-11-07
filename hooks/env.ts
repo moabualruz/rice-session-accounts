@@ -21,12 +21,6 @@ export const MANAGED = [
   'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
   'CLAUDE_CODE_USE_MANTLE',
   'CLAUDE_CODE_USE_GATEWAY',
-  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
-  'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR',
-  'CLAUDE_BG_AUTH_SNAPSHOT_PATH',
-  'CLAUDE_CODE_HOST_CREDS_FILE',
-  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
-  'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   'AWS_PROFILE',
   'AWS_REGION',
   'AWS_BEARER_TOKEN_BEDROCK',
@@ -58,12 +52,6 @@ const AUTH: readonly Managed[] = [
   'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
   'CLAUDE_CODE_USE_MANTLE',
   'CLAUDE_CODE_USE_GATEWAY',
-  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
-  'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR',
-  'CLAUDE_BG_AUTH_SNAPSHOT_PATH',
-  'CLAUDE_CODE_HOST_CREDS_FILE',
-  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
-  'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   'AWS_BEARER_TOKEN_BEDROCK',
   'ANTHROPIC_FOUNDRY_API_KEY',
 ]
@@ -141,15 +129,19 @@ export type SwitchBlocker =
   | { login: 'not-oauth'; message: string }
 
 /**
- * The sources that beat or break the selected account's bearer on the wire,
- * as measured against Claude Code 2.1.302: Claude Code's own credential wins
- * over the request header, or its requests drop the OAuth beta header the
- * bearer needs. An API key, an auth token or a provider selector does
- * neither: the switch clears them. The first that applies is reported.
+ * Credential sources that prevent a selected account's bearer from taking effect.
+ * Host-managed sources are blockers; switch-owned keys can be cleared. The first
+ * blocker that applies is reported.
  */
 export const SWITCH_BLOCKERS: readonly SwitchBlocker[] = [
   { setting: 'apiKeyHelper', message: "Claude Code sends the key from the apiKeyHelper setting in place of the selected account's token. Remove apiKeyHelper from your settings, then restart Claude Code." },
   { variables: ['CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'], message: "Claude Code sends the API key it read through CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR along with the selected account's token. Start Claude Code without CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR." },
+  { variables: ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'], message: 'Claude Code manages its OAuth credential through CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR.' },
+  { variables: ['CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR'], message: 'Claude Code manages its gateway credential through CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR.' },
+  { variables: ['CLAUDE_BG_AUTH_SNAPSHOT_PATH'], message: 'Claude Code manages a background authentication snapshot through CLAUDE_BG_AUTH_SNAPSHOT_PATH, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_BG_AUTH_SNAPSHOT_PATH.' },
+  { variables: ['CLAUDE_CODE_HOST_CREDS_FILE'], message: 'Claude Code manages credentials through CLAUDE_CODE_HOST_CREDS_FILE, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_CODE_HOST_CREDS_FILE.' },
+  { variables: ['CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'], message: 'Claude Code manages the authentication provider through CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST.' },
+  { variables: ['CLAUDE_CODE_HOST_AUTH_ENV_VAR'], message: 'Claude Code manages authentication through the environment named by CLAUDE_CODE_HOST_AUTH_ENV_VAR, which Rice Accounts cannot replace. Start Claude Code without CLAUDE_CODE_HOST_AUTH_ENV_VAR.' },
   { variables: ['ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID'], message: "Claude Code signs in through workload identity federation (ANTHROPIC_FEDERATION_RULE_ID and ANTHROPIC_ORGANIZATION_ID) and sends that token in place of the selected account's. Start Claude Code without them." },
   { login: 'not-oauth', message: "Claude Code was not started signed in with a Claude subscription, so its requests drop the OAuth beta header the selected account's token needs. Start Claude Code signed in with your Claude subscription (claude auth login, or CLAUDE_CODE_OAUTH_TOKEN)." },
 ]

@@ -11,12 +11,6 @@ const providerSelectors = {
   CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '1',
   CLAUDE_CODE_USE_MANTLE: '1',
   CLAUDE_CODE_USE_GATEWAY: '1',
-  CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '17',
-  CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR: '19',
-  CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture/background-auth',
-  CLAUDE_CODE_HOST_CREDS_FILE: '/fixture/host-credentials',
-  CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
-  CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'FIXTURE_HOST_AUTH',
 }
 
 test('the machine login restores every managed variable as the process started', async () => {
@@ -77,7 +71,7 @@ test('new native provider selectors are managed and restored for the machine log
   }
 })
 
-test('every supported OAuth account clears inherited native provider selectors and host authentication', async () => {
+test('every supported OAuth account clears inherited switchable provider selectors', async () => {
   const accounts: AccountConfig[] = [
     { kind: 'claudeai', loginDir: '/fixture/login' },
     { kind: 'claudeai-token', secret: { service: 'fixture', account: 'token' } },
@@ -103,6 +97,12 @@ test('each measured credential source refuses the switch with its cause and its 
   const cases: [SwitchContext, string, string][] = [
     [{ ...clean, settings: { apiKeyHelper: '/fixture/helper' } }, 'apiKeyHelper setting', 'Remove apiKeyHelper'],
     [{ ...clean, variables: { CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '3' } }, 'through CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', 'Start Claude Code without CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'],
+    [{ ...clean, variables: { CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: 'fixture-descriptor-present' } }, 'manages its OAuth credential through CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'Start Claude Code without CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'],
+    [{ ...clean, variables: { CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR: 'fixture-descriptor-present' } }, 'manages its gateway credential through CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', 'Start Claude Code without CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR'],
+    [{ ...clean, variables: { CLAUDE_BG_AUTH_SNAPSHOT_PATH: '/fixture/background-auth' } }, 'manages a background authentication snapshot through CLAUDE_BG_AUTH_SNAPSHOT_PATH', 'Start Claude Code without CLAUDE_BG_AUTH_SNAPSHOT_PATH'],
+    [{ ...clean, variables: { CLAUDE_CODE_HOST_CREDS_FILE: '/fixture/host-credentials' } }, 'manages credentials through CLAUDE_CODE_HOST_CREDS_FILE', 'Start Claude Code without CLAUDE_CODE_HOST_CREDS_FILE'],
+    [{ ...clean, variables: { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1' } }, 'manages the authentication provider through CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', 'Start Claude Code without CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'],
+    [{ ...clean, variables: { CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'FIXTURE_HOST_AUTH' } }, 'manages authentication through the environment named by CLAUDE_CODE_HOST_AUTH_ENV_VAR', 'Start Claude Code without CLAUDE_CODE_HOST_AUTH_ENV_VAR'],
     [{ ...clean, variables: { ANTHROPIC_FEDERATION_RULE_ID: 'fdrl_fixture', ANTHROPIC_ORGANIZATION_ID: 'fixture-org' } }, 'workload identity federation', 'Start Claude Code without them'],
     [{ ...clean, isOAuthLogin: false }, 'not started signed in with a Claude subscription', 'claude auth login, or CLAUDE_CODE_OAUTH_TOKEN'],
   ]
@@ -126,5 +126,5 @@ test('the first source in the table is reported; unreadable settings refuse, an 
 })
 
 test('the variables the switch reads are exactly those the table names', async () => {
-  expect([...BLOCKING_VARIABLES].sort()).toEqual(['ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'])
+  expect([...BLOCKING_VARIABLES].sort()).toEqual(['ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_BG_AUTH_SNAPSHOT_PATH', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR', 'CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_HOST_AUTH_ENV_VAR', 'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'])
 })
