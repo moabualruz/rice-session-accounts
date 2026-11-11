@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1
+
+### Added
+- A searchable, paginated native account picker that bounds identity-detail reads for large account lists.
+- Source-derived documentation for session, credential, storage and picker limits.
+
+### Fixed
+- Account switches now refuse host-managed credentials that can override the selected session account, with the cause and corrective action.
+
 ## 0.6.0
 
 Closer to the native flow: what the engine already reports is no longer replaced,
