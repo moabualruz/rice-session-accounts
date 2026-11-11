@@ -14,6 +14,7 @@
     "test:auth": "node scripts/proof-public-auth.mjs && node scripts/proof-public-auth.mjs --baseline-storage && npm run test:bash",
     "check:dashes": "node scripts/check-dashes.mjs",
     "check:compat": "npm test && npm run test:plugin && claude plugin validate --strict . && npm run check:dashes && git diff --check && git diff --cached --check",
-    "check": "npm run check:compat && npm run typecheck && npm run test:auth"
+    "check": "npm run check:compat && npm run typecheck && npm run test:auth",
+    "ci": "npm run check"
   }
 }

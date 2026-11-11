@@ -23,6 +23,21 @@ const START = { cwd: home, surface: 'terminal', isInteractive: true } as const
 const B_LIMITS = [{ kind: 'five_hour', percentUsed: 2 }, { kind: 'seven_day', percentUsed: 2 }]
 const MACHINE_LIMITS = [{ kind: 'five_hour', percentUsed: 95 }]
 
+type HttpBody = string | { readonly base64: string } | undefined
+
+function httpBodyText(body: HttpBody): string {
+  if (typeof body === 'string') return body
+  if (body === undefined) return '{}'
+  return new TextDecoder().decode(Uint8Array.from(atob(body.base64), value => value.charCodeAt(0)))
+}
+
+test('lifecycle HTTP fixture decodes string and base64 request bodies', async () => {
+  const text = JSON.stringify({ refresh_token: 'fixture-refresh-account-b' })
+  const base64 = 'eyJyZWZyZXNoX3Rva2VuIjoiZml4dHVyZS1yZWZyZXNoLWFjY291bnQtYiJ9'
+  expect(httpBodyText(text)).toBe(text)
+  expect(httpBodyText({ base64 })).toBe(text)
+})
+
 function command(args: string, name = 'rice-account'): CommandRunInput {
   return { command: name, args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } }
 }
@@ -137,7 +152,7 @@ function fixture(on: On, options: Options = {}) {
     if (input.url === TOKEN_URL) {
       tokenRequests += 1
       if (isRefreshFailing) return json({ error: 'owned refusal' }, 500)
-      const refresh = (JSON.parse(input.init?.body ?? '{}') as { refresh_token?: string }).refresh_token ?? ''
+      const refresh = (JSON.parse(httpBodyText(input.init?.body)) as { refresh_token?: string }).refresh_token ?? ''
       const name = refresh.replace(/^fixture-refresh-/, '').replace(/-\d+$/, '')
       return json({ access_token: `fixture-access-${name}-renewed`, refresh_token: `fixture-refresh-${name}-${tokenRequests}`, expires_in: 3600 })
     }

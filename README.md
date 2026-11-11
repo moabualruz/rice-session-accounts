@@ -180,11 +180,14 @@ account.
   window appears in `/rice-account usage` and the status entry.
 - A switch is refused, with the cause and the fix, when Claude Code's own credential
   would override the selected account: an `apiKeyHelper` setting from any settings
-  source, an API key passed through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, workload
-  identity federation (`ANTHROPIC_FEDERATION_RULE_ID` with `ANTHROPIC_ORGANIZATION_ID`),
-  or a session not started signed in with a Claude subscription. Settings that cannot
-  be read refuse it too. `login`, `list`, `check` and `usage` keep working, and an
-  account already selected stays in effect.
+  source, an API key passed through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, host-managed
+  credential sources (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+  `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_BG_AUTH_SNAPSHOT_PATH`,
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, and
+  `CLAUDE_CODE_HOST_AUTH_ENV_VAR`), workload identity federation
+  (`ANTHROPIC_FEDERATION_RULE_ID` with `ANTHROPIC_ORGANIZATION_ID`), or a session not
+  started signed in with a Claude subscription. Settings that cannot be read refuse it too.
+  `login`, `list`, `check` and `usage` keep working, and an account already selected stays in effect.
 - An `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or provider selector at launch does not
   block a switch when the session is also signed in with a Claude subscription: the
   switch clears them for this session, and `/rice-account login` restores them.
