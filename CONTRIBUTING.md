@@ -52,8 +52,8 @@ Native Windows storage is checked by `node scripts/proof-windows-storage.mjs` on
 `.github/workflows/ci.yml` runs on pull requests, pushes to `main` and manual dispatch with a
 read-only token and no secrets. It runs `check:compat` on Linux for each supported Claude Code
 version, the full `check` on 2.1.301, a macOS job with the keychain proof, and a native Windows job
-including the Windows storage proof. Pull requests from forks run on GitHub-hosted runners only.
-Lint workflow changes with `actionlint`; `.github/actionlint.yaml` declares the shared runner label.
+including the Windows storage proof. Every job runs on a GitHub-hosted runner; the workflow uses no `pull_request_target`, no secrets and no self-hosted runner.
+Lint workflow changes with `actionlint`.
 
 ## Rules
 

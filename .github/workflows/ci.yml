@@ -13,8 +13,7 @@ concurrency:
 jobs:
   check:
     name: linux (Claude Code ${{ matrix.claude }})
-    # Pull requests from forks run on GitHub-hosted machines; trusted events use the shared pool.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","linux","x64","generic"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
